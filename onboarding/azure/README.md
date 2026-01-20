@@ -38,6 +38,12 @@ Before running the script, ensure you have:
     .\Setup-SpottoAzure.ps1
     ```
 
+## What it looks like
+
+The onboarding script runs as a simple PowerShell wizard:
+
+![Spotto Azure onboarding wizard example](./powershell-wizard-sample.png)
+
 ## Interactive Steps
 
 The script is interactive and will guide you through the process:
