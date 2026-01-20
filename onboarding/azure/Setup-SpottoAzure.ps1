@@ -8,6 +8,7 @@
     
     Permissions granted:
     - Reader role on selected subscriptions (read Azure resources)
+    - Management Group Reader at tenant level (read management group hierarchy)
     - Reservation Reader at tenant level (read Reserved Instances)
     - Savings Plan Reader at tenant level (read Savings Plans)
     - Application.Read.All in Microsoft Graph (read service principal credential expiry)
@@ -23,6 +24,7 @@
     - Microsoft Graph PowerShell module (will be installed if missing)
     - Global Administrator or appropriate permissions to create service principals
     - Owner or User Access Administrator role on subscriptions
+    - Management Group Contributor or Owner role for management group access
     
 .EXAMPLE
     .\Setup-SpottoAzure.ps1
@@ -163,10 +165,11 @@ Write-Host "This script will:"
 Write-Host "1. Create a service principal named '$APP_NAME' (or use existing)"
 Write-Host "2. Generate a client secret (valid for 12 months)"
 Write-Host "3. Assign Reader role on your selected subscriptions"
-Write-Host "4. Assign Reservation Reader (tenant-level)"
-Write-Host "5. Assign Savings Plan Reader (tenant-level)"
-Write-Host "6. Grant Application.Read.All permission in Microsoft Graph"
-Write-Host "7. (Optional) Create and assign custom roles for write permissions"
+Write-Host "4. Assign Management Group Reader (tenant-level)"
+Write-Host "5. Assign Reservation Reader (tenant-level)"
+Write-Host "6. Assign Savings Plan Reader (tenant-level)"
+Write-Host "7. Grant Application.Read.All permission in Microsoft Graph"
+Write-Host "8. (Optional) Create and assign custom roles for write permissions"
 Write-Host "`nThis script is idempotent and safe to run multiple times.`n"
 
 $confirmation = Read-Host "Do you want to continue? (yes/no)"
@@ -407,10 +410,42 @@ foreach ($sub in $selectedSubscriptions) {
 Write-Info "Summary: $successCount new assignments, $skipCount already existed"
 
 # ============================================================================
-# Step 6: Assign Reservation Reader (Tenant Level)
+# Step 6: Assign Management Group Reader (Tenant Level)
 # ============================================================================
 
-Write-Header "Step 6: Assigning Reservation Reader (Tenant Level)"
+Write-Header "Step 6: Assigning Management Group Reader (Tenant Level)"
+
+try {
+    # Get the root management group for this tenant
+    # The root management group ID is typically the same as the tenant ID
+    $rootMgId = $script:tenantId
+    $mgScope = "/providers/Microsoft.Management/managementGroups/$rootMgId"
+    
+    Write-Info "Attempting to assign Management Group Reader at root level..."
+    Write-Info "Management Group Scope: $mgScope"
+    
+    # Check if role assignment already exists
+    $existingMgAssignment = Get-AzRoleAssignment -ObjectId $sp.Id -Scope $mgScope -RoleDefinitionName "Management Group Reader" -ErrorAction SilentlyContinue
+    
+    if ($existingMgAssignment) {
+        Write-Info "Management Group Reader role already assigned"
+    } else {
+        New-AzRoleAssignment -ObjectId $sp.Id -RoleDefinitionName "Management Group Reader" -Scope $mgScope | Out-Null
+        Write-Success "Assigned Management Group Reader role at tenant root level"
+    }
+} catch {
+    Write-Error-Custom "Failed to assign Management Group Reader role: $_"
+    Write-Info "This may occur if:"
+    Write-Info "  - You don't have sufficient permissions (need Management Group Contributor or Owner)"
+    Write-Info "  - Management Groups are not enabled in your tenant"
+    Write-Info "  - You need to manually assign this in Azure Portal > Management Groups"
+}
+
+# ============================================================================
+# Step 7: Assign Reservation Reader (Tenant Level)
+# ============================================================================
+
+Write-Header "Step 7: Assigning Reservation Reader (Tenant Level)"
 
 try {
     $reservationScope = "/providers/Microsoft.Capacity"
@@ -430,10 +465,10 @@ try {
 }
 
 # ============================================================================
-# Step 7: Assign Savings Plan Reader (Tenant Level)
+# Step 8: Assign Savings Plan Reader (Tenant Level)
 # ============================================================================
 
-Write-Header "Step 7: Assigning Savings Plan Reader (Tenant Level)"
+Write-Header "Step 8: Assigning Savings Plan Reader (Tenant Level)"
 
 try {
     $savingsPlanScope = "/providers/Microsoft.BillingBenefits"
@@ -453,10 +488,10 @@ try {
 }
 
 # ============================================================================
-# Step 8: Grant Microsoft Graph Permissions
+# Step 9: Grant Microsoft Graph Permissions
 # ============================================================================
 
-Write-Header "Step 8: Granting Microsoft Graph Permissions"
+Write-Header "Step 9: Granting Microsoft Graph Permissions"
 
 try {
     Write-Info "Connecting to Microsoft Graph..."
@@ -496,10 +531,10 @@ try {
 }
 
 # ============================================================================
-# Step 9: Optional Custom Roles
+# Step 10: Optional Custom Roles
 # ============================================================================
 
-Write-Header "Step 9: Optional Custom Roles (Write Permissions)"
+Write-Header "Step 10: Optional Custom Roles (Write Permissions)"
 
 Write-Host "Spotto can optionally perform these actions if you grant write permissions:"
 Write-Host "  1. Dismiss Azure Advisor Recommendations"
@@ -586,6 +621,7 @@ Write-Header "Setup Complete!"
 
 Write-Host "✓ Service Principal: $APP_NAME ($script:clientId)"
 Write-Host "✓ Reader role assigned on $($selectedSubscriptions.Count) subscription(s)"
+Write-Host "✓ Management Group Reader assigned at tenant root level"
 Write-Host "✓ Reservation Reader assigned at tenant level"
 Write-Host "✓ Savings Plan Reader assigned at tenant level"
 Write-Host "✓ Microsoft Graph permissions granted"
