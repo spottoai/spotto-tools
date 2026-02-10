@@ -155,6 +155,38 @@ function Show-Credentials {
     Write-Host ""
 }
 
+function Set-SubscriptionContext {
+    param([object]$Subscription)
+
+    if (-not $Subscription -or -not $Subscription.Id) {
+        Write-Error-Custom "Subscription details were missing. Unable to set context."
+        return $false
+    }
+
+    $tenantId = $Subscription.TenantId
+    try {
+        Set-AzContext -SubscriptionId $Subscription.Id -TenantId $tenantId | Out-Null
+        return $true
+    } catch {
+        Write-Info "Re-authentication required for tenant $tenantId. You may see an MFA prompt."
+        try {
+            if ($tenantId) {
+                Connect-AzAccount -TenantId $tenantId | Out-Null
+            } else {
+                Connect-AzAccount | Out-Null
+            }
+            Set-AzContext -SubscriptionId $Subscription.Id -TenantId $tenantId | Out-Null
+            return $true
+        } catch {
+            Write-Error-Custom "Failed to set context for $($Subscription.Name): $_"
+            if ($tenantId) {
+                Write-Info "Try: Connect-AzAccount -TenantId $tenantId"
+            }
+            return $false
+        }
+    }
+}
+
 # ============================================================================
 # MAIN SCRIPT
 # ============================================================================
@@ -389,7 +421,9 @@ $skipCount = 0
 
 foreach ($sub in $selectedSubscriptions) {
     try {
-        Set-AzContext -SubscriptionId $sub.Id | Out-Null
+        if (-not (Set-SubscriptionContext -Subscription $sub)) {
+            continue
+        }
         
         # Check if role assignment already exists
         $existingAssignment = Get-AzRoleAssignment -ObjectId $sp.Id -RoleDefinitionName "Reader" -Scope "/subscriptions/$($sub.Id)" -ErrorAction SilentlyContinue
@@ -404,6 +438,9 @@ foreach ($sub in $selectedSubscriptions) {
         }
     } catch {
         Write-Error-Custom "Failed to assign Reader role on $($sub.Name): $_"
+        if ($_.Exception.Message -match "Forbidden") {
+            Write-Info "Requires Owner or User Access Administrator on the subscription."
+        }
     }
 }
 
@@ -569,8 +606,17 @@ if ($grantWritePerms -eq "yes") {
                     AssignableScopes = @("/subscriptions/$($sub.Id)")
                 }
                 
-                $role = New-AzRoleDefinition -Role $roleDefinition
-                Write-Success "Created custom role '$CUSTOM_ROLE_NAME' on: $($sub.Name)"
+                try {
+                    $role = New-AzRoleDefinition -Role $roleDefinition
+                    Write-Success "Created custom role '$CUSTOM_ROLE_NAME' on: $($sub.Name)"
+                } catch {
+                    if ($_.Exception.Message -match "Conflict") {
+                        Write-Info "Custom role '$CUSTOM_ROLE_NAME' already exists. Loading existing role."
+                        $role = Get-AzRoleDefinition -Name $CUSTOM_ROLE_NAME -ErrorAction SilentlyContinue
+                    } else {
+                        throw
+                    }
+                }
                 
                 # Wait for role to propagate
                 Start-Sleep -Seconds 10
@@ -604,6 +650,9 @@ if ($grantWritePerms -eq "yes") {
             
         } catch {
             Write-Error-Custom "Failed to create/assign custom role on $($sub.Name): $_"
+            if ($_.Exception.Message -match "Forbidden") {
+                Write-Info "Requires Owner or User Access Administrator on the subscription."
+            }
         }
     }
     

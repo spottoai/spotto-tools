@@ -25,6 +25,14 @@ Before running the script, ensure you have:
     *   `Az.Resources`
     *   `Microsoft.Graph.Authentication`
     *   `Microsoft.Graph.Applications`
+*   **Multi-tenant / MFA**: If your account has access to multiple tenants or is protected by conditional access (MFA), you may be prompted to sign in more than once.
+
+## Required Permissions by Scope
+
+*   **App registration**: Global Administrator or Application Administrator.
+*   **Subscription role assignments**: Owner or User Access Administrator on each subscription.
+*   **Management Groups**: Management Group Contributor or Owner at the root management group.
+*   **Reservations / Savings Plans**: Tenant-level permissions to assign roles at `/providers/Microsoft.Capacity` and `/providers/Microsoft.BillingBenefits`.
 
 ## Usage
 
@@ -76,6 +84,13 @@ Upon successful completion, the script will display the credentials you need to 
     ```
     This allows scripts to run for the current PowerShell session only. The policy resets to its default when you close the terminal window.
 *   **Permission Errors**: If you see errors regarding role assignments, ensure your user account has `Owner` or `User Access Administrator` rights on the target subscriptions.
+*   **"Please provide a valid tenant or a valid subscription"**: Re-authenticate for the tenant shown in the warning:
+    ```powershell
+    Connect-AzAccount -TenantId <tenantId>
+    ```
+    Then re-run the script and select the affected subscriptions.
+*   **"Forbidden" role assignment errors**: Your account lacks permission at that scope (subscription, management group, or tenant-level billing scopes). Ask a tenant admin or subscription owner to run the script or assign the roles manually.
+*   **"Conflict" during custom role creation**: The custom role already exists in the tenant. This is safe to ignore; re-run the script if you need to assign it to more subscriptions.
 *   **Module Errors**: If module installation fails, try running PowerShell as Administrator or install them manually:
     ```powershell
     Install-Module -Name Az -Scope CurrentUser -Force
