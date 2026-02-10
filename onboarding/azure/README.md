@@ -70,6 +70,11 @@ Upon successful completion, the script will display the credentials you need to 
 
 ## Troubleshooting
 
+*   **Execution Policy Error**: If you receive an error stating *"cannot be loaded because running scripts is disabled on this system"*, you need to update your PowerShell execution policy. Run the following command in your PowerShell terminal before executing the script:
+    ```powershell
+    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+    ```
+    This allows scripts to run for the current PowerShell session only. The policy resets to its default when you close the terminal window.
 *   **Permission Errors**: If you see errors regarding role assignments, ensure your user account has `Owner` or `User Access Administrator` rights on the target subscriptions.
 *   **Module Errors**: If module installation fails, try running PowerShell as Administrator or install them manually:
     ```powershell
