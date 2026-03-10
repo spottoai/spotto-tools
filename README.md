@@ -12,6 +12,7 @@ A collection of automation scripts and tools to help you get up and running with
 Automated PowerShell script to connect your Azure environment to Spotto:
 - Creates Azure service principal with appropriate permissions
 - Assigns Reader role across your subscriptions
+- Optionally assigns recommended Monitoring Reader and Log Analytics Data Reader roles
 - Configures Reservation and Savings Plan access
 - Grants Microsoft Graph permissions
 - Optional: Sets up write permissions for Advisor recommendations and Storage inventory
