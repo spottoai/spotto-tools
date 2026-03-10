@@ -4,10 +4,13 @@
 
 .DESCRIPTION
     This script creates a service principal, assigns necessary permissions for Spotto to analyze
-    your Azure environment, and optionally grants write permissions for specific actions.
+    your Azure environment, and optionally grants recommended read and specific write permissions.
     
     Permissions granted:
     - Reader role on selected subscriptions (read Azure resources)
+    - Optional: Monitoring Reader role on selected subscriptions (includes Microsoft.Insights/Components/Query/Read)
+    - Optional: Log Analytics Data Reader role on selected subscriptions
+      (includes workspaces/query/read, workspaces/read, and workspaces/tables/data/read)
     - Management Group Reader at tenant level (read management group hierarchy)
     - Reservation Reader at tenant level (read Reserved Instances)
     - Savings Plan Reader at tenant level (read Savings Plans)
@@ -187,6 +190,48 @@ function Set-SubscriptionContext {
     }
 }
 
+function Ensure-SubscriptionRoleAssignments {
+    param(
+        [string]$PrincipalId,
+        [object[]]$Subscriptions,
+        [string]$RoleDefinitionName,
+        [string]$RoleLabel
+    )
+
+    $successCount = 0
+    $skipCount = 0
+    $failureCount = 0
+
+    foreach ($sub in $Subscriptions) {
+        try {
+            if (-not (Set-SubscriptionContext -Subscription $sub)) {
+                $failureCount++
+                continue
+            }
+
+            $scope = "/subscriptions/$($sub.Id)"
+            $existingAssignment = Get-AzRoleAssignment -ObjectId $PrincipalId -RoleDefinitionName $RoleDefinitionName -Scope $scope -ErrorAction SilentlyContinue
+
+            if ($existingAssignment) {
+                Write-Info "$RoleLabel already assigned on: $($sub.Name)"
+                $skipCount++
+            } else {
+                New-AzRoleAssignment -ObjectId $PrincipalId -RoleDefinitionName $RoleDefinitionName -Scope $scope | Out-Null
+                Write-Success "Assigned $RoleLabel on: $($sub.Name)"
+                $successCount++
+            }
+        } catch {
+            $failureCount++
+            Write-Error-Custom "Failed to assign $RoleLabel on $($sub.Name): $_"
+            if ($_.Exception.Message -match "Forbidden") {
+                Write-Info "Requires Owner or User Access Administrator on the subscription."
+            }
+        }
+    }
+
+    Write-Info "Summary: $successCount new assignments, $skipCount already existed, $failureCount failed"
+}
+
 # ============================================================================
 # MAIN SCRIPT
 # ============================================================================
@@ -197,11 +242,12 @@ Write-Host "This script will:"
 Write-Host "1. Create a service principal named '$APP_NAME' (or use existing)"
 Write-Host "2. Generate a client secret (valid for 12 months)"
 Write-Host "3. Assign Reader role on your selected subscriptions"
-Write-Host "4. Assign Management Group Reader (tenant-level)"
-Write-Host "5. Assign Reservation Reader (tenant-level)"
-Write-Host "6. Assign Savings Plan Reader (tenant-level)"
-Write-Host "7. Grant Application.Read.All permission in Microsoft Graph"
-Write-Host "8. (Optional) Create and assign custom roles for write permissions"
+Write-Host "4. (Optional, recommended) Assign Monitoring Reader and Log Analytics Data Reader on your selected subscriptions"
+Write-Host "5. Assign Management Group Reader (tenant-level)"
+Write-Host "6. Assign Reservation Reader (tenant-level)"
+Write-Host "7. Assign Savings Plan Reader (tenant-level)"
+Write-Host "8. Grant Application.Read.All permission in Microsoft Graph"
+Write-Host "9. (Optional) Create and assign custom roles for write permissions"
 Write-Host "`nThis script is idempotent and safe to run multiple times.`n"
 
 $confirmation = Read-Host "Do you want to continue? (yes/no)"
@@ -416,41 +462,36 @@ try {
 
 Write-Header "Step 5: Assigning Reader Role on Subscriptions"
 
-$successCount = 0
-$skipCount = 0
+Ensure-SubscriptionRoleAssignments -PrincipalId $sp.Id -Subscriptions $selectedSubscriptions -RoleDefinitionName "Reader" -RoleLabel "Reader role"
 
-foreach ($sub in $selectedSubscriptions) {
-    try {
-        if (-not (Set-SubscriptionContext -Subscription $sub)) {
-            continue
-        }
-        
-        # Check if role assignment already exists
-        $existingAssignment = Get-AzRoleAssignment -ObjectId $sp.Id -RoleDefinitionName "Reader" -Scope "/subscriptions/$($sub.Id)" -ErrorAction SilentlyContinue
-        
-        if ($existingAssignment) {
-            Write-Info "Reader role already assigned on: $($sub.Name)"
-            $skipCount++
-        } else {
-            New-AzRoleAssignment -ObjectId $sp.Id -RoleDefinitionName "Reader" -Scope "/subscriptions/$($sub.Id)" | Out-Null
-            Write-Success "Assigned Reader role on: $($sub.Name)"
-            $successCount++
-        }
-    } catch {
-        Write-Error-Custom "Failed to assign Reader role on $($sub.Name): $_"
-        if ($_.Exception.Message -match "Forbidden") {
-            Write-Info "Requires Owner or User Access Administrator on the subscription."
-        }
-    }
+# ============================================================================
+# Step 6: Optional Recommended Monitoring Roles
+# ============================================================================
+
+Write-Header "Step 6: Optional Recommended Monitoring Roles"
+
+Write-Host "Spotto can optionally request these recommended read permissions on the selected subscriptions:"
+Write-Host "  1. Monitoring Reader"
+Write-Host "     - Includes Application Insights query access via Microsoft.Insights/Components/Query/Read"
+Write-Host "  2. Log Analytics Data Reader"
+Write-Host "     - Includes Microsoft.OperationalInsights/workspaces/query/read"
+Write-Host "     - Includes Microsoft.OperationalInsights/workspaces/read"
+Write-Host "     - Includes Microsoft.OperationalInsights/workspaces/tables/data/read`n"
+
+$grantMonitoringReadPerms = Read-Host "Do you want to grant these optional recommended monitoring roles? (yes/no)"
+
+if ($grantMonitoringReadPerms -eq "yes") {
+    Ensure-SubscriptionRoleAssignments -PrincipalId $sp.Id -Subscriptions $selectedSubscriptions -RoleDefinitionName "Monitoring Reader" -RoleLabel "Monitoring Reader role"
+    Ensure-SubscriptionRoleAssignments -PrincipalId $sp.Id -Subscriptions $selectedSubscriptions -RoleDefinitionName "Log Analytics Data Reader" -RoleLabel "Log Analytics Data Reader role"
+} else {
+    Write-Info "Skipping optional recommended monitoring roles"
 }
 
-Write-Info "Summary: $successCount new assignments, $skipCount already existed"
-
 # ============================================================================
-# Step 6: Assign Management Group Reader (Tenant Level)
+# Step 7: Assign Management Group Reader (Tenant Level)
 # ============================================================================
 
-Write-Header "Step 6: Assigning Management Group Reader (Tenant Level)"
+Write-Header "Step 7: Assigning Management Group Reader (Tenant Level)"
 
 try {
     # Get the root management group for this tenant
@@ -479,10 +520,10 @@ try {
 }
 
 # ============================================================================
-# Step 7: Assign Reservation Reader (Tenant Level)
+# Step 8: Assign Reservation Reader (Tenant Level)
 # ============================================================================
 
-Write-Header "Step 7: Assigning Reservation Reader (Tenant Level)"
+Write-Header "Step 8: Assigning Reservation Reader (Tenant Level)"
 
 try {
     $reservationScope = "/providers/Microsoft.Capacity"
@@ -502,10 +543,10 @@ try {
 }
 
 # ============================================================================
-# Step 8: Assign Savings Plan Reader (Tenant Level)
+# Step 9: Assign Savings Plan Reader (Tenant Level)
 # ============================================================================
 
-Write-Header "Step 8: Assigning Savings Plan Reader (Tenant Level)"
+Write-Header "Step 9: Assigning Savings Plan Reader (Tenant Level)"
 
 try {
     $savingsPlanScope = "/providers/Microsoft.BillingBenefits"
@@ -525,10 +566,10 @@ try {
 }
 
 # ============================================================================
-# Step 9: Grant Microsoft Graph Permissions
+# Step 10: Grant Microsoft Graph Permissions
 # ============================================================================
 
-Write-Header "Step 9: Granting Microsoft Graph Permissions"
+Write-Header "Step 10: Granting Microsoft Graph Permissions"
 
 try {
     Write-Info "Connecting to Microsoft Graph..."
@@ -568,10 +609,10 @@ try {
 }
 
 # ============================================================================
-# Step 10: Optional Custom Roles
+# Step 11: Optional Custom Roles
 # ============================================================================
 
-Write-Header "Step 10: Optional Custom Roles (Write Permissions)"
+Write-Header "Step 11: Optional Custom Roles (Write Permissions)"
 
 Write-Host "Spotto can optionally perform these actions if you grant write permissions:"
 Write-Host "  1. Dismiss Azure Advisor Recommendations"
@@ -670,6 +711,11 @@ Write-Header "Setup Complete!"
 
 Write-Host "✓ Service Principal: $APP_NAME ($script:clientId)"
 Write-Host "✓ Reader role assigned on $($selectedSubscriptions.Count) subscription(s)"
+if ($grantMonitoringReadPerms -eq "yes") {
+    Write-Host "✓ Monitoring Reader and Log Analytics Data Reader processed on selected subscription(s)"
+} else {
+    Write-Host "• Monitoring Reader and Log Analytics Data Reader skipped (optional)"
+}
 Write-Host "✓ Management Group Reader assigned at tenant root level"
 Write-Host "✓ Reservation Reader assigned at tenant level"
 Write-Host "✓ Savings Plan Reader assigned at tenant level"

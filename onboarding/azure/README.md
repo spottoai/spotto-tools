@@ -7,10 +7,16 @@ This directory contains the `Setup-SpottoAzure.ps1` PowerShell script, which aut
 The script performs the following actions:
 1.  Creates an Azure AD Application and Service Principal for Spotto.
 2.  Assigns the **Reader** role to selected subscriptions (or all of them).
-3.  Assigns **Reservations Reader** and **Savings Plan Reader** roles at the tenant level.
-4.  Grants **Application.Read.All** permission in Microsoft Graph (to monitor credential expiry).
-5.  (Optional) Creates and assigns a custom role for **write permissions** (Advisor recommendations, Storage inventory).
-6.  Outputs the credentials needed to configure Spotto.
+3.  (Optional, recommended) Assigns **Monitoring Reader** and **Log Analytics Data Reader** roles to selected subscriptions.
+    *   **Monitoring Reader** adds access needed for Application Insights queries via `Microsoft.Insights/Components/Query/Read`.
+    *   **Log Analytics Data Reader** adds:
+        *   `Microsoft.OperationalInsights/workspaces/query/read`
+        *   `Microsoft.OperationalInsights/workspaces/read`
+        *   `Microsoft.OperationalInsights/workspaces/tables/data/read`
+4.  Assigns **Reservations Reader** and **Savings Plan Reader** roles at the tenant level.
+5.  Grants **Application.Read.All** permission in Microsoft Graph (to monitor credential expiry).
+6.  (Optional) Creates and assigns a custom role for **write permissions** (Advisor recommendations, Storage inventory).
+7.  Outputs the credentials needed to configure Spotto.
 
 ## Prerequisites
 
@@ -61,7 +67,12 @@ The script is interactive and will guide you through the process:
 3.  **Subscription Selection**: You can choose to onboard **All** subscriptions or select specific ones by index.
 4.  **Service Principal**: It checks for an existing "Spotto AI" app. If not found, it creates one.
 5.  **Client Secret**: It generates a new client secret (valid for 1 year) or asks to use an existing one if available.
-6.  **Optional Write Permissions**: You will be asked if you want to grant optional write permissions for:
+6.  **Optional Recommended Monitoring Roles**: You will be asked if you want to grant:
+    *   **Monitoring Reader** on selected subscriptions.
+        Adds `Microsoft.Insights/Components/Query/Read` for Application Insights queries.
+    *   **Log Analytics Data Reader** on selected subscriptions.
+        Adds workspace query, workspace read, and table data read access in Log Analytics.
+7.  **Optional Write Permissions**: You will be asked if you want to grant optional write permissions for:
     *   Dismissing Azure Advisor recommendations.
     *   Enabling Storage Inventory reports.
 
