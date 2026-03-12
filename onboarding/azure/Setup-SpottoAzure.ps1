@@ -72,9 +72,9 @@ if ($missingModules.Count -gt 0) {
         Write-Host "  - $module" -ForegroundColor Yellow
     }
     
-    $install = Read-Host "`nWould you like to install missing modules now? (yes/no)"
-    
-    if ($install -eq "yes") {
+    $install = Read-YesNoInput -Prompt "`nWould you like to install missing modules now?"
+
+    if ($install) {
         Write-Host "`nInstalling modules... This may take a few minutes." -ForegroundColor Cyan
         
         foreach ($module in $missingModules) {
@@ -129,6 +129,24 @@ function Write-Success {
 function Write-Info {
     param([string]$Message)
     Write-Host "ℹ $Message" -ForegroundColor Yellow
+}
+
+function Read-YesNoInput {
+    param([string]$Prompt)
+
+    while ($true) {
+        $response = (Read-Host "$Prompt (yes/no)").Trim().ToLowerInvariant()
+
+        switch ($response) {
+            "yes" { return $true }
+            "y" { return $true }
+            "no" { return $false }
+            "n" { return $false }
+            default {
+                Write-Info "Invalid input. Please enter yes/y or no/n."
+            }
+        }
+    }
 }
 
 function Write-Error-Custom {
@@ -250,8 +268,8 @@ Write-Host "8. Grant Application.Read.All permission in Microsoft Graph"
 Write-Host "9. (Optional) Create and assign custom roles for write permissions"
 Write-Host "`nThis script is idempotent and safe to run multiple times.`n"
 
-$confirmation = Read-Host "Do you want to continue? (yes/no)"
-if ($confirmation -ne "yes") {
+$confirmation = Read-YesNoInput -Prompt "Do you want to continue?"
+if (-not $confirmation) {
     Write-Info "Setup cancelled by user."
     exit
 }
@@ -269,8 +287,8 @@ try {
         Connect-AzAccount
     } else {
         Write-Info "Already logged in as: $($currentContext.Account.Id)"
-        $reconnect = Read-Host "Do you want to use a different account? (yes/no)"
-        if ($reconnect -eq "yes") {
+        $reconnect = Read-YesNoInput -Prompt "Do you want to use a different account?"
+        if ($reconnect) {
             Connect-AzAccount
         }
     }
@@ -420,9 +438,9 @@ try {
             Write-Host "  - $($cred.EndDateTime.ToString('yyyy-MM-dd HH:mm:ss UTC'))"
         }
         
-        $createNew = Read-Host "`nDo you want to create a new secret? (yes/no)"
-        
-        if ($createNew -ne "yes") {
+        $createNew = Read-YesNoInput -Prompt "`nDo you want to create a new secret?"
+
+        if (-not $createNew) {
             Write-Info "Using existing credentials. You'll need to provide the secret value manually."
             $script:clientSecret = "<USE_EXISTING_SECRET>"
             
@@ -430,14 +448,12 @@ try {
             $latestCred = $validCredentials | Sort-Object EndDateTime -Descending | Select-Object -First 1
             $script:secretExpiry = $latestCred.EndDateTime.ToString("yyyy-MM-dd")
             $script:isNewSecret = $false
-        } else {
-            $createNew = "yes"
         }
     } else {
-        $createNew = "yes"
+        $createNew = $true
     }
-    
-    if ($createNew -eq "yes") {
+
+    if ($createNew) {
         $secretEndDate = (Get-Date).AddMonths(12)
         
         # Create credential
@@ -478,9 +494,9 @@ Write-Host "     - Includes Microsoft.OperationalInsights/workspaces/query/read"
 Write-Host "     - Includes Microsoft.OperationalInsights/workspaces/read"
 Write-Host "     - Includes Microsoft.OperationalInsights/workspaces/tables/data/read`n"
 
-$grantMonitoringReadPerms = Read-Host "Do you want to grant these optional recommended monitoring roles? (yes/no)"
+$grantMonitoringReadPerms = Read-YesNoInput -Prompt "Do you want to grant these optional recommended monitoring roles?"
 
-if ($grantMonitoringReadPerms -eq "yes") {
+if ($grantMonitoringReadPerms) {
     Ensure-SubscriptionRoleAssignments -PrincipalId $sp.Id -Subscriptions $selectedSubscriptions -RoleDefinitionName "Monitoring Reader" -RoleLabel "Monitoring Reader role"
     Ensure-SubscriptionRoleAssignments -PrincipalId $sp.Id -Subscriptions $selectedSubscriptions -RoleDefinitionName "Log Analytics Data Reader" -RoleLabel "Log Analytics Data Reader role"
 } else {
@@ -618,9 +634,9 @@ Write-Host "Spotto can optionally perform these actions if you grant write permi
 Write-Host "  1. Dismiss Azure Advisor Recommendations"
 Write-Host "  2. Enable Storage Inventory Reports`n"
 
-$grantWritePerms = Read-Host "Do you want to grant these optional write permissions? (yes/no)"
+$grantWritePerms = Read-YesNoInput -Prompt "Do you want to grant these optional write permissions?"
 
-if ($grantWritePerms -eq "yes") {
+if ($grantWritePerms) {
     
     $customRoleSuccessCount = 0
     $customRoleSkipCount = 0
@@ -711,7 +727,7 @@ Write-Header "Setup Complete!"
 
 Write-Host "✓ Service Principal: $APP_NAME ($script:clientId)"
 Write-Host "✓ Reader role assigned on $($selectedSubscriptions.Count) subscription(s)"
-if ($grantMonitoringReadPerms -eq "yes") {
+if ($grantMonitoringReadPerms) {
     Write-Host "✓ Monitoring Reader and Log Analytics Data Reader processed on selected subscription(s)"
 } else {
     Write-Host "• Monitoring Reader and Log Analytics Data Reader skipped (optional)"
@@ -720,7 +736,7 @@ Write-Host "✓ Management Group Reader assigned at tenant root level"
 Write-Host "✓ Reservation Reader assigned at tenant level"
 Write-Host "✓ Savings Plan Reader assigned at tenant level"
 Write-Host "✓ Microsoft Graph permissions granted"
-if ($grantWritePerms -eq "yes") {
+if ($grantWritePerms) {
     Write-Host "✓ Custom role with write permissions created and assigned"
 }
 
