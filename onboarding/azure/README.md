@@ -6,7 +6,9 @@ This directory contains the `Setup-SpottoAzure.ps1` PowerShell script, which aut
 
 The script performs the following actions:
 1.  Creates an Azure AD Application and Service Principal for Spotto.
-2.  Assigns the **Reader** role to selected subscriptions (or all of them).
+2.  Assigns **Reader** access based on your selection:
+    *   **All subscriptions**: assigns **Reader** once at tenant root scope (`/`) so it inherits to all current and future subscriptions.
+    *   **Specific subscriptions**: assigns **Reader** on each selected subscription.
 3.  (Optional, recommended) Assigns **Monitoring Reader** and **Log Analytics Data Reader** roles to selected subscriptions.
     *   **Monitoring Reader** adds access needed for Application Insights queries via `Microsoft.Insights/Components/Query/Read`.
     *   **Log Analytics Data Reader** adds:
@@ -25,7 +27,8 @@ Before running the script, ensure you have:
 *   **PowerShell 5.1** or **PowerShell 7+**
 *   **Azure Account Permissions**:
     *   **Global Administrator** or **Application Administrator** (to create the Service Principal).
-    *   **Owner** or **User Access Administrator** on the subscriptions you want to onboard (to assign roles).
+    *   **Owner** or **User Access Administrator** on the subscriptions you want to onboard, or at tenant root scope (`/`) if you choose **All subscriptions**.
+    *   If you choose **All subscriptions** and want the script to assign **Reader** at tenant root scope (`/`), a **Global Administrator** typically needs to enable **Microsoft Entra ID** > **Properties** > **Access management for Azure resources**, then sign out and sign back in before running the script.
 *   **PowerShell Modules** (the script will attempt to install these if missing):
     *   `Az.Accounts`
     *   `Az.Resources`
@@ -36,7 +39,8 @@ Before running the script, ensure you have:
 ## Required Permissions by Scope
 
 *   **App registration**: Global Administrator or Application Administrator.
-*   **Subscription role assignments**: Owner or User Access Administrator on each subscription.
+*   **Subscription role assignments**: Owner or User Access Administrator on each selected subscription.
+*   **Tenant root Reader assignment for All subscriptions**: Owner or User Access Administrator at root scope (`/`). Global Administrators usually get this by enabling **Access management for Azure resources** in Microsoft Entra ID.
 *   **Management Groups**: Management Group Contributor or Owner at the root management group.
 *   **Reservations / Savings Plans**: Tenant-level permissions to assign roles at `/providers/Microsoft.Capacity` and `/providers/Microsoft.BillingBenefits`.
 
@@ -65,6 +69,8 @@ The script is interactive and will guide you through the process:
 1.  **Azure Login**: It will prompt you to log in to Azure if not already connected.
 2.  **Tenant Selection**: If you have access to multiple tenants, you will be asked to select one.
 3.  **Subscription Selection**: You can choose to onboard **All** subscriptions or select specific ones by index.
+    *   If you choose **All**, the script assigns **Reader** at tenant root scope (`/`) instead of creating one assignment per subscription.
+    *   If you choose **Specific**, the script assigns **Reader** only on the subscriptions you selected.
 4.  **Service Principal**: It checks for an existing "Spotto AI" app. If not found, it creates one.
 5.  **Client Secret**: It generates a new client secret (valid for 1 year) or asks to use an existing one if available.
 6.  **Optional Recommended Monitoring Roles**: You will be asked if you want to grant:
@@ -94,7 +100,8 @@ Upon successful completion, the script will display the credentials you need to 
     Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
     ```
     This allows scripts to run for the current PowerShell session only. The policy resets to its default when you close the terminal window.
-*   **Permission Errors**: If you see errors regarding role assignments, ensure your user account has `Owner` or `User Access Administrator` rights on the target subscriptions.
+*   **Permission Errors**: If you see errors regarding role assignments, ensure your user account has `Owner` or `User Access Administrator` rights on the target subscriptions. If you selected **All subscriptions**, ensure you also have that access at tenant root scope (`/`).
+*   **Root scope Reader assignment failed**: If the script says it could not assign **Reader** at tenant root scope (`/`), and you are a Global Administrator, enable **Microsoft Entra ID** > **Properties** > **Access management for Azure resources**, sign out, sign back in, and rerun the script. If you cannot get root-scope access, rerun the script and choose specific subscriptions instead.
 *   **"Please provide a valid tenant or a valid subscription"**: Re-authenticate for the tenant shown in the warning:
     ```powershell
     Connect-AzAccount -TenantId <tenantId>
