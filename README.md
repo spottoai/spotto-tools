@@ -10,11 +10,11 @@ A collection of automation scripts and tools to help you get up and running with
 
 ### 🚀 Azure Onboarding Script
 Automated PowerShell script to connect your Azure environment to Spotto:
-- Creates Azure service principal with appropriate permissions
-- Assigns Reader role across your subscriptions
-- Optionally assigns recommended Monitoring Reader and Log Analytics Data Reader roles
-- Configures Reservation and Savings Plan access
-- Grants Microsoft Graph permissions
+- Creates an Azure service principal with the permissions Spotto needs
+- Assigns Reader access across your subscriptions, or inherits it via tenant root scope when onboarding all subscriptions
+- Optionally assigns recommended Monitoring Reader and Log Analytics Reader roles
+- Configures management-group governance visibility, tenant-wide or per-subscription Log Analytics Reader access, plus Reservations Reader and Savings plan Reader access
+- Grants Microsoft Graph `Application.Read.All` with admin consent for governance and credential posture
 - Optional: Sets up write permissions for Advisor recommendations and Storage inventory
 
 The script is **idempotent** - safe to run multiple times.
@@ -29,24 +29,26 @@ The script is **idempotent** - safe to run multiple times.
 ### Prerequisites
 - PowerShell 5.1 or PowerShell 7+
 - Azure account with appropriate permissions:
-  - Global Administrator or Application Administrator (to create service principals)
-  - Owner or User Access Administrator role on subscriptions
+  - Global Administrator or Application Administrator to create the service principal
+  - Owner or User Access Administrator on subscriptions, and at tenant root scope (`/`) if onboarding all subscriptions
+  - Management Group Contributor or Owner at the root management group
+  - Tenant admin consent for Microsoft Graph `Application.Read.All`
 
 ### Setup
 ```powershell
 # Clone the repo
 git clone https://github.com/spotto/spotto-tools.git
-cd spotto-tools/azure
+cd spotto-tools
 
 # Run the setup script
-.\Setup-SpottoAzure.ps1
+.\onboarding\azure\Setup-SpottoAzure.ps1
 ```
 
 The script will:
 1. Check and install required PowerShell modules
 2. Guide you through selecting your tenant and subscriptions
 3. Create a service principal named "Spotto AI"
-4. Assign necessary permissions
+4. Assign the required governance, billing, and optional monitoring permissions
 5. Display credentials to copy into the Spotto portal
 
 ### Next Steps

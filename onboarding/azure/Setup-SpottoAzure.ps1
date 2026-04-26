@@ -3,20 +3,25 @@
     Sets up Azure service principal with appropriate permissions for Spotto AI.
 
 .DESCRIPTION
-    This script creates a service principal, assigns necessary permissions for Spotto to analyze
-    your Azure environment, and optionally grants recommended read and specific write permissions.
+    This script creates a service principal, assigns the governance and billing permissions Spotto
+    uses to analyze your Azure environment, and optionally grants recommended monitoring roles and
+    specific write permissions.
     
     Permissions granted:
     - Reader role at tenant root scope when all subscriptions are selected
       (inherits to all current and future subscriptions in the tenant)
     - Reader role on selected subscriptions when specific subscriptions are chosen
     - Optional: Monitoring Reader role on selected subscriptions (includes Microsoft.Insights/Components/Query/Read)
-    - Optional: Log Analytics Data Reader role on selected subscriptions
-      (includes workspaces/query/read, workspaces/read, and workspaces/tables/data/read)
-    - Management Group Reader at tenant level (read management group hierarchy)
-    - Reservation Reader at tenant level (read Reserved Instances)
-    - Savings Plan Reader at tenant level (read Savings Plans)
-    - Application.Read.All in Microsoft Graph (read service principal credential expiry)
+    - Optional: Log Analytics Reader role
+      (assigned at the root management group when all subscriptions are selected,
+       otherwise on selected subscriptions)
+      (includes workspace query access plus broader monitoring read access)
+    - Management Group Reader at the root management group
+      (read management group hierarchy plus management-group policy and RBAC metadata)
+    - Reservations Reader at /providers/Microsoft.Capacity
+    - Savings plan Reader at /providers/Microsoft.BillingBenefits
+    - Application.Read.All in Microsoft Graph with admin consent
+      (read applications and service principals for governance and credential posture)
     - Optional: Custom role for dismissing Azure Advisor recommendations
     - Optional: Custom role for enabling Storage Inventory Reports
     
@@ -27,8 +32,9 @@
     - PowerShell 5.1 or PowerShell 7+
     - Azure PowerShell module (will be installed if missing)
     - Microsoft Graph PowerShell module (will be installed if missing)
-    - Global Administrator or appropriate permissions to create service principals
+    - Global Administrator, Application Administrator, or appropriate permissions to create service principals
     - Owner or User Access Administrator on subscriptions, or at tenant root scope (/)
+    - Tenant admin consent for Microsoft Graph Application.Read.All
     - Management Group Contributor or Owner role for management group access
     - If assigning Reader at tenant root scope (/), Global Administrators typically need
       to enable Microsoft Entra ID > Properties > Access management for Azure resources
@@ -115,8 +121,11 @@ $script:clientSecret = $null
 $script:secretExpiry = $null
 $script:isNewSecret = $false
 $script:useTenantRootReader = $false
+$script:rootManagementGroup = $null
 $script:rootReaderAssignmentStatus = "not-applicable"
+$script:rootManagementGroupReaderStatus = "not-run"
 $script:managementGroupReaderStatus = "not-run"
+$script:logAnalyticsReaderStatus = "not-run"
 $script:reservationReaderStatus = "not-run"
 $script:savingsPlanReaderStatus = "not-run"
 $script:graphPermissionStatus = "not-run"
@@ -273,6 +282,84 @@ function Ensure-TenantRootReaderAssignment {
     }
 }
 
+function Resolve-RootManagementGroup {
+    param([string]$TenantId)
+
+    if ($script:rootManagementGroup) {
+        return $script:rootManagementGroup
+    }
+
+    $rootManagementGroup = $null
+
+    try {
+        $rootManagementGroup = Get-AzManagementGroup -GroupName $TenantId -ErrorAction SilentlyContinue
+
+        if (-not $rootManagementGroup) {
+            $managementGroups = @(Get-AzManagementGroup -ErrorAction Stop)
+            $rootManagementGroup = $managementGroups |
+                Sort-Object @{ Expression = { if ($_.Name -eq $TenantId) { 0 } else { 1 } } } |
+                Where-Object { $_.Name -eq $TenantId -or [string]::IsNullOrWhiteSpace($_.ParentId) } |
+                Select-Object -First 1
+        }
+    } catch {
+        throw "Unable to query management groups for tenant $TenantId. $_"
+    }
+
+    if (-not $rootManagementGroup) {
+        throw "Unable to resolve the root management group for tenant $TenantId."
+    }
+
+    $script:rootManagementGroup = $rootManagementGroup
+    return $rootManagementGroup
+}
+
+function Ensure-RootManagementGroupRoleAssignment {
+    param(
+        [string]$PrincipalId,
+        [string]$RoleDefinitionName,
+        [string]$RoleLabel
+    )
+
+    try {
+        $rootManagementGroup = Resolve-RootManagementGroup -TenantId $script:tenantId
+        $rootManagementGroupScope = if ($rootManagementGroup.Id) {
+            $rootManagementGroup.Id
+        } else {
+            "/providers/Microsoft.Management/managementGroups/$($rootManagementGroup.Name)"
+        }
+        $rootManagementGroupName = if ($rootManagementGroup.DisplayName) {
+            $rootManagementGroup.DisplayName
+        } elseif ($rootManagementGroup.Name) {
+            $rootManagementGroup.Name
+        } else {
+            $script:tenantId
+        }
+
+        Write-Info "Attempting to assign $RoleLabel at the root management group..."
+        Write-Info "Resolved root management group: $rootManagementGroupName"
+        Write-Info "Management Group Scope: $rootManagementGroupScope"
+
+        $existingAssignment = Get-AzRoleAssignment -ObjectId $PrincipalId -Scope $rootManagementGroupScope -RoleDefinitionName $RoleDefinitionName -ErrorAction SilentlyContinue
+
+        if ($existingAssignment) {
+            Write-Info "$RoleLabel already assigned"
+            return "existing"
+        }
+
+        New-AzRoleAssignment -ObjectId $PrincipalId -RoleDefinitionName $RoleDefinitionName -Scope $rootManagementGroupScope | Out-Null
+        Write-Success "Assigned $RoleLabel at the root management group"
+        return "created"
+    } catch {
+        Write-Error-Custom "Failed to assign ${RoleLabel}: $_"
+        Write-Info "This may occur if:"
+        Write-Info "  - You don't have sufficient permissions at the root management group"
+        Write-Info "  - Management Groups are not enabled in your tenant"
+        Write-Info "  - The root management group could not be resolved in the selected tenant"
+        Write-Info "  - You need to manually assign this at the root management group in Azure Portal > Management Groups"
+        return "failed"
+    }
+}
+
 # ============================================================================
 # MAIN SCRIPT
 # ============================================================================
@@ -285,11 +372,13 @@ Write-Host "2. Generate a client secret (valid for 12 months)"
 Write-Host "3. Assign Reader access"
 Write-Host "   - All subscriptions: one Reader role at tenant root scope (/)"
 Write-Host "   - Specific subscriptions: Reader role on each selected subscription"
-Write-Host "4. (Optional, recommended) Assign Monitoring Reader and Log Analytics Data Reader on your selected subscriptions"
-Write-Host "5. Assign Management Group Reader (tenant-level)"
-Write-Host "6. Assign Reservation Reader (tenant-level)"
-Write-Host "7. Assign Savings Plan Reader (tenant-level)"
-Write-Host "8. Grant Application.Read.All permission in Microsoft Graph"
+Write-Host "4. (Optional, recommended) Assign Monitoring Reader and Log Analytics Reader"
+Write-Host "   - Monitoring Reader: selected subscriptions"
+Write-Host "   - Log Analytics Reader: root management group for all subscriptions, otherwise selected subscriptions"
+Write-Host "5. Assign Reader and Management Group Reader at the root management group for tenant governance hierarchy, policy, and RBAC metadata"
+Write-Host "6. Assign Reservations Reader at /providers/Microsoft.Capacity"
+Write-Host "7. Assign Savings plan Reader at /providers/Microsoft.BillingBenefits"
+Write-Host "8. Grant Microsoft Graph Application.Read.All with admin consent for governance and credential posture"
 Write-Host "9. (Optional) Create and assign custom roles for write permissions"
 Write-Host "`nThis script is idempotent and safe to run multiple times.`n"
 Write-Host "Important for 'All subscriptions':" -ForegroundColor Yellow
@@ -297,6 +386,7 @@ Write-Host "  - The script will assign Reader at tenant root scope (/)." -Foregr
 Write-Host "  - This needs Owner or User Access Administrator at root scope." -ForegroundColor Yellow
 Write-Host "  - Global Administrators usually need to enable Microsoft Entra ID > Properties > Access management for Azure resources first," -ForegroundColor Yellow
 Write-Host "    then sign out and sign back in before running the script." -ForegroundColor Yellow
+Write-Host "  - Microsoft Graph Application.Read.All also requires tenant admin consent." -ForegroundColor Yellow
 Write-Host ""
 
 $confirmation = Read-Host "Do you want to continue? (yes/no)"
@@ -527,63 +617,55 @@ if ($script:useTenantRootReader) {
 
 Write-Header "Step 6: Optional Recommended Monitoring Roles"
 
-Write-Host "Spotto can optionally request these recommended read permissions on the selected subscriptions:"
+Write-Host "Spotto can optionally request these recommended read permissions:"
 Write-Host "  1. Monitoring Reader"
 Write-Host "     - Includes Application Insights query access via Microsoft.Insights/Components/Query/Read"
-Write-Host "  2. Log Analytics Data Reader"
-Write-Host "     - Includes Microsoft.OperationalInsights/workspaces/query/read"
-Write-Host "     - Includes Microsoft.OperationalInsights/workspaces/read"
-Write-Host "     - Includes Microsoft.OperationalInsights/workspaces/tables/data/read`n"
+Write-Host "     - Assigned on the selected subscriptions"
+Write-Host "  2. Log Analytics Reader"
+Write-Host "     - All subscriptions: assigned once at the root management group for tenant-wide workspace log access"
+Write-Host "     - Specific subscriptions: assigned on each selected subscription"
+Write-Host "     - Broader than Log Analytics Data Reader and suited for future workspace log analysis`n"
+Write-Info "Press Enter to accept the default answer of yes."
 
 $grantMonitoringReadPerms = Read-Host "Do you want to grant these optional recommended monitoring roles? (yes/no)"
 
-if ($grantMonitoringReadPerms -eq "yes") {
+if ([string]::IsNullOrWhiteSpace($grantMonitoringReadPerms) -or $grantMonitoringReadPerms -match "^(?i:yes)$") {
     Ensure-SubscriptionRoleAssignments -PrincipalId $sp.Id -Subscriptions $selectedSubscriptions -RoleDefinitionName "Monitoring Reader" -RoleLabel "Monitoring Reader role"
-    Ensure-SubscriptionRoleAssignments -PrincipalId $sp.Id -Subscriptions $selectedSubscriptions -RoleDefinitionName "Log Analytics Data Reader" -RoleLabel "Log Analytics Data Reader role"
-} else {
+
+    if ($script:useTenantRootReader) {
+        $script:logAnalyticsReaderStatus = Ensure-RootManagementGroupRoleAssignment -PrincipalId $sp.Id -RoleDefinitionName "Log Analytics Reader" -RoleLabel "Log Analytics Reader role"
+    } else {
+        Ensure-SubscriptionRoleAssignments -PrincipalId $sp.Id -Subscriptions $selectedSubscriptions -RoleDefinitionName "Log Analytics Reader" -RoleLabel "Log Analytics Reader role"
+        $script:logAnalyticsReaderStatus = "processed"
+    }
+} elseif ($grantMonitoringReadPerms -match "^(?i:no)$") {
     Write-Info "Skipping optional recommended monitoring roles"
+    $script:logAnalyticsReaderStatus = "skipped"
+} else {
+    Write-Info "Unrecognized response. Defaulting to no for the optional recommended monitoring roles."
+    $script:logAnalyticsReaderStatus = "skipped"
 }
 
 # ============================================================================
-# Step 7: Assign Management Group Reader (Tenant Level)
+# Step 7: Assign Root Management Group Governance Reader Roles
 # ============================================================================
 
-Write-Header "Step 7: Assigning Management Group Reader (Tenant Level)"
+Write-Header "Step 7: Assigning Root Management Group Governance Reader Roles"
 
 try {
-    # Get the root management group for this tenant
-    # The root management group ID is typically the same as the tenant ID
-    $rootMgId = $script:tenantId
-    $mgScope = "/providers/Microsoft.Management/managementGroups/$rootMgId"
-    
-    Write-Info "Attempting to assign Management Group Reader at root level..."
-    Write-Info "Management Group Scope: $mgScope"
-    
-    # Check if role assignment already exists
-    $existingMgAssignment = Get-AzRoleAssignment -ObjectId $sp.Id -Scope $mgScope -RoleDefinitionName "Management Group Reader" -ErrorAction SilentlyContinue
-    
-    if ($existingMgAssignment) {
-        Write-Info "Management Group Reader role already assigned"
-        $script:managementGroupReaderStatus = "existing"
-    } else {
-        New-AzRoleAssignment -ObjectId $sp.Id -RoleDefinitionName "Management Group Reader" -Scope $mgScope | Out-Null
-        Write-Success "Assigned Management Group Reader role at tenant root level"
-        $script:managementGroupReaderStatus = "created"
-    }
+    $script:rootManagementGroupReaderStatus = Ensure-RootManagementGroupRoleAssignment -PrincipalId $sp.Id -RoleDefinitionName "Reader" -RoleLabel "Reader role (root management group)"
+    $script:managementGroupReaderStatus = Ensure-RootManagementGroupRoleAssignment -PrincipalId $sp.Id -RoleDefinitionName "Management Group Reader" -RoleLabel "Management Group Reader role"
 } catch {
+    $script:rootManagementGroupReaderStatus = "failed"
     $script:managementGroupReaderStatus = "failed"
-    Write-Error-Custom "Failed to assign Management Group Reader role: $_"
-    Write-Info "This may occur if:"
-    Write-Info "  - You don't have sufficient permissions (need Management Group Contributor or Owner)"
-    Write-Info "  - Management Groups are not enabled in your tenant"
-    Write-Info "  - You need to manually assign this in Azure Portal > Management Groups"
+    Write-Error-Custom "Failed to assign root management group governance reader roles: $_"
 }
 
 # ============================================================================
-# Step 8: Assign Reservation Reader (Tenant Level)
+# Step 8: Assign Reservations Reader
 # ============================================================================
 
-Write-Header "Step 8: Assigning Reservation Reader (Tenant Level)"
+Write-Header "Step 8: Assigning Reservations Reader"
 
 try {
     $reservationScope = "/providers/Microsoft.Capacity"
@@ -592,24 +674,24 @@ try {
     $existingReservation = Get-AzRoleAssignment -ObjectId $sp.Id -Scope $reservationScope -RoleDefinitionName "Reservations Reader" -ErrorAction SilentlyContinue
     
     if ($existingReservation) {
-        Write-Info "Reservation Reader role already assigned"
+        Write-Info "Reservations Reader role already assigned"
         $script:reservationReaderStatus = "existing"
     } else {
         New-AzRoleAssignment -ObjectId $sp.Id -RoleDefinitionName "Reservations Reader" -Scope $reservationScope | Out-Null
-        Write-Success "Assigned Reservation Reader role at tenant level"
+        Write-Success "Assigned Reservations Reader role at /providers/Microsoft.Capacity"
         $script:reservationReaderStatus = "created"
     }
 } catch {
     $script:reservationReaderStatus = "failed"
-    Write-Error-Custom "Failed to assign Reservation Reader role: $_"
-    Write-Info "You may need elevated permissions to assign this role"
+    Write-Error-Custom "Failed to assign Reservations Reader role: $_"
+    Write-Info "You may need elevated permissions to assign this role at /providers/Microsoft.Capacity"
 }
 
 # ============================================================================
-# Step 9: Assign Savings Plan Reader (Tenant Level)
+# Step 9: Assign Savings plan Reader
 # ============================================================================
 
-Write-Header "Step 9: Assigning Savings Plan Reader (Tenant Level)"
+Write-Header "Step 9: Assigning Savings plan Reader"
 
 try {
     $savingsPlanScope = "/providers/Microsoft.BillingBenefits"
@@ -618,33 +700,33 @@ try {
     $existingSavingsPlan = Get-AzRoleAssignment -ObjectId $sp.Id -Scope $savingsPlanScope -RoleDefinitionName "Savings plan Reader" -ErrorAction SilentlyContinue
     
     if ($existingSavingsPlan) {
-        Write-Info "Savings Plan Reader role already assigned"
+        Write-Info "Savings plan Reader role already assigned"
         $script:savingsPlanReaderStatus = "existing"
     } else {
         New-AzRoleAssignment -ObjectId $sp.Id -RoleDefinitionName "Savings plan Reader" -Scope $savingsPlanScope | Out-Null
-        Write-Success "Assigned Savings Plan Reader role at tenant level"
+        Write-Success "Assigned Savings plan Reader role at /providers/Microsoft.BillingBenefits"
         $script:savingsPlanReaderStatus = "created"
     }
 } catch {
     $script:savingsPlanReaderStatus = "failed"
-    Write-Error-Custom "Failed to assign Savings Plan Reader role: $_"
-    Write-Info "You may need elevated permissions to assign this role"
+    Write-Error-Custom "Failed to assign Savings plan Reader role: $_"
+    Write-Info "You may need elevated permissions to assign this role at /providers/Microsoft.BillingBenefits"
 }
 
 # ============================================================================
-# Step 10: Grant Microsoft Graph Permissions
+# Step 10: Grant Microsoft Graph Application.Read.All
 # ============================================================================
 
-Write-Header "Step 10: Granting Microsoft Graph Permissions"
+Write-Header "Step 10: Granting Microsoft Graph Application.Read.All"
 
 try {
-    Write-Info "Connecting to Microsoft Graph..."
+    Write-Info "Connecting to Microsoft Graph to grant Application.Read.All with admin consent..."
     Connect-MgGraph -Scopes "Application.ReadWrite.All", "AppRoleAssignment.ReadWrite.All" -TenantId $script:tenantId -NoWelcome
     
     # Get Microsoft Graph service principal
     $graphSp = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'"
     
-    # Get Application.Read.All permission
+    # Get Application.Read.All application permission
     $appReadAllPermission = $graphSp.AppRoles | Where-Object { $_.Value -eq "Application.Read.All" }
     
     if ($null -eq $appReadAllPermission) {
@@ -655,12 +737,12 @@ try {
             Where-Object { $_.AppRoleId -eq $appReadAllPermission.Id }
         
         if ($existingPermission) {
-            Write-Info "Application.Read.All permission already granted"
+            Write-Info "Application.Read.All already granted for governance and credential posture"
             $script:graphPermissionStatus = "existing"
         } else {
             # Grant the permission
             New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -PrincipalId $sp.Id -ResourceId $graphSp.Id -AppRoleId $appReadAllPermission.Id | Out-Null
-            Write-Success "Granted Application.Read.All permission"
+            Write-Success "Granted Application.Read.All with admin consent for governance and credential posture"
             $script:graphPermissionStatus = "created"
         }
     }
@@ -673,8 +755,9 @@ try {
     
 } catch {
     $script:graphPermissionStatus = "failed"
-    Write-Error-Custom "Failed to grant Microsoft Graph permissions: $_"
-    Write-Info "You may need to grant this manually through Azure Portal > App Registrations > API Permissions"
+    Write-Error-Custom "Failed to grant Microsoft Graph Application.Read.All: $_"
+    Write-Info "You may need a tenant admin to grant admin consent."
+    Write-Info "You can also grant this manually through Azure Portal > App Registrations > API Permissions"
 }
 
 # ============================================================================
@@ -789,38 +872,57 @@ if ($script:useTenantRootReader) {
 } else {
     Write-Host "✓ Reader role processed on $($selectedSubscriptions.Count) selected subscription(s)"
 }
-if ($grantMonitoringReadPerms -eq "yes") {
-    Write-Host "✓ Monitoring Reader and Log Analytics Data Reader processed on selected subscription(s)"
+if ([string]::IsNullOrWhiteSpace($grantMonitoringReadPerms) -or $grantMonitoringReadPerms -match "^(?i:yes)$") {
+    Write-Host "✓ Monitoring Reader processed on selected subscription(s)"
 } else {
-    Write-Host "• Monitoring Reader and Log Analytics Data Reader skipped (optional)"
+    Write-Host "• Monitoring Reader skipped (optional)"
+}
+switch ($script:logAnalyticsReaderStatus) {
+    "created" { Write-Host "✓ Log Analytics Reader assigned at the root management group" }
+    "existing" { Write-Host "✓ Log Analytics Reader already existed at the root management group" }
+    "processed" { Write-Host "✓ Log Analytics Reader processed on selected subscription(s)" }
+    "failed" { Write-Host "✗ Log Analytics Reader was not assigned" }
+    "skipped" { Write-Host "• Log Analytics Reader skipped (optional)" }
+    default { Write-Host "• Log Analytics Reader was not processed" }
+}
+switch ($script:rootManagementGroupReaderStatus) {
+    "created" { Write-Host "✓ Reader assigned at the root management group for tenant governance hierarchy access" }
+    "existing" { Write-Host "✓ Reader already existed at the root management group for tenant governance hierarchy access" }
+    "failed" { Write-Host "✗ Reader was not assigned at the root management group" }
+    default { Write-Host "• Reader at the root management group was not processed" }
 }
 switch ($script:managementGroupReaderStatus) {
-    "created" { Write-Host "✓ Management Group Reader assigned at tenant root level" }
-    "existing" { Write-Host "✓ Management Group Reader already existed at tenant root level" }
-    "failed" { Write-Host "✗ Management Group Reader was not assigned at tenant root level" }
+    "created" { Write-Host "✓ Management Group Reader assigned at the root management group" }
+    "existing" { Write-Host "✓ Management Group Reader already existed at the root management group" }
+    "failed" { Write-Host "✗ Management Group Reader was not assigned at the root management group" }
     default { Write-Host "• Management Group Reader was not processed" }
 }
 switch ($script:reservationReaderStatus) {
-    "created" { Write-Host "✓ Reservation Reader assigned at tenant level" }
-    "existing" { Write-Host "✓ Reservation Reader already existed at tenant level" }
-    "failed" { Write-Host "✗ Reservation Reader was not assigned at tenant level" }
-    default { Write-Host "• Reservation Reader was not processed" }
+    "created" { Write-Host "✓ Reservations Reader assigned at /providers/Microsoft.Capacity" }
+    "existing" { Write-Host "✓ Reservations Reader already existed at /providers/Microsoft.Capacity" }
+    "failed" { Write-Host "✗ Reservations Reader was not assigned at /providers/Microsoft.Capacity" }
+    default { Write-Host "• Reservations Reader was not processed" }
 }
 switch ($script:savingsPlanReaderStatus) {
-    "created" { Write-Host "✓ Savings Plan Reader assigned at tenant level" }
-    "existing" { Write-Host "✓ Savings Plan Reader already existed at tenant level" }
-    "failed" { Write-Host "✗ Savings Plan Reader was not assigned at tenant level" }
-    default { Write-Host "• Savings Plan Reader was not processed" }
+    "created" { Write-Host "✓ Savings plan Reader assigned at /providers/Microsoft.BillingBenefits" }
+    "existing" { Write-Host "✓ Savings plan Reader already existed at /providers/Microsoft.BillingBenefits" }
+    "failed" { Write-Host "✗ Savings plan Reader was not assigned at /providers/Microsoft.BillingBenefits" }
+    default { Write-Host "• Savings plan Reader was not processed" }
 }
 switch ($script:graphPermissionStatus) {
-    "created" { Write-Host "✓ Microsoft Graph permissions granted" }
-    "existing" { Write-Host "✓ Microsoft Graph permissions already existed" }
-    "failed" { Write-Host "✗ Microsoft Graph permissions were not granted" }
-    default { Write-Host "• Microsoft Graph permissions were not processed" }
+    "created" { Write-Host "✓ Microsoft Graph Application.Read.All granted for governance and credential posture" }
+    "existing" { Write-Host "✓ Microsoft Graph Application.Read.All already existed for governance and credential posture" }
+    "failed" { Write-Host "✗ Microsoft Graph Application.Read.All was not granted" }
+    default { Write-Host "• Microsoft Graph Application.Read.All was not processed" }
 }
 if ($grantWritePerms -eq "yes") {
     Write-Host "✓ Custom role with write permissions created and assigned"
 }
+Write-Host ""
+Write-Host "Propagation note:" -ForegroundColor Yellow
+Write-Host "  Azure RBAC changes and Microsoft Graph admin consent can take 5-15 minutes to apply." -ForegroundColor Yellow
+Write-Host "  During that time, Spotto may validate the account or list subscriptions while tenant governance data still shows access denied." -ForegroundColor Yellow
+Write-Host "  If that happens, wait a few minutes and rerun validation or retry the tenant sync." -ForegroundColor Yellow
 
 # Display credentials for copy/paste
 Show-Credentials

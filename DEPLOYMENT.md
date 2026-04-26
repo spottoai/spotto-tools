@@ -7,6 +7,7 @@ Owner: Platform
 ## Prerequisites
 - PowerShell 5.1 or PowerShell 7+
 - Azure account with required permissions (see `README.md`)
+- For detailed onboarding permission scopes, including optional `Log Analytics Reader`, see `onboarding/azure/README.md`
 
 ## Run onboarding script
 ```powershell
