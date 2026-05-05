@@ -51,12 +51,14 @@ The script will:
 4. Assign the required governance, billing, and optional monitoring permissions
 5. Display credentials to copy into the Spotto portal
 
+You can safely rerun the script. It checks for existing Spotto resources and role assignments, then reuses or updates them where possible.
+
 ### Next Steps
 
 1. Copy the credentials displayed at the end of the script
 2. Go to [Spotto Portal](https://portal.spotto.ai)
-3. Navigate to: **Cloud Accounts** > **Add Cloud Account**
-4. Paste your credentials and click **Validate & Create**
+3. Navigate to: **Connectors** > **Cloud Accounts**
+4. Add a cloud account, paste your credentials, click **Validate Credentials**, then click **Create**
 
 ## Coming Soon
 

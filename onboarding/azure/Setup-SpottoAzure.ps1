@@ -46,10 +46,40 @@
 
 # Script configuration
 $ErrorActionPreference = "Stop"
+$APP_NAME = "Spotto AI"
+$CUSTOM_ROLE_NAME = "Spotto Access"
+$script:ConsolePanelWidth = 80
 
 # Start logging
 $logPath = "SpottoSetup-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
 Start-Transcript -Path $logPath -Append
+
+function Show-StartupSplash {
+    param([string]$TranscriptPath)
+
+    $logo = @'
+   _____ ____   ____  ______ ______ ____
+  / ___// __ \ / __ \/_  __//_  __// __ \
+  \__ \/ /_/ // / / / / /    / /  / / / /
+ ___/ / ____// /_/ / / /    / /  / /_/ /
+/____/_/     \____/ /_/    /_/   \____/
+'@
+
+    Write-Host ""
+    Write-Host ("=" * $script:ConsolePanelWidth) -ForegroundColor Cyan
+    Write-Host $logo -ForegroundColor Cyan
+    Write-Host ("-" * $script:ConsolePanelWidth) -ForegroundColor DarkGray
+    Write-Host "  Azure onboarding for Spotto AI" -ForegroundColor White
+    Write-Host "  Creates the service principal and assigns the Azure access Spotto needs." -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  Safe to rerun:" -ForegroundColor Green -NoNewline
+    Write-Host " existing apps, secrets, and role assignments are reused where possible." -ForegroundColor White
+    Write-Host "  Transcript: $TranscriptPath" -ForegroundColor DarkGray
+    Write-Host ("=" * $script:ConsolePanelWidth) -ForegroundColor Cyan
+    Write-Host ""
+}
+
+Show-StartupSplash -TranscriptPath $logPath
 
 # ============================================================================
 # CHECK AND INSTALL REQUIRED MODULES
@@ -111,8 +141,6 @@ if ($missingModules.Count -gt 0) {
 }
 
 Write-Host "✓ All required modules are available`n" -ForegroundColor Green
-$APP_NAME = "Spotto AI"
-$CUSTOM_ROLE_NAME = "Spotto Access"
 
 # Global variables to track credentials
 $script:clientId = $null
@@ -134,11 +162,100 @@ $script:graphPermissionStatus = "not-run"
 # HELPER FUNCTIONS
 # ============================================================================
 
+function Write-Divider {
+    param(
+        [string]$Character = "=",
+        [ConsoleColor]$Color = "Cyan"
+    )
+
+    Write-Host ($Character * $script:ConsolePanelWidth) -ForegroundColor $Color
+}
+
+function Get-CenteredText {
+    param([string]$Text)
+
+    if ([string]::IsNullOrEmpty($Text) -or $Text.Length -ge $script:ConsolePanelWidth) {
+        return $Text
+    }
+
+    $padding = [Math]::Floor(($script:ConsolePanelWidth - $Text.Length) / 2)
+    return (" " * $padding) + $Text
+}
+
 function Write-Header {
-    param([string]$Message)
-    Write-Host "`n========================================" -ForegroundColor Cyan
-    Write-Host $Message -ForegroundColor Cyan
-    Write-Host "========================================`n" -ForegroundColor Cyan
+    param(
+        [string]$Message,
+        [string]$Subtitle = ""
+    )
+
+    Write-Host ""
+    Write-Divider -Color Cyan
+    Write-Host (Get-CenteredText $Message) -ForegroundColor Cyan
+    if (-not [string]::IsNullOrWhiteSpace($Subtitle)) {
+        Write-Host (Get-CenteredText $Subtitle) -ForegroundColor DarkGray
+    }
+    Write-Divider -Color Cyan
+    Write-Host ""
+}
+
+function Write-PanelTitle {
+    param(
+        [string]$Title,
+        [string]$Subtitle = "",
+        [ConsoleColor]$Color = "Cyan"
+    )
+
+    Write-Host ""
+    Write-Divider -Color $Color
+    Write-Host (Get-CenteredText $Title) -ForegroundColor $Color
+    if (-not [string]::IsNullOrWhiteSpace($Subtitle)) {
+        Write-Host (Get-CenteredText $Subtitle) -ForegroundColor $Color
+    }
+    Write-Divider -Color $Color
+}
+
+function Write-SectionLabel {
+    param([string]$Title)
+
+    Write-Host $Title -ForegroundColor Cyan
+    Write-Divider -Character "-" -Color DarkGray
+}
+
+function Write-DetailRow {
+    param(
+        [string]$Label,
+        [string]$Value,
+        [ConsoleColor]$ValueColor = "White"
+    )
+
+    $labelText = "  {0,-30}" -f ($Label + ":")
+    Write-Host $labelText -ForegroundColor DarkGray -NoNewline
+    Write-Host $Value -ForegroundColor $ValueColor
+}
+
+function Write-NumberedStep {
+    param(
+        [int]$Number,
+        [string]$Message
+    )
+
+    Write-Host ("  {0,2}. {1}" -f $Number, $Message)
+}
+
+function Write-OptionRow {
+    param(
+        [string]$Key,
+        [string]$Label,
+        [string]$Description = ""
+    )
+
+    Write-Host ("  [{0}] " -f $Key) -ForegroundColor Cyan -NoNewline
+    Write-Host $Label -NoNewline
+    if (-not [string]::IsNullOrWhiteSpace($Description)) {
+        Write-Host " - $Description" -ForegroundColor DarkGray
+    } else {
+        Write-Host ""
+    }
 }
 
 function Write-Success {
@@ -148,7 +265,7 @@ function Write-Success {
 
 function Write-Info {
     param([string]$Message)
-    Write-Host "ℹ $Message" -ForegroundColor Yellow
+    Write-Host "ℹ $Message" -ForegroundColor Cyan
 }
 
 function Write-Error-Custom {
@@ -156,25 +273,38 @@ function Write-Error-Custom {
     Write-Host "✗ $Message" -ForegroundColor Red
 }
 
+function Write-Skipped {
+    param([string]$Message)
+    Write-Host "• $Message" -ForegroundColor DarkGray
+}
+
 function Show-Credentials {
-    Write-Host "`n" + ("=" * 80) -ForegroundColor Yellow
-    Write-Host " SPOTTO CREDENTIALS - Copy these into the Spotto Portal " -ForegroundColor Yellow
-    Write-Host ("=" * 80) -ForegroundColor Yellow
+    Write-PanelTitle -Title "SPOTTO CREDENTIALS" -Subtitle "Copy these values into the Spotto Portal" -Color Yellow
     Write-Host ""
-    Write-Host "  Application (Client) ID:  " -NoNewline
-    Write-Host $script:clientId -ForegroundColor Green
-    Write-Host "  Directory (Tenant) ID:    " -NoNewline
-    Write-Host $script:tenantId -ForegroundColor Green
-    Write-Host "  Client Secret:            " -NoNewline
-    Write-Host $script:clientSecret -ForegroundColor Green
-    Write-Host "  Secret Expiry Date:       " -NoNewline
-    Write-Host $script:secretExpiry -ForegroundColor Green
+    Write-DetailRow -Label "Application (Client) ID" -Value $script:clientId -ValueColor Green
+    Write-DetailRow -Label "Directory (Tenant) ID" -Value $script:tenantId -ValueColor Green
+    Write-DetailRow -Label "Client Secret" -Value $script:clientSecret -ValueColor Green
+    Write-DetailRow -Label "Secret Expiry Date" -Value $script:secretExpiry -ValueColor Green
     Write-Host ""
-    Write-Host ("=" * 80) -ForegroundColor Yellow
     if ($script:isNewSecret) {
         Write-Host "⚠ IMPORTANT: This secret will not be shown again! Save it now." -ForegroundColor Red
     }
-    Write-Host ("=" * 80) -ForegroundColor Yellow
+    Write-Divider -Color Yellow
+    Write-Host ""
+}
+
+function Show-NextSteps {
+    Write-PanelTitle -Title "NEXT STEPS" -Subtitle "Finish the connection in Spotto" -Color Cyan
+    Write-Host ""
+    Write-NumberedStep -Number 1 -Message "Copy the credentials shown above."
+    Write-NumberedStep -Number 2 -Message "Go to the Spotto Portal: https://portal.spotto.ai"
+    Write-NumberedStep -Number 3 -Message "Navigate to: Connectors > Cloud Accounts"
+    Write-NumberedStep -Number 4 -Message "Add a cloud account and paste the credentials into the form."
+    Write-NumberedStep -Number 5 -Message "Click 'Validate Credentials', then click 'Create'."
+    Write-Host ""
+    Write-Info "It is safe to rerun this script later if validation needs more time or access changes."
+    Write-Host ""
+    Write-Divider -Color Cyan
     Write-Host ""
 }
 
@@ -364,29 +494,32 @@ function Ensure-RootManagementGroupRoleAssignment {
 # MAIN SCRIPT
 # ============================================================================
 
-Write-Header "Spotto AI - Azure Setup Script"
+Write-Header -Message "Spotto AI Azure Setup" -Subtitle "Creates the service principal and assigns required Azure access"
 
-Write-Host "This script will:"
-Write-Host "1. Create a service principal named '$APP_NAME' (or use existing)"
-Write-Host "2. Generate a client secret (valid for 12 months)"
-Write-Host "3. Assign Reader access"
-Write-Host "   - All subscriptions: one Reader role at tenant root scope (/)"
-Write-Host "   - Specific subscriptions: Reader role on each selected subscription"
-Write-Host "4. (Optional, recommended) Assign Monitoring Reader and Log Analytics Reader"
-Write-Host "   - Monitoring Reader: selected subscriptions"
-Write-Host "   - Log Analytics Reader: root management group for all subscriptions, otherwise selected subscriptions"
-Write-Host "5. Assign Reader and Management Group Reader at the root management group for tenant governance hierarchy, policy, and RBAC metadata"
-Write-Host "6. Assign Reservations Reader at /providers/Microsoft.Capacity"
-Write-Host "7. Assign Savings plan Reader at /providers/Microsoft.BillingBenefits"
-Write-Host "8. Grant Microsoft Graph Application.Read.All with admin consent for governance and credential posture"
-Write-Host "9. (Optional) Create and assign custom roles for write permissions"
-Write-Host "`nThis script is idempotent and safe to run multiple times.`n"
-Write-Host "Important for 'All subscriptions':" -ForegroundColor Yellow
-Write-Host "  - The script will assign Reader at tenant root scope (/)." -ForegroundColor Yellow
+Write-Host "You can run this script more than once. It checks for existing Spotto resources"
+Write-Host "and reuses them where possible, so rerunning is the normal way to retry or update access."
+Write-Host ""
+
+Write-SectionLabel "Required access"
+Write-DetailRow -Label "Service principal" -Value "Create or reuse '$APP_NAME'."
+Write-DetailRow -Label "Client secret" -Value "Create a 12-month secret or use an existing credential."
+Write-DetailRow -Label "Azure Reader" -Value "Assign at tenant root for all subscriptions, or on selected subscriptions."
+Write-DetailRow -Label "Governance" -Value "Assign Reader and Management Group Reader at the root management group."
+Write-DetailRow -Label "Billing" -Value "Assign Reservations Reader and Savings plan Reader provider-scope access."
+Write-DetailRow -Label "Microsoft Graph" -Value "Grant Application.Read.All with tenant admin consent."
+Write-Host ""
+
+Write-SectionLabel "Optional prompts"
+Write-DetailRow -Label "Monitoring" -Value "Monitoring Reader and Log Analytics Reader for richer telemetry analysis."
+Write-DetailRow -Label "Write permissions" -Value "Custom role for Advisor dismissals and Storage Inventory reports."
+Write-Host ""
+
+Write-SectionLabel "Important for all subscriptions"
+Write-Host "  - Reader is assigned once at tenant root scope (/)." -ForegroundColor Yellow
 Write-Host "  - This needs Owner or User Access Administrator at root scope." -ForegroundColor Yellow
-Write-Host "  - Global Administrators usually need to enable Microsoft Entra ID > Properties > Access management for Azure resources first," -ForegroundColor Yellow
-Write-Host "    then sign out and sign back in before running the script." -ForegroundColor Yellow
-Write-Host "  - Microsoft Graph Application.Read.All also requires tenant admin consent." -ForegroundColor Yellow
+Write-Host "  - Global Administrators usually need to enable Microsoft Entra ID > Properties >" -ForegroundColor Yellow
+Write-Host "    Access management for Azure resources, then sign out and sign back in." -ForegroundColor Yellow
+Write-Host "  - Microsoft Graph Application.Read.All requires tenant admin consent." -ForegroundColor Yellow
 Write-Host ""
 
 $confirmation = Read-Host "Do you want to continue? (yes/no)"
@@ -399,7 +532,7 @@ if ($confirmation -ne "yes") {
 # Step 1: Connect to Azure
 # ============================================================================
 
-Write-Header "Step 1: Connecting to Azure"
+Write-Header -Message "Step 1 of 12: Connect to Azure"
 
 try {
     $currentContext = Get-AzContext
@@ -420,10 +553,10 @@ try {
 }
 
 # ============================================================================
-# Step 1b: Select Tenant
+# Step 2: Select Tenant
 # ============================================================================
 
-Write-Header "Step 1b: Select Tenant"
+Write-Header -Message "Step 2 of 12: Select Tenant"
 
 try {
     # Get all tenants the user has access to
@@ -443,9 +576,10 @@ try {
         for ($i = 0; $i -lt $allTenants.Count; $i++) {
             $tenant = $allTenants[$i]
             $tenantName = if ($tenant.Name) { $tenant.Name } else { "Unnamed Tenant" }
-            Write-Host "  [$($i + 1)] $tenantName"
-            Write-Host "      Tenant ID: $($tenant.Id)"
-            Write-Host "      Domains: $($tenant.Domains -join ', ')`n"
+            Write-Host ("  [{0,2}] {1}" -f ($i + 1), $tenantName)
+            Write-DetailRow -Label "Tenant ID" -Value $tenant.Id
+            Write-DetailRow -Label "Domains" -Value ($tenant.Domains -join ', ')
+            Write-Host ""
         }
         
         $validSelection = $false
@@ -475,42 +609,84 @@ try {
 }
 
 # ============================================================================
-# Step 2: Select Subscriptions
+# Step 3: Select Subscriptions
 # ============================================================================
 
-Write-Header "Step 2: Select Subscriptions"
+Write-Header -Message "Step 3 of 12: Select Subscriptions"
 
 $subscriptions = Get-AzSubscription -TenantId $script:tenantId
 Write-Host "Found $($subscriptions.Count) subscription(s) in your tenant:`n"
 
-for ($i = 0; $i -lt $subscriptions.Count; $i++) {
-    Write-Host "  [$($i + 1)] $($subscriptions[$i].Name) ($($subscriptions[$i].Id))"
+if ($subscriptions.Count -eq 0) {
+    Write-Error-Custom "No subscriptions were found for tenant $script:tenantId."
+    exit 1
 }
 
-Write-Host "`nOptions:"
-Write-Host "  [A] All subscriptions"
-Write-Host "  [S] Specific subscriptions (comma-separated numbers, e.g., 1,3,5)"
+for ($i = 0; $i -lt $subscriptions.Count; $i++) {
+    Write-Host ("  [{0,2}] {1} ({2})" -f ($i + 1), $subscriptions[$i].Name, $subscriptions[$i].Id)
+}
 
-$selection = Read-Host "`nSelect option"
+Write-Host ""
+Write-SectionLabel "Onboarding scope"
+Write-OptionRow -Key "1" -Label "All subscriptions" -Description "Assign Reader once at tenant root scope (/)."
+Write-OptionRow -Key "2" -Label "Specific subscriptions" -Description "Choose one or more subscriptions by number."
 
 $selectedSubscriptions = @()
-if ($selection -eq "A" -or $selection -eq "a") {
-    $selectedSubscriptions = $subscriptions
-    $script:useTenantRootReader = $true
-    Write-Success "Selected all $($selectedSubscriptions.Count) subscriptions"
-    Write-Info "Reader access will be assigned once at tenant root scope (/)."
-} else {
-    $indices = $selection -split ',' | ForEach-Object { [int]$_.Trim() - 1 }
-    $selectedSubscriptions = $indices | ForEach-Object { $subscriptions[$_] }
-    $script:useTenantRootReader = $false
-    Write-Success "Selected $($selectedSubscriptions.Count) subscription(s)"
+$scopeSelected = $false
+
+while (-not $scopeSelected) {
+    $selection = Read-Host "`nSelect onboarding scope (1/2)"
+    $normalizedSelection = $selection.Trim().ToLowerInvariant()
+
+    if ($normalizedSelection -in @("1", "a", "all")) {
+        $selectedSubscriptions = $subscriptions
+        $script:useTenantRootReader = $true
+        $scopeSelected = $true
+        Write-Success "Selected all $($selectedSubscriptions.Count) subscriptions"
+        Write-Info "Reader access will be assigned once at tenant root scope (/)."
+    } elseif ($normalizedSelection -in @("2", "s", "specific")) {
+        $script:useTenantRootReader = $false
+
+        while ($selectedSubscriptions.Count -eq 0) {
+            $subscriptionSelection = Read-Host "Enter subscription numbers (comma-separated, e.g., 1,3,5)"
+            $invalidSelections = @()
+            $selectedSubscriptions = @()
+            $seenSubscriptionIds = @{}
+
+            foreach ($entry in ($subscriptionSelection -split ",")) {
+                $subscriptionNumber = 0
+                $trimmedEntry = $entry.Trim()
+
+                if (-not [int]::TryParse($trimmedEntry, [ref]$subscriptionNumber) -or $subscriptionNumber -lt 1 -or $subscriptionNumber -gt $subscriptions.Count) {
+                    $invalidSelections += $trimmedEntry
+                    continue
+                }
+
+                $subscription = $subscriptions[$subscriptionNumber - 1]
+                if (-not $seenSubscriptionIds.ContainsKey($subscription.Id)) {
+                    $selectedSubscriptions += $subscription
+                    $seenSubscriptionIds[$subscription.Id] = $true
+                }
+            }
+
+            if ($invalidSelections.Count -gt 0 -or $selectedSubscriptions.Count -eq 0) {
+                Write-Error-Custom "Invalid subscription selection. Enter numbers between 1 and $($subscriptions.Count)."
+                $selectedSubscriptions = @()
+            }
+        }
+
+        $scopeSelected = $true
+        Write-Success "Selected $($selectedSubscriptions.Count) subscription(s)"
+    } else {
+        Write-Error-Custom "Invalid option. Enter 1 for all subscriptions or 2 to choose specific subscriptions."
+    }
 }
 
 # ============================================================================
-# Step 3: Create Service Principal
+# Step 4: Create Service Principal
 # ============================================================================
 
-Write-Header "Step 3: Creating Service Principal"
+Write-Header -Message "Step 4 of 12: Create Service Principal"
 
 try {
     # Check if app already exists
@@ -545,10 +721,10 @@ try {
 }
 
 # ============================================================================
-# Step 4: Create Client Secret
+# Step 5: Create Client Secret
 # ============================================================================
 
-Write-Header "Step 4: Creating Client Secret"
+Write-Header -Message "Step 5 of 12: Create Client Secret"
 
 try {
     # Check for existing secrets
@@ -599,10 +775,10 @@ try {
 }
 
 # ============================================================================
-# Step 5: Assign Reader Access
+# Step 6: Assign Reader Access
 # ============================================================================
 
-Write-Header "Step 5: Assigning Reader Access"
+Write-Header -Message "Step 6 of 12: Assign Reader Access"
 
 if ($script:useTenantRootReader) {
     Write-Info "All subscriptions were selected, so Reader will be assigned at tenant root scope (/)."
@@ -612,19 +788,17 @@ if ($script:useTenantRootReader) {
 }
 
 # ============================================================================
-# Step 6: Optional Recommended Monitoring Roles
+# Step 7: Optional Recommended Monitoring Roles
 # ============================================================================
 
-Write-Header "Step 6: Optional Recommended Monitoring Roles"
+Write-Header -Message "Step 7 of 12: Recommended Monitoring Roles"
 
-Write-Host "Spotto can optionally request these recommended read permissions:"
-Write-Host "  1. Monitoring Reader"
-Write-Host "     - Includes Application Insights query access via Microsoft.Insights/Components/Query/Read"
-Write-Host "     - Assigned on the selected subscriptions"
-Write-Host "  2. Log Analytics Reader"
-Write-Host "     - All subscriptions: assigned once at the root management group for tenant-wide workspace log access"
-Write-Host "     - Specific subscriptions: assigned on each selected subscription"
-Write-Host "     - Broader than Log Analytics Data Reader and suited for future workspace log analysis`n"
+Write-SectionLabel "Recommended read permissions"
+Write-DetailRow -Label "Monitoring Reader" -Value "Application Insights query access on selected subscriptions."
+Write-DetailRow -Label "Log Analytics Reader" -Value "Workspace log access for current and future analysis scenarios."
+Write-DetailRow -Label "All subscriptions" -Value "Log Analytics Reader is assigned once at the root management group."
+Write-DetailRow -Label "Specific subscriptions" -Value "Log Analytics Reader is assigned on each selected subscription."
+Write-Host ""
 Write-Info "Press Enter to accept the default answer of yes."
 
 $grantMonitoringReadPerms = Read-Host "Do you want to grant these optional recommended monitoring roles? (yes/no)"
@@ -647,10 +821,10 @@ if ([string]::IsNullOrWhiteSpace($grantMonitoringReadPerms) -or $grantMonitoring
 }
 
 # ============================================================================
-# Step 7: Assign Root Management Group Governance Reader Roles
+# Step 8: Assign Root Management Group Governance Reader Roles
 # ============================================================================
 
-Write-Header "Step 7: Assigning Root Management Group Governance Reader Roles"
+Write-Header -Message "Step 8 of 12: Assign Governance Reader Roles"
 
 try {
     $script:rootManagementGroupReaderStatus = Ensure-RootManagementGroupRoleAssignment -PrincipalId $sp.Id -RoleDefinitionName "Reader" -RoleLabel "Reader role (root management group)"
@@ -662,10 +836,10 @@ try {
 }
 
 # ============================================================================
-# Step 8: Assign Reservations Reader
+# Step 9: Assign Reservations Reader
 # ============================================================================
 
-Write-Header "Step 8: Assigning Reservations Reader"
+Write-Header -Message "Step 9 of 12: Assign Reservations Reader"
 
 try {
     $reservationScope = "/providers/Microsoft.Capacity"
@@ -688,10 +862,10 @@ try {
 }
 
 # ============================================================================
-# Step 9: Assign Savings plan Reader
+# Step 10: Assign Savings plan Reader
 # ============================================================================
 
-Write-Header "Step 9: Assigning Savings plan Reader"
+Write-Header -Message "Step 10 of 12: Assign Savings Plan Reader"
 
 try {
     $savingsPlanScope = "/providers/Microsoft.BillingBenefits"
@@ -714,10 +888,10 @@ try {
 }
 
 # ============================================================================
-# Step 10: Grant Microsoft Graph Application.Read.All
+# Step 11: Grant Microsoft Graph Application.Read.All
 # ============================================================================
 
-Write-Header "Step 10: Granting Microsoft Graph Application.Read.All"
+Write-Header -Message "Step 11 of 12: Grant Microsoft Graph Application.Read.All"
 
 try {
     Write-Info "Connecting to Microsoft Graph to grant Application.Read.All with admin consent..."
@@ -761,14 +935,15 @@ try {
 }
 
 # ============================================================================
-# Step 11: Optional Custom Roles
+# Step 12: Optional Custom Roles
 # ============================================================================
 
-Write-Header "Step 11: Optional Custom Roles (Write Permissions)"
+Write-Header -Message "Step 12 of 12: Optional Write Permissions"
 
-Write-Host "Spotto can optionally perform these actions if you grant write permissions:"
-Write-Host "  1. Dismiss Azure Advisor Recommendations"
-Write-Host "  2. Enable Storage Inventory Reports`n"
+Write-SectionLabel "Optional write capabilities"
+Write-NumberedStep -Number 1 -Message "Dismiss Azure Advisor recommendations."
+Write-NumberedStep -Number 2 -Message "Enable Storage Inventory reports."
+Write-Host ""
 
 $grantWritePerms = Read-Host "Do you want to grant these optional write permissions? (yes/no)"
 
@@ -859,64 +1034,64 @@ if ($grantWritePerms -eq "yes") {
 # SUMMARY & CREDENTIALS
 # ============================================================================
 
-Write-Header "Setup Complete!"
+Write-Header -Message "Setup Complete" -Subtitle "Review the results, then copy the credentials into Spotto"
 
-Write-Host "✓ Service Principal: $APP_NAME ($script:clientId)"
+Write-Success "Service Principal: $APP_NAME ($script:clientId)"
 if ($script:useTenantRootReader) {
     switch ($script:rootReaderAssignmentStatus) {
-        "created" { Write-Host "✓ Reader role assigned at tenant root scope (/), covering all subscriptions" }
-        "existing" { Write-Host "✓ Reader role already existed at tenant root scope (/), covering all subscriptions" }
-        "failed" { Write-Host "✗ Reader role was not assigned at tenant root scope (/)" }
-        default { Write-Host "• Reader role at tenant root scope (/) was not processed" }
+        "created" { Write-Success "Reader role assigned at tenant root scope (/), covering all subscriptions" }
+        "existing" { Write-Success "Reader role already existed at tenant root scope (/), covering all subscriptions" }
+        "failed" { Write-Error-Custom "Reader role was not assigned at tenant root scope (/)" }
+        default { Write-Skipped "Reader role at tenant root scope (/) was not processed" }
     }
 } else {
-    Write-Host "✓ Reader role processed on $($selectedSubscriptions.Count) selected subscription(s)"
+    Write-Success "Reader role processed on $($selectedSubscriptions.Count) selected subscription(s)"
 }
 if ([string]::IsNullOrWhiteSpace($grantMonitoringReadPerms) -or $grantMonitoringReadPerms -match "^(?i:yes)$") {
-    Write-Host "✓ Monitoring Reader processed on selected subscription(s)"
+    Write-Success "Monitoring Reader processed on selected subscription(s)"
 } else {
-    Write-Host "• Monitoring Reader skipped (optional)"
+    Write-Skipped "Monitoring Reader skipped (optional)"
 }
 switch ($script:logAnalyticsReaderStatus) {
-    "created" { Write-Host "✓ Log Analytics Reader assigned at the root management group" }
-    "existing" { Write-Host "✓ Log Analytics Reader already existed at the root management group" }
-    "processed" { Write-Host "✓ Log Analytics Reader processed on selected subscription(s)" }
-    "failed" { Write-Host "✗ Log Analytics Reader was not assigned" }
-    "skipped" { Write-Host "• Log Analytics Reader skipped (optional)" }
-    default { Write-Host "• Log Analytics Reader was not processed" }
+    "created" { Write-Success "Log Analytics Reader assigned at the root management group" }
+    "existing" { Write-Success "Log Analytics Reader already existed at the root management group" }
+    "processed" { Write-Success "Log Analytics Reader processed on selected subscription(s)" }
+    "failed" { Write-Error-Custom "Log Analytics Reader was not assigned" }
+    "skipped" { Write-Skipped "Log Analytics Reader skipped (optional)" }
+    default { Write-Skipped "Log Analytics Reader was not processed" }
 }
 switch ($script:rootManagementGroupReaderStatus) {
-    "created" { Write-Host "✓ Reader assigned at the root management group for tenant governance hierarchy access" }
-    "existing" { Write-Host "✓ Reader already existed at the root management group for tenant governance hierarchy access" }
-    "failed" { Write-Host "✗ Reader was not assigned at the root management group" }
-    default { Write-Host "• Reader at the root management group was not processed" }
+    "created" { Write-Success "Reader assigned at the root management group for tenant governance hierarchy access" }
+    "existing" { Write-Success "Reader already existed at the root management group for tenant governance hierarchy access" }
+    "failed" { Write-Error-Custom "Reader was not assigned at the root management group" }
+    default { Write-Skipped "Reader at the root management group was not processed" }
 }
 switch ($script:managementGroupReaderStatus) {
-    "created" { Write-Host "✓ Management Group Reader assigned at the root management group" }
-    "existing" { Write-Host "✓ Management Group Reader already existed at the root management group" }
-    "failed" { Write-Host "✗ Management Group Reader was not assigned at the root management group" }
-    default { Write-Host "• Management Group Reader was not processed" }
+    "created" { Write-Success "Management Group Reader assigned at the root management group" }
+    "existing" { Write-Success "Management Group Reader already existed at the root management group" }
+    "failed" { Write-Error-Custom "Management Group Reader was not assigned at the root management group" }
+    default { Write-Skipped "Management Group Reader was not processed" }
 }
 switch ($script:reservationReaderStatus) {
-    "created" { Write-Host "✓ Reservations Reader assigned at /providers/Microsoft.Capacity" }
-    "existing" { Write-Host "✓ Reservations Reader already existed at /providers/Microsoft.Capacity" }
-    "failed" { Write-Host "✗ Reservations Reader was not assigned at /providers/Microsoft.Capacity" }
-    default { Write-Host "• Reservations Reader was not processed" }
+    "created" { Write-Success "Reservations Reader assigned at /providers/Microsoft.Capacity" }
+    "existing" { Write-Success "Reservations Reader already existed at /providers/Microsoft.Capacity" }
+    "failed" { Write-Error-Custom "Reservations Reader was not assigned at /providers/Microsoft.Capacity" }
+    default { Write-Skipped "Reservations Reader was not processed" }
 }
 switch ($script:savingsPlanReaderStatus) {
-    "created" { Write-Host "✓ Savings plan Reader assigned at /providers/Microsoft.BillingBenefits" }
-    "existing" { Write-Host "✓ Savings plan Reader already existed at /providers/Microsoft.BillingBenefits" }
-    "failed" { Write-Host "✗ Savings plan Reader was not assigned at /providers/Microsoft.BillingBenefits" }
-    default { Write-Host "• Savings plan Reader was not processed" }
+    "created" { Write-Success "Savings plan Reader assigned at /providers/Microsoft.BillingBenefits" }
+    "existing" { Write-Success "Savings plan Reader already existed at /providers/Microsoft.BillingBenefits" }
+    "failed" { Write-Error-Custom "Savings plan Reader was not assigned at /providers/Microsoft.BillingBenefits" }
+    default { Write-Skipped "Savings plan Reader was not processed" }
 }
 switch ($script:graphPermissionStatus) {
-    "created" { Write-Host "✓ Microsoft Graph Application.Read.All granted for governance and credential posture" }
-    "existing" { Write-Host "✓ Microsoft Graph Application.Read.All already existed for governance and credential posture" }
-    "failed" { Write-Host "✗ Microsoft Graph Application.Read.All was not granted" }
-    default { Write-Host "• Microsoft Graph Application.Read.All was not processed" }
+    "created" { Write-Success "Microsoft Graph Application.Read.All granted for governance and credential posture" }
+    "existing" { Write-Success "Microsoft Graph Application.Read.All already existed for governance and credential posture" }
+    "failed" { Write-Error-Custom "Microsoft Graph Application.Read.All was not granted" }
+    default { Write-Skipped "Microsoft Graph Application.Read.All was not processed" }
 }
 if ($grantWritePerms -eq "yes") {
-    Write-Host "✓ Custom role with write permissions created and assigned"
+    Write-Success "Custom role with write permissions created and assigned"
 }
 Write-Host ""
 Write-Host "Propagation note:" -ForegroundColor Yellow
@@ -927,18 +1102,7 @@ Write-Host "  If that happens, wait a few minutes and rerun validation or retry 
 # Display credentials for copy/paste
 Show-Credentials
 
-Write-Host "`n" + ("=" * 80) -ForegroundColor Cyan
-Write-Host " NEXT STEPS " -ForegroundColor Cyan
-Write-Host ("=" * 80) -ForegroundColor Cyan
-Write-Host ""
-Write-Host "1. Copy the credentials shown above"
-Write-Host "2. Go to the Spotto Portal: https://portal.spotto.ai"
-Write-Host "3. Navigate to: Cloud Accounts > Add Cloud Account"
-Write-Host "4. Paste the credentials into the form"
-Write-Host "5. Click 'Validate Credentials' and then 'Create'"
-Write-Host ""
-Write-Host ("=" * 80) -ForegroundColor Cyan
-Write-Host ""
+Show-NextSteps
 
 if ($script:isNewSecret) {
     Write-Host "⚠ REMINDER: The client secret shown above will NOT be displayed again!" -ForegroundColor Red

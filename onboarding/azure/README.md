@@ -19,6 +19,8 @@ The script performs the following actions:
 7.  (Optional) Creates and assigns a custom role for **write permissions** (Advisor recommendations, Storage inventory).
 8.  Outputs the credentials needed to configure Spotto.
 
+You can safely rerun the script if validation needs more time, permissions change, or you need to retry a failed step. It checks for existing Spotto resources and role assignments, then reuses or updates them where possible.
+
 ## Prerequisites
 
 Before running the script, ensure you have:
