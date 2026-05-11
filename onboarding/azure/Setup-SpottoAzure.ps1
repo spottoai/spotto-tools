@@ -4,8 +4,8 @@
 
 .DESCRIPTION
     This script creates a service principal, assigns the governance and billing permissions Spotto
-    uses to analyze your Azure environment, and optionally grants recommended monitoring roles and
-    specific write permissions.
+    uses to analyze your Azure environment, recommends billing exports to reduce billing API calls,
+    and optionally grants recommended monitoring roles and specific write permissions.
     
     Permissions granted:
     - Reader role at tenant root scope when all subscriptions are selected
@@ -22,6 +22,8 @@
     - Savings plan Reader at /providers/Microsoft.BillingBenefits
     - Application.Read.All in Microsoft Graph with admin consent
       (read applications and service principals for governance and credential posture)
+    - Highly recommended: Cost Management exports to customer-owned Azure Storage
+      (daily actual/amortized exports plus one-time historical backfill where supported)
     - Optional: Custom role for dismissing Azure Advisor recommendations
     - Optional: Custom role for enabling Storage Inventory Reports
     
@@ -48,6 +50,11 @@
 $ErrorActionPreference = "Stop"
 $APP_NAME = "Spotto AI"
 $CUSTOM_ROLE_NAME = "Spotto Access"
+$BILLING_EXPORT_CONTAINER_NAME = "spotto-cost-exports"
+$BILLING_EXPORT_ROOT_PATH = "spotto"
+$BILLING_EXPORT_DEFAULT_LOCATION = "australiaeast"
+$COST_EXPORT_API_VERSION = "2025-03-01"
+$SPOTTO_BACKFILL_QUEUED_PREFIX = "Spotto backfill queued"
 $script:ConsolePanelWidth = 80
 
 # Start logging
@@ -90,6 +97,7 @@ Write-Host "Checking required PowerShell modules..." -ForegroundColor Cyan
 $requiredModules = @(
     @{ Name = "Az.Accounts"; MinVersion = "2.0.0" },
     @{ Name = "Az.Resources"; MinVersion = "6.0.0" },
+    @{ Name = "Az.Storage"; MinVersion = "5.0.0" },
     @{ Name = "Microsoft.Graph.Authentication"; MinVersion = "2.0.0" },
     @{ Name = "Microsoft.Graph.Applications"; MinVersion = "2.0.0" }
 )
@@ -113,7 +121,7 @@ if ($missingModules.Count -gt 0) {
         Write-Host "  - $module" -ForegroundColor Yellow
     }
     
-    $install = Read-Host "`nWould you like to install missing modules now? (yes/no)"
+    $install = Read-Host "`nWould you like to install missing modules now? (yes/no, default no)"
     
     if ($install -eq "yes") {
         Write-Host "`nInstalling modules... This may take a few minutes." -ForegroundColor Cyan
@@ -157,6 +165,8 @@ $script:logAnalyticsReaderStatus = "not-run"
 $script:reservationReaderStatus = "not-run"
 $script:savingsPlanReaderStatus = "not-run"
 $script:graphPermissionStatus = "not-run"
+$script:billingExportSetupStatus = "not-run"
+$script:billingExportResults = @()
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -266,6 +276,11 @@ function Write-Success {
 function Write-Info {
     param([string]$Message)
     Write-Host "ℹ $Message" -ForegroundColor Cyan
+}
+
+function Write-Warning-Custom {
+    param([string]$Message)
+    Write-Host "! $Message" -ForegroundColor Yellow
 }
 
 function Write-Error-Custom {
@@ -490,6 +505,1018 @@ function Ensure-RootManagementGroupRoleAssignment {
     }
 }
 
+function Get-DefaultedInput {
+    param(
+        [string]$Prompt,
+        [string]$DefaultValue
+    )
+
+    $value = Read-Host "$Prompt [$DefaultValue]"
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        return $DefaultValue
+    }
+
+    return $value.Trim()
+}
+
+function Test-YesResponse {
+    param(
+        [string]$Value,
+        [bool]$DefaultYes = $true
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $DefaultYes
+    }
+
+    return $Value -match "^(?i:y|yes)$"
+}
+
+function Resolve-AzureLocationName {
+    param([string]$Location)
+
+    if ([string]::IsNullOrWhiteSpace($Location)) {
+        return $BILLING_EXPORT_DEFAULT_LOCATION
+    }
+
+    $normalized = $Location.Trim().ToLowerInvariant() -replace "[\s_-]", ""
+    $aliases = @{
+        "aueast" = "australiaeast"
+        "auseast" = "australiaeast"
+        "australiaeast" = "australiaeast"
+        "ausoutheast" = "australiasoutheast"
+        "australiasoutheast" = "australiasoutheast"
+        "nzealandnorth" = "newzealandnorth"
+        "nzorth" = "newzealandnorth"
+        "nznorth" = "newzealandnorth"
+        "newzealandnorth" = "newzealandnorth"
+    }
+
+    if ($aliases.ContainsKey($normalized)) {
+        return $aliases[$normalized]
+    }
+
+    return $normalized
+}
+
+function Get-AvailableAzureLocationNames {
+    try {
+        return @(
+            Get-AzLocation -ErrorAction Stop |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_.Location) } |
+                ForEach-Object { $_.Location.ToLowerInvariant() } |
+                Sort-Object -Unique
+        )
+    } catch {
+        Write-Info "Unable to retrieve Azure region list for validation. Continuing with basic location normalization. $_"
+        return @()
+    }
+}
+
+function Read-AzureLocationInput {
+    param(
+        [string]$Prompt,
+        [string]$DefaultValue,
+        [string[]]$AvailableLocations
+    )
+
+    while ($true) {
+        $locationInput = Get-DefaultedInput -Prompt $Prompt -DefaultValue $DefaultValue
+        $location = Resolve-AzureLocationName -Location $locationInput
+
+        if ($AvailableLocations.Count -eq 0 -or $AvailableLocations -contains $location) {
+            if ($locationInput.Trim().ToLowerInvariant() -ne $location) {
+                Write-Info "Using Azure region '$location' for input '$locationInput'."
+            }
+            return $location
+        }
+
+        Write-Error-Custom "Azure region '$locationInput' is not valid or not available for this subscription."
+        Write-Info "Use Azure location names such as 'australiaeast', 'australiasoutheast', 'newzealandnorth', 'eastus', or 'westeurope'."
+    }
+}
+
+function Get-StorageAccountParts {
+    param([string]$StorageAccountId)
+
+    if ($StorageAccountId -notmatch "^/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft\.Storage/storageAccounts/([^/]+)$") {
+        throw "Storage account resource ID is not in the expected format: $StorageAccountId"
+    }
+
+    return [pscustomobject]@{
+        SubscriptionId = $Matches[1]
+        ResourceGroupName = $Matches[2]
+        Name = $Matches[3]
+    }
+}
+
+function Get-StorageAccountResource {
+    param([string]$StorageAccountId)
+
+    $storageParts = Get-StorageAccountParts -StorageAccountId $StorageAccountId
+    Set-AzContext -SubscriptionId $storageParts.SubscriptionId -TenantId $script:tenantId | Out-Null
+    return Get-AzStorageAccount -ResourceGroupName $storageParts.ResourceGroupName -Name $storageParts.Name -ErrorAction Stop
+}
+
+function Ensure-ResourceProviderRegistered {
+    param(
+        [string]$SubscriptionId,
+        [string]$ProviderNamespace
+    )
+
+    try {
+        Set-AzContext -SubscriptionId $SubscriptionId -TenantId $script:tenantId | Out-Null
+        $provider = Get-AzResourceProvider -ProviderNamespace $ProviderNamespace -ErrorAction SilentlyContinue
+        if ($provider -and $provider.RegistrationState -eq "Registered") {
+            Write-Info "$ProviderNamespace is already registered in subscription $SubscriptionId"
+            return
+        }
+
+        Register-AzResourceProvider -ProviderNamespace $ProviderNamespace | Out-Null
+        Write-Success "Requested registration for $ProviderNamespace in subscription $SubscriptionId"
+        for ($attempt = 0; $attempt -lt 24; $attempt++) {
+            Start-Sleep -Seconds 5
+            $provider = Get-AzResourceProvider -ProviderNamespace $ProviderNamespace -ErrorAction SilentlyContinue
+            if ($provider -and $provider.RegistrationState -eq "Registered") {
+                Write-Success "$ProviderNamespace is registered in subscription $SubscriptionId"
+                return
+            }
+        }
+
+        Write-Info "$ProviderNamespace registration is still pending. Azure may finish it in the background."
+    } catch {
+        Write-Error-Custom "Failed to register ${ProviderNamespace}: $_"
+        Write-Info "You can register it manually and rerun this script."
+    }
+}
+
+function Test-StorageAccountNameAvailable {
+    param(
+        [string]$SubscriptionId,
+        [string]$Name
+    )
+
+    Set-AzContext -SubscriptionId $SubscriptionId -TenantId $script:tenantId | Out-Null
+    $result = Get-AzStorageAccountNameAvailability -Name $Name -ErrorAction Stop
+    return [bool]$result.nameAvailable
+}
+
+function Test-BillingStorageAccountNameFormat {
+    param([string]$Name)
+
+    return -not [string]::IsNullOrWhiteSpace($Name) -and $Name -match "^[a-z0-9]{3,24}$"
+}
+
+function New-AvailableBillingStorageAccountName {
+    param([string]$SubscriptionId)
+
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        $suffix = ([guid]::NewGuid().ToString("N")).Substring(0, 13)
+        $name = "spotto$suffix"
+        if (Test-StorageAccountNameAvailable -SubscriptionId $SubscriptionId -Name $name) {
+            return $name
+        }
+    }
+
+    throw "Unable to generate an available storage account name. Please rerun and provide one manually."
+}
+
+function Wait-StorageAccountReady {
+    param(
+        [string]$StorageAccountId,
+        [int]$MaxAttempts = 60,
+        [int]$PollSeconds = 10
+    )
+
+    $lastState = "unknown"
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            $account = Get-StorageAccountResource -StorageAccountId $StorageAccountId
+            if ($account) {
+                $lastState = if ($account.ProvisioningState) { $account.ProvisioningState } else { $account.properties.provisioningState }
+                if ($lastState -eq "Succeeded") {
+                    return $account
+                }
+
+                if ($lastState -in @("Failed", "Canceled")) {
+                    throw "Storage account provisioning ended with state '$lastState'."
+                }
+
+                if ($attempt -eq 1 -or $attempt % 6 -eq 0) {
+                    Write-Info "Waiting for storage account provisioning. Current state: $lastState"
+                }
+            }
+        } catch {
+            if ($_.Exception.Message -match "ended with state") {
+                throw
+            }
+
+            if ($attempt -eq 1 -or $attempt % 6 -eq 0) {
+                Write-Info "Waiting for storage account to become visible in Azure Resource Manager. $_"
+            }
+        }
+
+        if ($attempt -lt $MaxAttempts) {
+            Start-Sleep -Seconds $PollSeconds
+        }
+    }
+
+    throw "Timed out waiting for storage account provisioning to complete. Last provisioning state: $lastState."
+}
+
+function New-BillingExportStorageAccount {
+    param([object[]]$Subscriptions)
+
+    Write-SectionLabel "Storage account subscription"
+    for ($i = 0; $i -lt $Subscriptions.Count; $i++) {
+        Write-Host ("  [{0,2}] {1} ({2})" -f ($i + 1), $Subscriptions[$i].Name, $Subscriptions[$i].Id)
+    }
+
+    $hostSubscription = $Subscriptions[0]
+    if ($Subscriptions.Count -gt 1) {
+        $selected = Read-Host "Select subscription for the billing export storage account (1-$($Subscriptions.Count))"
+        $selectedIndex = 0
+        if ([int]::TryParse($selected, [ref]$selectedIndex) -and $selectedIndex -ge 1 -and $selectedIndex -le $Subscriptions.Count) {
+            $hostSubscription = $Subscriptions[$selectedIndex - 1]
+        } else {
+            Write-Info "Invalid selection. Using $($hostSubscription.Name)."
+        }
+    }
+
+    Set-AzContext -SubscriptionId $hostSubscription.Id -TenantId $script:tenantId | Out-Null
+    Ensure-ResourceProviderRegistered -SubscriptionId $hostSubscription.Id -ProviderNamespace "Microsoft.Storage"
+    Ensure-ResourceProviderRegistered -SubscriptionId $hostSubscription.Id -ProviderNamespace "Microsoft.CostManagement"
+    $availableLocations = Get-AvailableAzureLocationNames
+
+    $defaultResourceGroupName = "rg-spotto-cost-exports"
+    $resourceGroupName = Get-DefaultedInput -Prompt "Resource group for the billing export storage account" -DefaultValue $defaultResourceGroupName
+    $resourceGroup = Get-AzResourceGroup -Name $resourceGroupName -ErrorAction SilentlyContinue
+    if (-not $resourceGroup) {
+        $resourceGroupCreated = $false
+        while (-not $resourceGroupCreated) {
+            $location = Read-AzureLocationInput -Prompt "Azure region for the new resource group" -DefaultValue $BILLING_EXPORT_DEFAULT_LOCATION -AvailableLocations $availableLocations
+            try {
+                $resourceGroup = New-AzResourceGroup -Name $resourceGroupName -Location $location -ErrorAction Stop
+                $resourceGroupCreated = $true
+                Write-Success "Created resource group $resourceGroupName in $location"
+            } catch {
+                Write-Error-Custom "Failed to create resource group '$resourceGroupName' in '$location': $($_.Exception.Message)"
+                $retryLocation = Read-Host "Try another region for the billing export resource group? (yes/no, default yes)"
+                if (-not (Test-YesResponse -Value $retryLocation)) {
+                    throw "Billing export storage setup could not create resource group '$resourceGroupName'."
+                }
+            }
+        }
+    } else {
+        Write-Info "Using existing resource group $resourceGroupName"
+    }
+
+    $storageAccountNameReady = $false
+    while (-not $storageAccountNameReady) {
+        $suggestedName = New-AvailableBillingStorageAccountName -SubscriptionId $hostSubscription.Id
+        $storageAccountName = Get-DefaultedInput -Prompt "Storage account name" -DefaultValue $suggestedName
+        $storageAccountId = "/subscriptions/$($hostSubscription.Id)/resourceGroups/$resourceGroupName/providers/Microsoft.Storage/storageAccounts/$storageAccountName"
+        $existingStorageAccount = Get-AzResource -ResourceId $storageAccountId -ErrorAction SilentlyContinue
+
+        if ($existingStorageAccount) {
+            $storageAccountNameReady = $true
+        } elseif (-not (Test-BillingStorageAccountNameFormat -Name $storageAccountName)) {
+            Write-Error-Custom "Storage account name '$storageAccountName' is invalid. Use 3-24 lowercase letters and numbers only."
+        } elseif (Test-StorageAccountNameAvailable -SubscriptionId $hostSubscription.Id -Name $storageAccountName) {
+            $storageAccountNameReady = $true
+        } else {
+            Write-Error-Custom "Storage account name '$storageAccountName' is not available."
+        }
+    }
+
+    if ($existingStorageAccount) {
+        Write-Info "Using existing storage account $storageAccountName in $resourceGroupName"
+        return [pscustomobject]@{
+            ResourceId = $storageAccountId
+            SubscriptionId = $hostSubscription.Id
+            ResourceGroupName = $resourceGroupName
+            Name = $storageAccountName
+        }
+    }
+
+    $storageAccountCreated = $false
+    while (-not $storageAccountCreated) {
+        $storageAccountLocation = Read-AzureLocationInput -Prompt "Azure region for the billing export storage account" -DefaultValue $BILLING_EXPORT_DEFAULT_LOCATION -AvailableLocations $availableLocations
+        try {
+            New-AzStorageAccount `
+                -ResourceGroupName $resourceGroupName `
+                -Name $storageAccountName `
+                -Location $storageAccountLocation `
+                -SkuName "Standard_LRS" `
+                -Kind "StorageV2" `
+                -AccessTier "Hot" `
+                -MinimumTlsVersion "TLS1_2" `
+                -AllowBlobPublicAccess $false `
+                -EnableHttpsTrafficOnly $true `
+                -PublicNetworkAccess "Enabled" `
+                -NetworkRuleSet @{ bypass = "AzureServices"; defaultAction = "Allow" } `
+                -ErrorAction Stop | Out-Null
+
+            $waitingForStorageAccount = $true
+            while ($waitingForStorageAccount) {
+                try {
+                    Wait-StorageAccountReady -StorageAccountId $storageAccountId | Out-Null
+                    $waitingForStorageAccount = $false
+                } catch {
+                    if ($_.Exception.Message -match "Timed out waiting for storage account provisioning") {
+                        Write-Info "Azure accepted the storage account create request, but provisioning is taking longer than expected."
+                        $keepWaiting = Read-Host "Keep waiting for storage account provisioning? (yes/no, default yes)"
+                        if (Test-YesResponse -Value $keepWaiting) {
+                            continue
+                        }
+                    }
+
+                    throw
+                }
+            }
+            $storageAccountCreated = $true
+            Write-Success "Created storage account $storageAccountName in $storageAccountLocation"
+        } catch {
+            Write-Error-Custom "Failed to create storage account '$storageAccountName' in '$storageAccountLocation': $($_.Exception.Message)"
+            $retryLocation = Read-Host "Try another region for the billing export storage account? (yes/no, default yes)"
+            if (-not (Test-YesResponse -Value $retryLocation)) {
+                throw "Billing export storage setup could not create storage account '$storageAccountName'."
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        ResourceId = $storageAccountId
+        SubscriptionId = $hostSubscription.Id
+        ResourceGroupName = $resourceGroupName
+        Name = $storageAccountName
+    }
+}
+
+function Select-ExistingBillingStorageAccount {
+    param([object[]]$Subscriptions)
+
+    $storageAccounts = @()
+    foreach ($sub in $Subscriptions) {
+        try {
+            Set-AzContext -SubscriptionId $sub.Id -TenantId $script:tenantId | Out-Null
+            $resources = @(Get-AzResource -ResourceType "Microsoft.Storage/storageAccounts" -ErrorAction Stop)
+            foreach ($resource in $resources) {
+                $storageAccounts += [pscustomobject]@{
+                    ResourceId = $resource.ResourceId
+                    SubscriptionId = $sub.Id
+                    ResourceGroupName = $resource.ResourceGroupName
+                    Name = $resource.Name
+                    SubscriptionName = $sub.Name
+                }
+            }
+        } catch {
+            Write-Info "Unable to list storage accounts in $($sub.Name): $_"
+        }
+    }
+
+    if ($storageAccounts.Count -eq 0) {
+        Write-Info "No existing storage accounts were found in the selected subscriptions."
+        return $null
+    }
+
+    Write-Host ""
+    Write-SectionLabel "Existing storage accounts"
+    for ($i = 0; $i -lt $storageAccounts.Count; $i++) {
+        $account = $storageAccounts[$i]
+        Write-Host ("  [{0,2}] {1} ({2}, {3})" -f ($i + 1), $account.Name, $account.ResourceGroupName, $account.SubscriptionName)
+    }
+
+    $selection = Read-Host "Select storage account number, type a storage account name, or press Enter to create a new one"
+    if ([string]::IsNullOrWhiteSpace($selection)) {
+        return $null
+    }
+
+    $selection = $selection.Trim()
+    $selectedIndex = 0
+    if ([int]::TryParse($selection, [ref]$selectedIndex) -and $selectedIndex -ge 1 -and $selectedIndex -le $storageAccounts.Count) {
+        return $storageAccounts[$selectedIndex - 1]
+    }
+
+    $matches = @($storageAccounts | Where-Object { $_.Name -eq $selection })
+    if ($matches.Count -eq 1) {
+        return $matches[0]
+    }
+
+    if ($matches.Count -gt 1) {
+        Write-Info "Multiple storage accounts named '$selection' were found in the selected subscriptions. Select by number instead."
+        return Select-ExistingBillingStorageAccount -Subscriptions $Subscriptions
+    }
+
+    Write-Info "Invalid selection. A new storage account will be created."
+    return $null
+}
+
+function Select-BillingExportStorageAccount {
+    param([object[]]$Subscriptions)
+
+    Write-SectionLabel "Billing export storage"
+    Write-OptionRow -Key "1" -Label "Create a new storage account" -Description "Recommended when no suitable export storage exists."
+    Write-OptionRow -Key "2" -Label "Use an existing storage account" -Description "The script will keep anonymous access off and grant Spotto blob read access."
+
+    $selection = Read-Host "Select storage option (1/2)"
+    if ($selection -eq "2") {
+        $existing = Select-ExistingBillingStorageAccount -Subscriptions $Subscriptions
+        if ($existing) {
+            return $existing
+        }
+    }
+
+    return New-BillingExportStorageAccount -Subscriptions $Subscriptions
+}
+
+function Ensure-BillingExportStorageSettings {
+    param([string]$StorageAccountId)
+
+    $account = Get-StorageAccountResource -StorageAccountId $StorageAccountId
+    $storageParts = Get-StorageAccountParts -StorageAccountId $StorageAccountId
+    $needsUpdate = $false
+
+    if ($account.AllowBlobPublicAccess -ne $false) {
+        $needsUpdate = $true
+    }
+
+    if ($account.EnableHttpsTrafficOnly -ne $true) {
+        $needsUpdate = $true
+    }
+
+    if ($account.PublicNetworkAccess -ne "Enabled") {
+        $needsUpdate = $true
+    }
+
+    if (-not $account.NetworkRuleSet -or $account.NetworkRuleSet.DefaultAction -ne "Allow") {
+        $needsUpdate = $true
+    }
+
+    if ($account.MinimumTlsVersion -ne "TLS1_2") {
+        $needsUpdate = $true
+    }
+
+    if ($needsUpdate) {
+        Set-AzStorageAccount `
+            -ResourceGroupName $storageParts.ResourceGroupName `
+            -Name $storageParts.Name `
+            -AllowBlobPublicAccess $false `
+            -EnableHttpsTrafficOnly $true `
+            -MinimumTlsVersion "TLS1_2" `
+            -PublicNetworkAccess "Enabled" `
+            -NetworkRuleSet @{ bypass = "AzureServices"; defaultAction = "Allow" } `
+            -ErrorAction Stop | Out-Null
+        Write-Success "Updated storage account settings for billing exports"
+    } else {
+        Write-Info "Storage account already meets billing export access settings"
+    }
+}
+
+function Ensure-BillingExportContainer {
+    param(
+        [string]$StorageAccountId,
+        [string]$ContainerName
+    )
+
+    $containerId = "$StorageAccountId/blobServices/default/containers/$ContainerName"
+    $storageParts = Get-StorageAccountParts -StorageAccountId $StorageAccountId
+    $account = Get-StorageAccountResource -StorageAccountId $StorageAccountId
+
+    $existingContainer = Get-AzRmStorageContainer -ResourceGroupName $storageParts.ResourceGroupName -StorageAccountName $storageParts.Name -Name $ContainerName -ErrorAction SilentlyContinue
+    if ($existingContainer) {
+        Update-AzRmStorageContainer -StorageAccount $account -Name $ContainerName -PublicAccess None -ErrorAction Stop | Out-Null
+    } else {
+        New-AzRmStorageContainer -StorageAccount $account -Name $ContainerName -PublicAccess None -ErrorAction Stop | Out-Null
+    }
+    Write-Success "Ensured private blob container '$ContainerName'"
+    return $containerId
+}
+
+function Ensure-StorageBlobDataReaderAssignment {
+    param(
+        [string]$PrincipalId,
+        [string]$Scope
+    )
+
+    try {
+        $existingAssignment = Get-AzRoleAssignment -ObjectId $PrincipalId -RoleDefinitionName "Storage Blob Data Reader" -Scope $Scope -ErrorAction SilentlyContinue
+        if ($existingAssignment) {
+            Write-Info "Storage Blob Data Reader already assigned on export container"
+            return "existing"
+        }
+
+        New-AzRoleAssignment -ObjectId $PrincipalId -RoleDefinitionName "Storage Blob Data Reader" -Scope $Scope | Out-Null
+        Write-Success "Assigned Storage Blob Data Reader on export container"
+        return "created"
+    } catch {
+        Write-Error-Custom "Failed to assign Storage Blob Data Reader on ${Scope}: $_"
+        return "failed"
+    }
+}
+
+function Get-CostExportsForScope {
+    param([string]$Scope)
+
+    try {
+        if ($Scope -notmatch "^/subscriptions/([^/]+)$") {
+            throw "Cost export scope is not a subscription scope: $Scope"
+        }
+
+        Set-AzContext -SubscriptionId $Matches[1] -TenantId $script:tenantId | Out-Null
+        return @(Get-AzResource -ResourceType "Microsoft.CostManagement/exports" -ApiVersion $COST_EXPORT_API_VERSION -ExpandProperties -ErrorAction Stop)
+    } catch {
+        Write-Info "Unable to list Cost Management exports at $Scope. $_"
+    }
+
+    return @()
+}
+
+function Get-CostExport {
+    param(
+        [string]$Scope,
+        [string]$ExportName
+    )
+
+    try {
+        return Get-AzResource -ResourceId (Get-CostExportResourceId -Scope $Scope -ExportName $ExportName) -ApiVersion $COST_EXPORT_API_VERSION -ExpandProperties -ErrorAction Stop
+    } catch {
+        return $null
+    }
+}
+
+function Get-CostExportResourceId {
+    param(
+        [string]$Scope,
+        [string]$ExportName
+    )
+
+    return "$Scope/providers/Microsoft.CostManagement/exports/$ExportName"
+}
+
+function Get-CostExportProperties {
+    param([object]$Export)
+
+    if (-not $Export) {
+        return $null
+    }
+
+    $properties = $Export.Properties
+    if (-not $properties) {
+        $properties = $Export.properties
+    }
+
+    if ($properties -is [string]) {
+        try {
+            return $properties | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            Write-Info "Unable to parse Cost Management export properties for '$($Export.Name)'. $_"
+            return $null
+        }
+    }
+
+    return $properties
+}
+
+function Test-RecurringCostExportMeetsRequirements {
+    param(
+        [object]$Export,
+        [string]$DatasetType
+    )
+
+    $properties = Get-CostExportProperties -Export $Export
+    if (-not $properties) {
+        return $false
+    }
+
+    $destination = $properties.deliveryInfo.destination
+    $compression = $properties.compressionMode
+
+    if ($properties.schedule.status -ne "Active") { return $false }
+    if ($properties.schedule.recurrence -ne "Daily") { return $false }
+    if (-not (Test-CostExportDefinitionTypeMatches -RequestedDatasetType $DatasetType -ExportDefinitionType $properties.definition.type)) { return $false }
+    if ($properties.definition.timeframe -notin @("MonthToDate", "BillingMonthToDate", "TheCurrentMonth")) { return $false }
+    if ($properties.format -ne "Csv") { return $false }
+    if ($compression -and $compression -notin @("none", "gzip", "None", "Gzip")) { return $false }
+    if (-not $destination.resourceId -or -not $destination.container) { return $false }
+
+    return $true
+}
+
+function Test-CostExportDefinitionTypeMatches {
+    param(
+        [string]$RequestedDatasetType,
+        [string]$ExportDefinitionType
+    )
+
+    if ($RequestedDatasetType -eq "ActualCost") {
+        return $ExportDefinitionType -in @("ActualCost", "Usage")
+    }
+
+    return $ExportDefinitionType -eq $RequestedDatasetType
+}
+
+function Get-CostExportDefinitionTypeCandidates {
+    param([string]$DatasetType)
+
+    if ($DatasetType -eq "ActualCost") {
+        return @("ActualCost", "Usage")
+    }
+
+    return @($DatasetType)
+}
+
+function Test-ShouldRetryActualCostAsUsage {
+    param([string]$Message)
+
+    return $Message -match "ActualCost" -and $Message -match "not supported"
+}
+
+function Test-CostExportTypeNotSupported {
+    param(
+        [string]$Message,
+        [string]$DatasetType
+    )
+
+    return $Message -match [regex]::Escape($DatasetType) -and $Message -match "not supported"
+}
+
+function Get-SpottoRecurringExportName {
+    param([string]$DatasetType)
+
+    if ($DatasetType -eq "ActualCost") {
+        return "spotto-actual-daily"
+    }
+
+    if ($DatasetType -eq "AmortizedCost") {
+        return "spotto-amortized-daily"
+    }
+
+    throw "Unsupported dataset type for Spotto recurring export: $DatasetType"
+}
+
+function Find-ExistingRecurringBillingExports {
+    param(
+        [object]$Subscription,
+        [string]$DatasetType
+    )
+
+    $scope = "/subscriptions/$($Subscription.Id)"
+    $exports = @()
+
+    $spottoExportName = Get-SpottoRecurringExportName -DatasetType $DatasetType
+    $spottoExport = Get-CostExport -Scope $scope -ExportName $spottoExportName
+    if ($spottoExport) {
+        $exports += $spottoExport
+    }
+
+    $exports += @(Get-CostExportsForScope -Scope $scope)
+    $uniqueExports = @($exports | Where-Object { $_ } | Sort-Object -Property ResourceId, Id, Name -Unique)
+    return @($uniqueExports | Where-Object { Test-RecurringCostExportMeetsRequirements -Export $_ -DatasetType $DatasetType })
+}
+
+function Get-ExportDestinationInfo {
+    param([object]$Export)
+
+    $properties = Get-CostExportProperties -Export $Export
+    $destination = $properties.deliveryInfo.destination
+    return [pscustomobject]@{
+        StorageAccountId = $destination.resourceId
+        Container = $destination.container
+        RootFolderPath = $destination.rootFolderPath
+    }
+}
+
+function Get-BackfillMonthPeriods {
+    param([int]$MonthCount)
+
+    $todayUtc = [DateTime]::UtcNow
+    $currentMonth = [DateTime]::SpecifyKind((Get-Date -Year $todayUtc.Year -Month $todayUtc.Month -Day 1 -Hour 0 -Minute 0 -Second 0), [DateTimeKind]::Utc)
+    $periods = @()
+
+    for ($offset = $MonthCount; $offset -ge 1; $offset--) {
+        $start = $currentMonth.AddMonths(-$offset)
+        $lastDay = [DateTime]::DaysInMonth($start.Year, $start.Month)
+        $end = [DateTime]::SpecifyKind((Get-Date -Year $start.Year -Month $start.Month -Day $lastDay -Hour 23 -Minute 59 -Second 59), [DateTimeKind]::Utc)
+        $periods += [pscustomobject]@{
+            Name = $start.ToString("yyyyMM")
+            From = $start.ToString("yyyy-MM-ddTHH:mm:ssZ")
+            To = $end.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        }
+    }
+
+    return $periods
+}
+
+function Get-SpottoBackfillQueuedDescription {
+    param([string]$PeriodName)
+
+    return "$SPOTTO_BACKFILL_QUEUED_PREFIX $PeriodName"
+}
+
+function Test-SpottoBackfillQueued {
+    param(
+        [object]$Export,
+        [string]$PeriodName
+    )
+
+    $properties = Get-CostExportProperties -Export $Export
+    if (-not $properties -or [string]::IsNullOrWhiteSpace($properties.exportDescription)) {
+        return $false
+    }
+
+    return $properties.exportDescription -eq (Get-SpottoBackfillQueuedDescription -PeriodName $PeriodName)
+}
+
+function New-CostExportBody {
+    param(
+        [string]$DatasetType,
+        [string]$Timeframe,
+        [string]$StorageAccountId,
+        [string]$ContainerName,
+        [string]$RootFolderPath,
+        [hashtable]$Schedule,
+        [hashtable]$TimePeriod = $null,
+        [string]$ExportDescription = ""
+    )
+
+    $definition = @{
+        type = $DatasetType
+        timeframe = $Timeframe
+        dataSet = @{
+            granularity = "Daily"
+        }
+    }
+
+    if ($TimePeriod) {
+        $definition.timePeriod = $TimePeriod
+    }
+
+    $body = @{
+        properties = @{
+            format = "Csv"
+            compressionMode = "gzip"
+            dataOverwriteBehavior = "OverwritePreviousReport"
+            partitionData = $true
+            definition = $definition
+            deliveryInfo = @{
+                destination = @{
+                    type = "AzureBlob"
+                    resourceId = $StorageAccountId
+                    container = $ContainerName
+                    rootFolderPath = $RootFolderPath
+                }
+            }
+            schedule = $Schedule
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ExportDescription)) {
+        $body.properties.exportDescription = $ExportDescription
+    }
+
+    return $body
+}
+
+function Ensure-CostExport {
+    param(
+        [string]$Scope,
+        [string]$ExportName,
+        [hashtable]$Body
+    )
+
+    $existingExport = Get-CostExport -Scope $Scope -ExportName $ExportName
+    if ($existingExport -and $existingExport.eTag) {
+        $Body.eTag = $existingExport.eTag
+    }
+
+    $resourceId = Get-CostExportResourceId -Scope $Scope -ExportName $ExportName
+
+    try {
+        New-AzResource -ResourceId $resourceId -ApiVersion $COST_EXPORT_API_VERSION -Properties $Body.properties -Force -ErrorAction Stop | Out-Null
+    } catch {
+        if ($Body.properties.ContainsKey("partitionData")) {
+            Write-Info "Retrying export '$ExportName' without explicit partitionData because this scope may not support that property."
+            $Body.properties.Remove("partitionData")
+            New-AzResource -ResourceId $resourceId -ApiVersion $COST_EXPORT_API_VERSION -Properties $Body.properties -Force -ErrorAction Stop | Out-Null
+        } else {
+            throw
+        }
+    }
+
+    if ($existingExport) {
+        return "updated"
+    }
+
+    return "created"
+}
+
+function Invoke-CostExportRun {
+    param(
+        [string]$Scope,
+        [string]$ExportName,
+        [hashtable]$TimePeriod = $null
+    )
+
+    $resourceId = Get-CostExportResourceId -Scope $Scope -ExportName $ExportName
+    if ($TimePeriod) {
+        Invoke-AzResourceAction -ResourceId $resourceId -Action "run" -ApiVersion $COST_EXPORT_API_VERSION -Parameters @{ timePeriod = $TimePeriod } -Force -ErrorAction Stop | Out-Null
+    } else {
+        Invoke-AzResourceAction -ResourceId $resourceId -Action "run" -ApiVersion $COST_EXPORT_API_VERSION -Force -ErrorAction Stop | Out-Null
+    }
+}
+
+function Add-BillingExportResult {
+    param(
+        [string]$SubscriptionName,
+        [string]$SubscriptionId,
+        [string]$DatasetType,
+        [string]$ExportKind,
+        [string]$ExportName,
+        [string]$Status,
+        [string]$StorageAccountId,
+        [string]$ContainerName,
+        [string]$RootFolderPath,
+        [string]$Message = ""
+    )
+
+    $script:billingExportResults += [pscustomobject]@{
+        SubscriptionName = $SubscriptionName
+        SubscriptionId = $SubscriptionId
+        DatasetType = $DatasetType
+        ExportKind = $ExportKind
+        ExportName = $ExportName
+        Status = $Status
+        StorageAccountId = $StorageAccountId
+        ContainerName = $ContainerName
+        RootFolderPath = $RootFolderPath
+        Message = $Message
+    }
+}
+
+function Ensure-RecurringAndBackfillExports {
+    param(
+        [object]$Subscription,
+        [object]$StorageDestination,
+        [string]$ContainerName,
+        [hashtable]$ExistingRecurringExports
+    )
+
+    $scope = "/subscriptions/$($Subscription.Id)"
+    $storageAccountId = $StorageDestination.ResourceId
+    $datasets = @("ActualCost", "AmortizedCost")
+    $backfillPeriods = Get-BackfillMonthPeriods -MonthCount 13
+
+    Ensure-ResourceProviderRegistered -SubscriptionId $Subscription.Id -ProviderNamespace "Microsoft.CostManagement"
+
+    foreach ($datasetType in $datasets) {
+        $datasetName = if ($datasetType -eq "ActualCost") { "actual" } else { "amortized" }
+        $recurringExportName = Get-SpottoRecurringExportName -DatasetType $datasetType
+        $recurringRootPath = "$BILLING_EXPORT_ROOT_PATH/$($Subscription.Id)/$datasetName/recurring"
+        $existingKey = "$($Subscription.Id)|$datasetType"
+        $effectiveDefinitionType = $datasetType
+
+        if ($ExistingRecurringExports.ContainsKey($existingKey)) {
+            $existingExport = $ExistingRecurringExports[$existingKey]
+            $existingExportProperties = Get-CostExportProperties -Export $existingExport
+            $destination = Get-ExportDestinationInfo -Export $existingExport
+            $effectiveDefinitionType = $existingExportProperties.definition.type
+            Write-Success "Using existing $datasetType daily export on $($Subscription.Name): $($existingExport.name)"
+            Add-BillingExportResult -SubscriptionName $Subscription.Name -SubscriptionId $Subscription.Id -DatasetType $datasetType -ExportKind "Recurring" -ExportName $existingExport.name -Status "existing" -StorageAccountId $destination.StorageAccountId -ContainerName $destination.Container -RootFolderPath $destination.RootFolderPath
+        } else {
+            try {
+                $from = (Get-Date).ToUniversalTime().Date.AddDays(1).ToString("yyyy-MM-ddT00:00:00Z")
+                $to = (Get-Date).ToUniversalTime().Date.AddYears(10).ToString("yyyy-MM-ddT00:00:00Z")
+                $schedule = @{
+                    status = "Active"
+                    recurrence = "Daily"
+                    recurrencePeriod = @{
+                        from = $from
+                        to = $to
+                    }
+                }
+
+                $resultStatus = ""
+                $resultMessage = ""
+                $createdOrUpdatedRecurring = $false
+                foreach ($definitionType in (Get-CostExportDefinitionTypeCandidates -DatasetType $datasetType)) {
+                    try {
+                        $body = New-CostExportBody -DatasetType $definitionType -Timeframe "MonthToDate" -StorageAccountId $storageAccountId -ContainerName $ContainerName -RootFolderPath $recurringRootPath -Schedule $schedule
+                        $status = Ensure-CostExport -Scope $scope -ExportName $recurringExportName -Body $body
+                        $resultStatus = $status
+                        if ($definitionType -ne $datasetType) {
+                            $resultMessage = "Used export definition type '$definitionType' because '$datasetType' is not supported for this agreement/scope."
+                            Write-Info $resultMessage
+                        }
+                        $effectiveDefinitionType = $definitionType
+
+                        if ($status -eq "created") {
+                            try {
+                                Invoke-CostExportRun -Scope $scope -ExportName $recurringExportName
+                                $resultStatus = "created-run-queued"
+                                Write-Success "created $datasetType daily export and queued an immediate run on $($Subscription.Name)"
+                            } catch {
+                                $runMessage = "Immediate run failed: $($_.Exception.Message)"
+                                $resultMessage = if ($resultMessage) { "$resultMessage $runMessage" } else { $runMessage }
+                                Write-Info "$datasetType daily export was created, but Azure did not queue an immediate run. It will run on its daily schedule. $runMessage"
+                            }
+                        } else {
+                            Write-Success "$status $datasetType daily export on $($Subscription.Name)"
+                        }
+
+                        $createdOrUpdatedRecurring = $true
+                        break
+                    } catch {
+                        $candidateMessage = $_.Exception.Message
+                        if ($definitionType -eq "ActualCost" -and (Test-ShouldRetryActualCostAsUsage -Message $candidateMessage)) {
+                            Write-Info "ActualCost exports are not supported for $($Subscription.Name). Retrying with export definition type 'Usage'."
+                            continue
+                        }
+
+                        throw
+                    }
+                }
+
+                if (-not $createdOrUpdatedRecurring) {
+                    throw "Unable to create $datasetType daily export using supported definition types."
+                }
+                Add-BillingExportResult -SubscriptionName $Subscription.Name -SubscriptionId $Subscription.Id -DatasetType $datasetType -ExportKind "Recurring" -ExportName $recurringExportName -Status $resultStatus -StorageAccountId $storageAccountId -ContainerName $ContainerName -RootFolderPath $recurringRootPath -Message $resultMessage
+            } catch {
+                $message = $_.Exception.Message
+
+                if ($datasetType -eq "AmortizedCost" -and (Test-CostExportTypeNotSupported -Message $message -DatasetType $datasetType)) {
+                    $friendlyMessage = "AmortizedCost exports are not supported for $($Subscription.Name) on this Azure agreement/scope. Continuing with actual cost exports."
+                    Write-Warning-Custom $friendlyMessage
+                    Add-BillingExportResult -SubscriptionName $Subscription.Name -SubscriptionId $Subscription.Id -DatasetType $datasetType -ExportKind "Recurring" -ExportName $recurringExportName -Status "unavailable" -StorageAccountId $storageAccountId -ContainerName $ContainerName -RootFolderPath $recurringRootPath -Message $friendlyMessage
+                    continue
+                }
+
+                Write-Error-Custom "Failed to create $datasetType daily export on $($Subscription.Name): $message"
+                Add-BillingExportResult -SubscriptionName $Subscription.Name -SubscriptionId $Subscription.Id -DatasetType $datasetType -ExportKind "Recurring" -ExportName $recurringExportName -Status "failed" -StorageAccountId $storageAccountId -ContainerName $ContainerName -RootFolderPath $recurringRootPath -Message $message
+                continue
+            }
+        }
+
+        foreach ($period in $backfillPeriods) {
+            $backfillExportName = "spotto-$datasetName-backfill-$($period.Name)"
+            $backfillRootPath = "$BILLING_EXPORT_ROOT_PATH/$($Subscription.Id)/$datasetName/backfill/$($period.Name)"
+            $existingBackfillExport = Get-CostExport -Scope $scope -ExportName $backfillExportName
+            $backfillAlreadyQueued = Test-SpottoBackfillQueued -Export $existingBackfillExport -PeriodName $period.Name
+            $backfillDescription = if ($backfillAlreadyQueued) {
+                Get-SpottoBackfillQueuedDescription -PeriodName $period.Name
+            } else {
+                "Spotto backfill pending $($period.Name)"
+            }
+            $timePeriod = @{
+                from = $period.From
+                to = $period.To
+            }
+            $schedule = @{
+                status = "Inactive"
+            }
+
+            try {
+                $body = New-CostExportBody -DatasetType $effectiveDefinitionType -Timeframe "Custom" -StorageAccountId $storageAccountId -ContainerName $ContainerName -RootFolderPath $backfillRootPath -Schedule $schedule -TimePeriod $timePeriod -ExportDescription $backfillDescription
+                $status = Ensure-CostExport -Scope $scope -ExportName $backfillExportName -Body $body
+                if ($status -eq "created" -or -not $backfillAlreadyQueued) {
+                    Invoke-CostExportRun -Scope $scope -ExportName $backfillExportName -TimePeriod $timePeriod
+                    $body.properties.exportDescription = Get-SpottoBackfillQueuedDescription -PeriodName $period.Name
+                    try {
+                        Ensure-CostExport -Scope $scope -ExportName $backfillExportName -Body $body | Out-Null
+                    } catch {
+                        Write-Warning-Custom "$DatasetType backfill export $($period.Name) was queued, but the idempotency marker could not be saved. A later rerun may queue it again. $_"
+                    }
+
+                    if ($status -eq "created") {
+                        Write-Success "created and queued $DatasetType backfill export $($period.Name) on $($Subscription.Name)"
+                        Add-BillingExportResult -SubscriptionName $Subscription.Name -SubscriptionId $Subscription.Id -DatasetType $datasetType -ExportKind "Backfill" -ExportName $backfillExportName -Status "queued" -StorageAccountId $storageAccountId -ContainerName $ContainerName -RootFolderPath $backfillRootPath
+                    } else {
+                        Write-Success "re-queued $DatasetType backfill export $($period.Name) on $($Subscription.Name) because no queued marker was found"
+                        Add-BillingExportResult -SubscriptionName $Subscription.Name -SubscriptionId $Subscription.Id -DatasetType $datasetType -ExportKind "Backfill" -ExportName $backfillExportName -Status "requeued" -StorageAccountId $storageAccountId -ContainerName $ContainerName -RootFolderPath $backfillRootPath
+                    }
+                } else {
+                    Write-Info "$DatasetType backfill export $($period.Name) already exists on $($Subscription.Name); not re-queued"
+                    Add-BillingExportResult -SubscriptionName $Subscription.Name -SubscriptionId $Subscription.Id -DatasetType $datasetType -ExportKind "Backfill" -ExportName $backfillExportName -Status "existing" -StorageAccountId $storageAccountId -ContainerName $ContainerName -RootFolderPath $backfillRootPath
+                }
+            } catch {
+                $message = $_.Exception.Message
+                if ($datasetType -eq "AmortizedCost" -and (Test-CostExportTypeNotSupported -Message $message -DatasetType $datasetType)) {
+                    $friendlyMessage = "AmortizedCost backfill exports are not supported for $($Subscription.Name) on this Azure agreement/scope. Continuing with actual cost exports."
+                    Write-Warning-Custom $friendlyMessage
+                    Add-BillingExportResult -SubscriptionName $Subscription.Name -SubscriptionId $Subscription.Id -DatasetType $datasetType -ExportKind "Backfill" -ExportName $backfillExportName -Status "unavailable" -StorageAccountId $storageAccountId -ContainerName $ContainerName -RootFolderPath $backfillRootPath -Message $friendlyMessage
+                    break
+                }
+
+                Write-Error-Custom "Failed to queue $DatasetType backfill $($period.Name) on $($Subscription.Name): $message"
+                Add-BillingExportResult -SubscriptionName $Subscription.Name -SubscriptionId $Subscription.Id -DatasetType $datasetType -ExportKind "Backfill" -ExportName $backfillExportName -Status "failed" -StorageAccountId $storageAccountId -ContainerName $ContainerName -RootFolderPath $backfillRootPath -Message $message
+                if ($datasetType -eq "AmortizedCost") {
+                    break
+                }
+            }
+        }
+    }
+}
+
 # ============================================================================
 # MAIN SCRIPT
 # ============================================================================
@@ -509,8 +1536,9 @@ Write-DetailRow -Label "Billing" -Value "Assign Reservations Reader and Savings 
 Write-DetailRow -Label "Microsoft Graph" -Value "Grant Application.Read.All with tenant admin consent."
 Write-Host ""
 
-Write-SectionLabel "Optional prompts"
+Write-SectionLabel "Recommended and optional prompts"
 Write-DetailRow -Label "Monitoring" -Value "Monitoring Reader and Log Analytics Reader for richer telemetry analysis."
+Write-DetailRow -Label "Billing exports" -Value "Highly recommended daily exports plus 13-month backfill to reduce billing API calls."
 Write-DetailRow -Label "Write permissions" -Value "Custom role for Advisor dismissals and Storage Inventory reports."
 Write-Host ""
 
@@ -522,8 +1550,8 @@ Write-Host "    Access management for Azure resources, then sign out and sign ba
 Write-Host "  - Microsoft Graph Application.Read.All requires tenant admin consent." -ForegroundColor Yellow
 Write-Host ""
 
-$confirmation = Read-Host "Do you want to continue? (yes/no)"
-if ($confirmation -ne "yes") {
+$confirmation = Read-Host "Do you want to continue? (yes/no, default yes)"
+if (-not (Test-YesResponse -Value $confirmation)) {
     Write-Info "Setup cancelled by user."
     exit
 }
@@ -532,7 +1560,7 @@ if ($confirmation -ne "yes") {
 # Step 1: Connect to Azure
 # ============================================================================
 
-Write-Header -Message "Step 1 of 12: Connect to Azure"
+Write-Header -Message "Step 1 of 13: Connect to Azure"
 
 try {
     $currentContext = Get-AzContext
@@ -541,8 +1569,8 @@ try {
         Connect-AzAccount
     } else {
         Write-Info "Already logged in as: $($currentContext.Account.Id)"
-        $reconnect = Read-Host "Do you want to use a different account? (yes/no)"
-        if ($reconnect -eq "yes") {
+        $useCurrentAccount = Read-Host "Use this account? (yes/no, default yes)"
+        if (-not (Test-YesResponse -Value $useCurrentAccount)) {
             Connect-AzAccount
         }
     }
@@ -556,7 +1584,7 @@ try {
 # Step 2: Select Tenant
 # ============================================================================
 
-Write-Header -Message "Step 2 of 12: Select Tenant"
+Write-Header -Message "Step 2 of 13: Select Tenant"
 
 try {
     # Get all tenants the user has access to
@@ -612,7 +1640,7 @@ try {
 # Step 3: Select Subscriptions
 # ============================================================================
 
-Write-Header -Message "Step 3 of 12: Select Subscriptions"
+Write-Header -Message "Step 3 of 13: Select Subscriptions"
 
 $subscriptions = Get-AzSubscription -TenantId $script:tenantId
 Write-Host "Found $($subscriptions.Count) subscription(s) in your tenant:`n"
@@ -686,7 +1714,7 @@ while (-not $scopeSelected) {
 # Step 4: Create Service Principal
 # ============================================================================
 
-Write-Header -Message "Step 4 of 12: Create Service Principal"
+Write-Header -Message "Step 4 of 13: Create Service Principal"
 
 try {
     # Check if app already exists
@@ -724,7 +1752,7 @@ try {
 # Step 5: Create Client Secret
 # ============================================================================
 
-Write-Header -Message "Step 5 of 12: Create Client Secret"
+Write-Header -Message "Step 5 of 13: Create Client Secret"
 
 try {
     # Check for existing secrets
@@ -738,7 +1766,7 @@ try {
             Write-Host "  - $($cred.EndDateTime.ToString('yyyy-MM-dd HH:mm:ss UTC'))"
         }
         
-        $createNew = Read-Host "`nDo you want to create a new secret? (yes/no)"
+        $createNew = Read-Host "`nDo you want to create a new secret? (yes/no, default no)"
         
         if ($createNew -ne "yes") {
             Write-Info "Using existing credentials. You'll need to provide the secret value manually."
@@ -778,7 +1806,7 @@ try {
 # Step 6: Assign Reader Access
 # ============================================================================
 
-Write-Header -Message "Step 6 of 12: Assign Reader Access"
+Write-Header -Message "Step 6 of 13: Assign Reader Access"
 
 if ($script:useTenantRootReader) {
     Write-Info "All subscriptions were selected, so Reader will be assigned at tenant root scope (/)."
@@ -791,7 +1819,7 @@ if ($script:useTenantRootReader) {
 # Step 7: Optional Recommended Monitoring Roles
 # ============================================================================
 
-Write-Header -Message "Step 7 of 12: Recommended Monitoring Roles"
+Write-Header -Message "Step 7 of 13: Recommended Monitoring Roles"
 
 Write-SectionLabel "Recommended read permissions"
 Write-DetailRow -Label "Monitoring Reader" -Value "Application Insights query access on selected subscriptions."
@@ -801,7 +1829,7 @@ Write-DetailRow -Label "Specific subscriptions" -Value "Log Analytics Reader is 
 Write-Host ""
 Write-Info "Press Enter to accept the default answer of yes."
 
-$grantMonitoringReadPerms = Read-Host "Do you want to grant these optional recommended monitoring roles? (yes/no)"
+$grantMonitoringReadPerms = Read-Host "Do you want to grant these optional recommended monitoring roles? (yes/no, default yes)"
 
 if ([string]::IsNullOrWhiteSpace($grantMonitoringReadPerms) -or $grantMonitoringReadPerms -match "^(?i:yes)$") {
     Ensure-SubscriptionRoleAssignments -PrincipalId $sp.Id -Subscriptions $selectedSubscriptions -RoleDefinitionName "Monitoring Reader" -RoleLabel "Monitoring Reader role"
@@ -824,7 +1852,7 @@ if ([string]::IsNullOrWhiteSpace($grantMonitoringReadPerms) -or $grantMonitoring
 # Step 8: Assign Root Management Group Governance Reader Roles
 # ============================================================================
 
-Write-Header -Message "Step 8 of 12: Assign Governance Reader Roles"
+Write-Header -Message "Step 8 of 13: Assign Governance Reader Roles"
 
 try {
     $script:rootManagementGroupReaderStatus = Ensure-RootManagementGroupRoleAssignment -PrincipalId $sp.Id -RoleDefinitionName "Reader" -RoleLabel "Reader role (root management group)"
@@ -839,7 +1867,7 @@ try {
 # Step 9: Assign Reservations Reader
 # ============================================================================
 
-Write-Header -Message "Step 9 of 12: Assign Reservations Reader"
+Write-Header -Message "Step 9 of 13: Assign Reservations Reader"
 
 try {
     $reservationScope = "/providers/Microsoft.Capacity"
@@ -865,7 +1893,7 @@ try {
 # Step 10: Assign Savings plan Reader
 # ============================================================================
 
-Write-Header -Message "Step 10 of 12: Assign Savings Plan Reader"
+Write-Header -Message "Step 10 of 13: Assign Savings Plan Reader"
 
 try {
     $savingsPlanScope = "/providers/Microsoft.BillingBenefits"
@@ -891,7 +1919,7 @@ try {
 # Step 11: Grant Microsoft Graph Application.Read.All
 # ============================================================================
 
-Write-Header -Message "Step 11 of 12: Grant Microsoft Graph Application.Read.All"
+Write-Header -Message "Step 11 of 13: Grant Microsoft Graph Application.Read.All"
 
 try {
     Write-Info "Connecting to Microsoft Graph to grant Application.Read.All with admin consent..."
@@ -935,17 +1963,160 @@ try {
 }
 
 # ============================================================================
-# Step 12: Optional Custom Roles
+# Step 12: Highly Recommended Cost Management Billing Exports
 # ============================================================================
 
-Write-Header -Message "Step 12 of 12: Optional Write Permissions"
+Write-Header -Message "Step 12 of 13: Cost Management Billing Exports"
+
+Write-SectionLabel "Highly recommended billing export setup"
+Write-NumberedStep -Number 1 -Message "Detect existing daily actual and amortized Cost Management exports."
+Write-NumberedStep -Number 2 -Message "Grant the Spotto service principal Storage Blob Data Reader on export containers."
+Write-NumberedStep -Number 3 -Message "Create missing daily exports and queue one-time exports for the previous 13 closed months."
+Write-Host ""
+Write-Info "Exports are written to customer-owned Azure Storage. Spotto cloud-engine reads them later."
+Write-Info "This is highly recommended because it reduces Cost Management API calls and Azure rate limiting."
+Write-Info "The script keeps the storage public endpoint enabled, anonymous access disabled, and containers private."
+Write-Info "New daily recurring exports are run immediately when Azure accepts the run request."
+Write-Info "Historical backfill exports are queued once and marked so reruns can recover interrupted backfills without repeated queueing."
+Write-Host ""
+
+$configureBillingExports = Read-Host "Set up highly recommended Cost Management exports for Spotto? (yes/no, default yes)"
+
+if (Test-YesResponse -Value $configureBillingExports) {
+    $script:billingExportSetupStatus = "processed"
+    $existingRecurringExports = @{}
+    $detectedExistingExports = @()
+
+    Write-Info "Checking for existing daily Cost Management exports on selected subscriptions..."
+    foreach ($sub in $selectedSubscriptions) {
+        foreach ($datasetType in @("ActualCost", "AmortizedCost")) {
+            $matches = @(Find-ExistingRecurringBillingExports -Subscription $sub -DatasetType $datasetType)
+            if ($matches.Count -gt 0) {
+                $export = $matches | Select-Object -First 1
+                $destination = Get-ExportDestinationInfo -Export $export
+                $detectedExistingExports += [pscustomobject]@{
+                    Subscription = $sub
+                    DatasetType = $datasetType
+                    Export = $export
+                    Destination = $destination
+                }
+            }
+        }
+    }
+
+    if ($detectedExistingExports.Count -gt 0) {
+        Write-Host ""
+        Write-SectionLabel "Detected compatible recurring exports"
+        foreach ($detected in $detectedExistingExports) {
+            Write-DetailRow -Label "Subscription" -Value $detected.Subscription.Name
+            Write-DetailRow -Label "Dataset" -Value $detected.DatasetType
+            Write-DetailRow -Label "Export" -Value $detected.Export.name
+            Write-DetailRow -Label "Container" -Value $detected.Destination.Container
+            Write-Host ""
+        }
+
+        Write-Info "If accepted, storage accounts for existing exports may be updated to keep the public endpoint enabled with anonymous blob access disabled."
+        $useExistingExports = Read-Host "Use compatible existing recurring exports where found? (yes/no, default yes)"
+        if (Test-YesResponse -Value $useExistingExports) {
+            foreach ($detected in $detectedExistingExports) {
+                try {
+                    $storageAccountId = $detected.Destination.StorageAccountId
+                    $containerName = $detected.Destination.Container
+                    Ensure-BillingExportStorageSettings -StorageAccountId $storageAccountId
+                    $containerScope = Ensure-BillingExportContainer -StorageAccountId $storageAccountId -ContainerName $containerName
+                    $storageReaderStatus = Ensure-StorageBlobDataReaderAssignment -PrincipalId $sp.Id -Scope $containerScope
+                    if ($storageReaderStatus -eq "failed") {
+                        throw "Storage Blob Data Reader could not be assigned on export container '$containerName'."
+                    }
+
+                    $key = "$($detected.Subscription.Id)|$($detected.DatasetType)"
+                    $existingRecurringExports[$key] = $detected.Export
+                } catch {
+                    Write-Error-Custom "Existing export '$($detected.Export.name)' could not be prepared for Spotto: $_"
+                }
+            }
+        }
+    } else {
+        Write-Info "No compatible recurring exports were found on the selected subscriptions."
+    }
+
+    $storageDestination = $null
+    $billingExportContainerName = $BILLING_EXPORT_CONTAINER_NAME
+
+    if ($existingRecurringExports.Count -gt 0) {
+        $firstExistingExport = $existingRecurringExports.Values | Select-Object -First 1
+        $firstDestination = Get-ExportDestinationInfo -Export $firstExistingExport
+        $useExistingStorageForNewExports = Read-Host "Use the first existing export storage account for backfill and missing exports? (yes/no, default yes)"
+
+        if (Test-YesResponse -Value $useExistingStorageForNewExports) {
+            try {
+                $storageParts = Get-StorageAccountParts -StorageAccountId $firstDestination.StorageAccountId
+                $storageDestination = [pscustomobject]@{
+                    ResourceId = $firstDestination.StorageAccountId
+                    SubscriptionId = $storageParts.SubscriptionId
+                    ResourceGroupName = $storageParts.ResourceGroupName
+                    Name = $storageParts.Name
+                }
+                $billingExportContainerName = $firstDestination.Container
+            } catch {
+                Write-Info "Unable to reuse existing export storage. A storage account selection is required. $_"
+            }
+        }
+    }
+
+    if (-not $storageDestination) {
+        try {
+            $storageDestination = Select-BillingExportStorageAccount -Subscriptions $selectedSubscriptions
+            $billingExportContainerName = Get-DefaultedInput -Prompt "Blob container for Spotto billing exports" -DefaultValue $BILLING_EXPORT_CONTAINER_NAME
+        } catch {
+            $script:billingExportSetupStatus = "failed"
+            Write-Error-Custom "Failed to select or create billing export storage: $($_.Exception.Message)"
+            Write-Info "Continuing with the remaining onboarding steps. You can rerun the script after fixing the storage/export prerequisite."
+        }
+    }
+
+    if ($script:billingExportSetupStatus -ne "failed") {
+        try {
+            Ensure-BillingExportStorageSettings -StorageAccountId $storageDestination.ResourceId
+            $billingContainerScope = Ensure-BillingExportContainer -StorageAccountId $storageDestination.ResourceId -ContainerName $billingExportContainerName
+            $storageReaderStatus = Ensure-StorageBlobDataReaderAssignment -PrincipalId $sp.Id -Scope $billingContainerScope
+            if ($storageReaderStatus -eq "failed") {
+                throw "Storage Blob Data Reader could not be assigned on export container '$billingExportContainerName'."
+            }
+        } catch {
+            $script:billingExportSetupStatus = "failed"
+            Write-Error-Custom "Failed to prepare billing export storage: $_"
+        }
+    }
+
+    if ($script:billingExportSetupStatus -ne "failed") {
+        foreach ($sub in $selectedSubscriptions) {
+            Write-Header -Message "Billing exports: $($sub.Name)" -Subtitle "Daily recurring plus 13-month backfill"
+            try {
+                Ensure-RecurringAndBackfillExports -Subscription $sub -StorageDestination $storageDestination -ContainerName $billingExportContainerName -ExistingRecurringExports $existingRecurringExports
+            } catch {
+                Write-Error-Custom "Billing export setup failed for $($sub.Name): $_"
+                Add-BillingExportResult -SubscriptionName $sub.Name -SubscriptionId $sub.Id -DatasetType "All" -ExportKind "Setup" -ExportName "" -Status "failed" -StorageAccountId $storageDestination.ResourceId -ContainerName $billingExportContainerName -RootFolderPath $BILLING_EXPORT_ROOT_PATH -Message $_.Exception.Message
+            }
+        }
+    }
+} else {
+    $script:billingExportSetupStatus = "skipped"
+    Write-Info "Skipping highly recommended Cost Management billing export setup"
+}
+
+# ============================================================================
+# Step 13: Optional Custom Roles
+# ============================================================================
+
+Write-Header -Message "Step 13 of 13: Optional Write Permissions"
 
 Write-SectionLabel "Optional write capabilities"
 Write-NumberedStep -Number 1 -Message "Dismiss Azure Advisor recommendations."
 Write-NumberedStep -Number 2 -Message "Enable Storage Inventory reports."
 Write-Host ""
 
-$grantWritePerms = Read-Host "Do you want to grant these optional write permissions? (yes/no)"
+$grantWritePerms = Read-Host "Do you want to grant these optional write permissions? (yes/no, default no)"
 
 if ($grantWritePerms -eq "yes") {
     
@@ -1089,6 +2260,41 @@ switch ($script:graphPermissionStatus) {
     "existing" { Write-Success "Microsoft Graph Application.Read.All already existed for governance and credential posture" }
     "failed" { Write-Error-Custom "Microsoft Graph Application.Read.All was not granted" }
     default { Write-Skipped "Microsoft Graph Application.Read.All was not processed" }
+}
+switch ($script:billingExportSetupStatus) {
+    "processed" { Write-Success "Cost Management billing exports processed" }
+    "failed" { Write-Error-Custom "Cost Management billing export setup failed before export creation completed" }
+    "skipped" { Write-Skipped "Cost Management billing export setup skipped (highly recommended)" }
+    default { Write-Skipped "Cost Management billing export setup was not processed" }
+}
+if ($script:billingExportResults.Count -gt 0) {
+    $failedBillingExports = @($script:billingExportResults | Where-Object { $_.Status -eq "failed" })
+    $unavailableBillingExports = @($script:billingExportResults | Where-Object { $_.Status -eq "unavailable" })
+    $processedBillingExports = @($script:billingExportResults | Where-Object { $_.Status -notin @("failed", "unavailable") })
+    $billingDestinations = @($script:billingExportResults |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_.StorageAccountId) } |
+        Select-Object -Property StorageAccountId, ContainerName -Unique)
+
+    Write-Host ""
+    Write-SectionLabel "Billing export summary"
+    Write-DetailRow -Label "Processed" -Value "$($processedBillingExports.Count) export operation(s)"
+    Write-DetailRow -Label "Unavailable" -Value "$($unavailableBillingExports.Count) export operation(s)"
+    Write-DetailRow -Label "Failures" -Value "$($failedBillingExports.Count) export operation(s)"
+    foreach ($destination in ($billingDestinations | Select-Object -First 5)) {
+        Write-DetailRow -Label "Storage" -Value "$($destination.StorageAccountId) / containers/$($destination.ContainerName)"
+    }
+    if ($billingDestinations.Count -gt 5) {
+        Write-Info "Additional billing export storage destinations are listed in the transcript."
+    }
+    if ($unavailableBillingExports.Count -gt 0) {
+        Write-Warning-Custom "Some optional export datasets are not available for this Azure agreement/scope."
+    }
+    if ($failedBillingExports.Count -gt 0) {
+        Write-Info "Some exports failed and may need manual review."
+        foreach ($failedExport in ($failedBillingExports | Select-Object -First 5)) {
+            Write-Error-Custom "$($failedExport.SubscriptionName) $($failedExport.DatasetType) $($failedExport.ExportKind): $($failedExport.Message)"
+        }
+    }
 }
 if ($grantWritePerms -eq "yes") {
     Write-Success "Custom role with write permissions created and assigned"

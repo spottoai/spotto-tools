@@ -15,6 +15,8 @@ Automated PowerShell script to connect your Azure environment to Spotto:
 - Optionally assigns recommended Monitoring Reader and Log Analytics Reader roles
 - Configures management-group governance visibility, tenant-wide or per-subscription Log Analytics Reader access, plus Reservations Reader and Savings plan Reader access
 - Grants Microsoft Graph `Application.Read.All` with admin consent for governance and credential posture
+- Highly recommended: Detects or creates Azure Cost Management exports to customer-owned storage, with daily CSV/GZIP exports, immediate first runs when supported, and one-time 13-month backfill where supported
+- New billing export resource groups and storage accounts default to Azure location `australiaeast`
 - Optional: Sets up write permissions for Advisor recommendations and Storage inventory
 
 The script is **idempotent** - safe to run multiple times.
@@ -28,11 +30,13 @@ The script is **idempotent** - safe to run multiple times.
 
 ### Prerequisites
 - PowerShell 5.1 or PowerShell 7+
+- Azure PowerShell modules including `Az.Accounts`, `Az.Resources`, and `Az.Storage` (the script can install missing modules)
 - Azure account with appropriate permissions:
   - Global Administrator or Application Administrator to create the service principal
   - Owner or User Access Administrator on subscriptions, and at tenant root scope (`/`) if onboarding all subscriptions
   - Management Group Contributor or Owner at the root management group
   - Tenant admin consent for Microsoft Graph `Application.Read.All`
+  - Highly recommended billing export setup: permission to manage Cost Management exports, storage accounts, containers, and `Storage Blob Data Reader` role assignments
 
 ### Setup
 ```powershell
@@ -49,9 +53,10 @@ The script will:
 2. Guide you through selecting your tenant and subscriptions
 3. Create a service principal named "Spotto AI"
 4. Assign the required governance, billing, and optional monitoring permissions
-5. Display credentials to copy into the Spotto portal
+5. Configure the highly recommended Azure Cost Management exports for Spotto cloud-engine to read later
+6. Display credentials to copy into the Spotto portal
 
-You can safely rerun the script. It checks for existing Spotto resources and role assignments, then reuses or updates them where possible.
+You can safely rerun the script. It checks for existing Spotto resources, role assignments, storage containers, and export definitions, then reuses or updates them where possible.
 
 ### Next Steps
 

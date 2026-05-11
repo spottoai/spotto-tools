@@ -16,10 +16,14 @@ The script performs the following actions:
 4.  Assigns **Reader** and **Management Group Reader** at the root management group for tenant governance hierarchy plus management-group policy and RBAC metadata.
 5.  Assigns **Reservations Reader** at `/providers/Microsoft.Capacity` and **Savings plan Reader** at `/providers/Microsoft.BillingBenefits`.
 6.  Grants **Application.Read.All** in Microsoft Graph with admin consent so Spotto can read applications and service principals for governance and credential posture.
-7.  (Optional) Creates and assigns a custom role for **write permissions** (Advisor recommendations, Storage inventory).
-8.  Outputs the credentials needed to configure Spotto.
+7.  (Highly recommended) Configures **Cost Management exports** to customer-owned Azure Storage:
+    *   Detects compatible existing daily actual/amortized exports and can grant the Spotto service principal **Storage Blob Data Reader** on their containers.
+    *   Creates a new or selected existing storage account/container when no suitable export destination is available.
+    *   Creates daily CSV/GZIP exports and queues one-time exports for the previous 13 closed months where the subscription supports the dataset.
+8.  (Optional) Creates and assigns a custom role for **write permissions** (Advisor recommendations, Storage inventory).
+9.  Outputs the credentials needed to configure Spotto.
 
-You can safely rerun the script if validation needs more time, permissions change, or you need to retry a failed step. It checks for existing Spotto resources and role assignments, then reuses or updates them where possible.
+You can safely rerun the script if validation needs more time, permissions change, or you need to retry a failed step. It checks for existing Spotto resources, role assignments, storage containers, and export definitions, then reuses or updates them where possible.
 
 ## Prerequisites
 
@@ -31,9 +35,11 @@ Before running the script, ensure you have:
     *   **Owner** or **User Access Administrator** on the subscriptions you want to onboard, or at tenant root scope (`/`) if you choose **All subscriptions**.
     *   If you choose **All subscriptions** and want the script to assign **Reader** at tenant root scope (`/`), a **Global Administrator** typically needs to enable **Microsoft Entra ID** > **Properties** > **Access management for Azure resources**, then sign out and sign back in before running the script.
     *   A tenant admin able to grant **Microsoft Graph Application.Read.All** admin consent.
+    *   Highly recommended billing export setup requires rights to manage Cost Management exports, storage accounts, blob containers, and `Storage Blob Data Reader` role assignments.
 *   **PowerShell Modules** (the script will attempt to install these if missing):
     *   `Az.Accounts`
     *   `Az.Resources`
+    *   `Az.Storage`
     *   `Microsoft.Graph.Authentication`
     *   `Microsoft.Graph.Applications`
 *   **Multi-tenant / MFA**: If your account has access to multiple tenants or is protected by conditional access (MFA), you may be prompted to sign in more than once.
@@ -50,6 +56,8 @@ Before running the script, ensure you have:
 *   **Reservations Reader**: Permission to assign the role at `/providers/Microsoft.Capacity`.
 *   **Savings plan Reader**: Permission to assign the role at `/providers/Microsoft.BillingBenefits`.
 *   **Microsoft Graph Application.Read.All**: Tenant admin consent for the application permission so Spotto can read applications and service principals for governance and credential posture.
+*   **Cost Management exports**: Permission to create/update `Microsoft.CostManagement/exports` on selected subscriptions.
+*   **Billing export storage**: Permission to create or update the selected storage account and container, plus Owner or User Access Administrator permission to assign **Storage Blob Data Reader** at the container scope.
 
 ## Usage
 
@@ -93,7 +101,15 @@ The script is interactive and will guide you through the process:
     *   **Reservations Reader** at `/providers/Microsoft.Capacity`.
     *   **Savings plan Reader** at `/providers/Microsoft.BillingBenefits`.
 8.  **Microsoft Graph Governance Permission**: The script grants **Application.Read.All** with admin consent so Spotto can read applications and service principals for governance and credential posture.
-9.  **Optional Write Permissions**: You will be asked if you want to grant optional write permissions for:
+9.  **Highly Recommended Cost Management Exports**: You will be asked if you want to configure exports. The default is **yes** because exports reduce Cost Management API calls and Azure rate limiting.
+    *   If compatible daily exports already exist, the script can reuse them and grant Spotto blob read access to their containers.
+    *   If no suitable destination exists, the script can create a storage account or use an existing one.
+    *   New billing export resource groups and storage accounts default to Azure location `australiaeast` (Australia East).
+    *   The script keeps anonymous blob access disabled, containers private, and the storage public endpoint enabled so Spotto cloud-engine can authenticate and read the data later.
+    *   The script creates actual-cost exports and attempts amortized-cost exports. Amortized exports are skipped where Azure does not support them.
+    *   Newly created daily recurring exports are run immediately when Azure accepts the run request, so Spotto does not have to wait for the first scheduled daily run.
+    *   Historical backfill exports are marked after they are queued, so rerunning the script can recover interrupted backfills without repeated queueing.
+10. **Optional Write Permissions**: You will be asked if you want to grant optional write permissions for:
     *   Dismissing Azure Advisor recommendations.
     *   Enabling Storage Inventory reports.
 
@@ -129,6 +145,8 @@ Upon successful completion, the script will display the credentials you need to 
 *   **Log Analytics Reader failed**: Confirm you have permission to assign roles at the root management group for tenant-wide onboarding, or at each selected subscription for per-subscription onboarding. If needed, assign **Log Analytics Reader** manually and rerun the script.
 *   **Reservations Reader / Savings plan Reader failed**: Your account lacks permission at the billing provider scopes `/providers/Microsoft.Capacity` or `/providers/Microsoft.BillingBenefits`. Ask a tenant admin to assign these roles manually if needed.
 *   **Microsoft Graph Application.Read.All failed**: The tenant still needs admin consent for the Microsoft Graph application permission. Have a tenant admin grant **Application.Read.All** with admin consent in **Azure Portal > App Registrations > API permissions**, then rerun the script.
+*   **Cost Management export setup failed**: Confirm the subscription supports Cost Management exports and that your account can create or update `Microsoft.CostManagement/exports`. Some subscriptions do not support amortized exports; the script continues with actual cost where possible.
+*   **Billing export storage access failed**: Confirm the storage account allows access through the public endpoint, anonymous blob access is disabled, and the Spotto service principal has **Storage Blob Data Reader** on the export container.
 *   **"Forbidden" role assignment errors**: Your account lacks permission at that scope (subscription, root management group, or tenant billing scopes). Ask a tenant admin or subscription owner to run the script or assign the roles manually.
 *   **"Conflict" during custom role creation**: The custom role already exists in the tenant. This is safe to ignore; re-run the script if you need to assign it to more subscriptions.
 *   **Module Errors**: If module installation fails, try running PowerShell as Administrator or install them manually:
