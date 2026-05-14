@@ -14,8 +14,9 @@ Automated PowerShell script to connect your Azure environment to Spotto:
 - Assigns Reader access across your subscriptions, or inherits it via tenant root scope when onboarding all subscriptions
 - Optionally assigns recommended Monitoring Reader and Log Analytics Reader roles
 - Configures management-group governance visibility, tenant-wide or per-subscription Log Analytics Reader access, plus Reservations Reader and Savings plan Reader access
-- Grants Microsoft Graph `Application.Read.All` with admin consent for governance and credential posture
+- Optionally grants Microsoft Graph `Application.Read.All` with admin consent for governance and credential posture
 - Highly recommended: Detects or creates Azure Cost Management exports to customer-owned storage, with daily CSV/GZIP exports, immediate first runs when supported, and one-time 13-month backfill where supported
+- Skips billing export setup with a friendly warning when Cost Management exports are unavailable for a subscription offer, billing scope, or dataset
 - New billing export resource groups and storage accounts default to Azure location `australiaeast`
 - Optional: Sets up write permissions for Advisor recommendations and Storage inventory
 
@@ -35,7 +36,7 @@ The script is **idempotent** - safe to run multiple times.
   - Global Administrator or Application Administrator to create the service principal
   - Owner or User Access Administrator on subscriptions, and at tenant root scope (`/`) if onboarding all subscriptions
   - Management Group Contributor or Owner at the root management group
-  - Tenant admin consent for Microsoft Graph `Application.Read.All`
+  - Tenant admin consent for Microsoft Graph `Application.Read.All` if you choose to grant Graph governance permissions
   - Highly recommended billing export setup: permission to manage Cost Management exports, storage accounts, containers, and `Storage Blob Data Reader` role assignments
 
 ### Setup
@@ -53,8 +54,9 @@ The script will:
 2. Guide you through selecting your tenant and subscriptions
 3. Create a service principal named "Spotto AI"
 4. Assign the required governance, billing, and optional monitoring permissions
-5. Configure the highly recommended Azure Cost Management exports for Spotto cloud-engine to read later
-6. Display credentials to copy into the Spotto portal
+5. Ask whether to grant Microsoft Graph `Application.Read.All` with admin consent
+6. Configure the highly recommended Azure Cost Management exports for Spotto cloud-engine to read later
+7. Display credentials to copy into the Spotto portal
 
 You can safely rerun the script. It checks for existing Spotto resources, role assignments, storage containers, and export definitions, then reuses or updates them where possible.
 
