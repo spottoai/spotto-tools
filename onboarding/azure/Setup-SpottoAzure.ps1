@@ -24,6 +24,9 @@
       (read applications and service principals for governance and credential posture)
     - Highly recommended: Cost Management exports to customer-owned Azure Storage
       (daily actual/amortized exports plus one-time historical backfill where supported)
+      Existing billing-scope exports can be reused when the operator has access to the
+      billing scope; billing-scope reader access for the Spotto service principal must
+      be granted separately for EA/MCA billing hierarchy scopes.
     - Optional: Custom role for dismissing Azure Advisor recommendations
     - Optional: Custom role for enabling Storage Inventory Reports
     
@@ -38,6 +41,8 @@
     - Owner or User Access Administrator on subscriptions, or at tenant root scope (/)
     - Tenant admin consent for Microsoft Graph Application.Read.All if granting Graph governance permissions
     - Management Group Contributor or Owner role for management group access
+    - Billing-scope reader access if reusing Cost Management exports created at an EA/MCA
+      billing account, billing profile, invoice section, department, or enrollment scope
     - If assigning Reader at tenant root scope (/), Global Administrators typically need
       to enable Microsoft Entra ID > Properties > Access management for Azure resources
       and then sign out and sign back in before running this script
@@ -54,6 +59,7 @@ $BILLING_EXPORT_CONTAINER_NAME = "spotto-cost-exports"
 $BILLING_EXPORT_ROOT_PATH = "spotto"
 $BILLING_EXPORT_DEFAULT_LOCATION = "australiaeast"
 $COST_EXPORT_API_VERSION = "2025-03-01"
+$BILLING_API_VERSION = "2020-05-01"
 $SPOTTO_BACKFILL_QUEUED_PREFIX = "Spotto backfill queued"
 $script:ConsolePanelWidth = 80
 
@@ -197,6 +203,7 @@ $script:reservationReaderStatus = "not-run"
 $script:savingsPlanReaderStatus = "not-run"
 $script:graphPermissionStatus = "not-run"
 $script:billingExportSetupStatus = "not-run"
+$script:billingScopeExportStatus = "not-run"
 $script:billingExportResults = @()
 
 # ============================================================================
@@ -1079,18 +1086,326 @@ function Ensure-StorageBlobDataReaderAssignment {
     }
 }
 
+function Invoke-AzRestGetJson {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $null
+    }
+
+    if ($Path -match "^https://management\.azure\.com(/.+)$") {
+        $Path = $Matches[1]
+    }
+
+    $response = Invoke-AzRestMethod -Method GET -Path $Path -ErrorAction Stop
+    if (-not $response -or [string]::IsNullOrWhiteSpace($response.Content)) {
+        return $null
+    }
+
+    return $response.Content | ConvertFrom-Json -ErrorAction Stop
+}
+
+function Get-AzRestCollection {
+    param(
+        [string]$Path,
+        [bool]$Quiet = $false
+    )
+
+    $items = @()
+    $nextPath = $Path
+
+    try {
+        while (-not [string]::IsNullOrWhiteSpace($nextPath)) {
+            $result = Invoke-AzRestGetJson -Path $nextPath
+            if ($result -and $result.value) {
+                $items += @($result.value)
+            }
+
+            $nextPath = if ($result -and $result.nextLink) { $result.nextLink } else { "" }
+        }
+    } catch {
+        if (-not $Quiet) {
+            Write-Info "Unable to query Azure Resource Manager path '$Path'. $_"
+        }
+    }
+
+    return @($items)
+}
+
+function Test-BillingCostExportScope {
+    param([string]$Scope)
+
+    if ([string]::IsNullOrWhiteSpace($Scope)) {
+        return $false
+    }
+
+    $normalizedScope = $Scope.Trim().TrimEnd("/")
+    return $normalizedScope -match "^/providers/Microsoft\.Billing/billingAccounts/[^/]+(/billingProfiles/[^/]+)?(/invoiceSections/[^/]+)?$" -or
+        $normalizedScope -match "^/providers/Microsoft\.Billing/billingAccounts/[^/]+/(departments|enrollmentAccounts|customers|invoiceSections)/[^/]+$"
+}
+
+function Test-SubscriptionCostExportScope {
+    param([string]$Scope)
+
+    return -not [string]::IsNullOrWhiteSpace($Scope) -and $Scope.Trim() -match "^/subscriptions/([^/]+)$"
+}
+
+function Get-SubscriptionIdFromCostExportScope {
+    param([string]$Scope)
+
+    if (-not [string]::IsNullOrWhiteSpace($Scope) -and $Scope.Trim() -match "^/subscriptions/([^/]+)$") {
+        return $Matches[1]
+    }
+
+    return ""
+}
+
+function Normalize-CostExportScope {
+    param([string]$Scope)
+
+    if ([string]::IsNullOrWhiteSpace($Scope)) {
+        return ""
+    }
+
+    $normalizedScope = $Scope.Trim()
+    if ($normalizedScope -match "^https://management\.azure\.com(/.+)$") {
+        $normalizedScope = $Matches[1]
+    }
+
+    $normalizedScope = ($normalizedScope -split "\?")[0].TrimEnd("/")
+    if ($normalizedScope -match "(.+)/providers/Microsoft\.CostManagement/exports(/.*)?$") {
+        $normalizedScope = $Matches[1]
+    }
+
+    return $normalizedScope
+}
+
+function Get-CostExportScopeLabel {
+    param([string]$Scope)
+
+    $subscriptionId = Get-SubscriptionIdFromCostExportScope -Scope $Scope
+    if (-not [string]::IsNullOrWhiteSpace($subscriptionId)) {
+        $subscription = $selectedSubscriptions | Where-Object { $_.Id -eq $subscriptionId } | Select-Object -First 1
+        if ($subscription) {
+            return $subscription.Name
+        }
+
+        return $subscriptionId
+    }
+
+    if (Test-BillingCostExportScope -Scope $Scope) {
+        if ($Scope -match "/billingProfiles/([^/]+)/invoiceSections/([^/]+)$") {
+            return "Invoice section $($Matches[2])"
+        }
+
+        if ($Scope -match "/billingProfiles/([^/]+)$") {
+            return "Billing profile $($Matches[1])"
+        }
+
+        if ($Scope -match "/departments/([^/]+)$") {
+            return "EA department $($Matches[1])"
+        }
+
+        if ($Scope -match "/enrollmentAccounts/([^/]+)$") {
+            return "EA enrollment account $($Matches[1])"
+        }
+
+        if ($Scope -match "/customers/([^/]+)$") {
+            return "Billing customer $($Matches[1])"
+        }
+
+        if ($Scope -match "/invoiceSections/([^/]+)$") {
+            return "Invoice section $($Matches[1])"
+        }
+
+        if ($Scope -match "/billingAccounts/([^/]+)$") {
+            return "Billing account $($Matches[1])"
+        }
+    }
+
+    return $Scope
+}
+
+function Get-BillingResourceDisplayName {
+    param([object]$Resource)
+
+    if (-not $Resource) {
+        return ""
+    }
+
+    if ($Resource.properties -and $Resource.properties.displayName) {
+        return $Resource.properties.displayName
+    }
+
+    if ($Resource.name) {
+        return $Resource.name
+    }
+
+    return $Resource.id
+}
+
+function Add-UniqueBillingScope {
+    param(
+        [hashtable]$SeenScopes,
+        [object[]]$Scopes,
+        [string]$Scope,
+        [string]$Label,
+        [string]$Type
+    )
+
+    $normalizedScope = Normalize-CostExportScope -Scope $Scope
+    if (-not (Test-BillingCostExportScope -Scope $normalizedScope)) {
+        return $Scopes
+    }
+
+    $key = $normalizedScope.ToLowerInvariant()
+    if ($SeenScopes.ContainsKey($key)) {
+        return $Scopes
+    }
+
+    $SeenScopes[$key] = $true
+    return @($Scopes + [pscustomobject]@{
+        Scope = $normalizedScope
+        Label = $Label
+        Type = $Type
+    })
+}
+
+function Get-AccessibleBillingCostScopes {
+    $scopes = @()
+    $seenScopes = @{}
+
+    Write-Info "Checking accessible billing scopes for existing billing-level exports..."
+    $billingAccounts = @(Get-AzRestCollection -Path "/providers/Microsoft.Billing/billingAccounts?api-version=$BILLING_API_VERSION")
+
+    foreach ($billingAccount in $billingAccounts) {
+        $accountId = Normalize-CostExportScope -Scope $billingAccount.id
+        $accountLabel = Get-BillingResourceDisplayName -Resource $billingAccount
+        $scopes = Add-UniqueBillingScope -SeenScopes $seenScopes -Scopes $scopes -Scope $accountId -Label $accountLabel -Type "Billing account"
+
+        foreach ($childType in @("departments", "enrollmentAccounts", "customers")) {
+            $children = @(Get-AzRestCollection -Path "$accountId/$childType?api-version=$BILLING_API_VERSION" -Quiet $true)
+            foreach ($child in $children) {
+                $label = Get-BillingResourceDisplayName -Resource $child
+                $scopes = Add-UniqueBillingScope -SeenScopes $seenScopes -Scopes $scopes -Scope $child.id -Label $label -Type $childType
+            }
+        }
+
+        $billingProfiles = @(Get-AzRestCollection -Path "$accountId/billingProfiles?api-version=$BILLING_API_VERSION" -Quiet $true)
+        foreach ($billingProfile in $billingProfiles) {
+            $profileId = Normalize-CostExportScope -Scope $billingProfile.id
+            $profileLabel = Get-BillingResourceDisplayName -Resource $billingProfile
+            $scopes = Add-UniqueBillingScope -SeenScopes $seenScopes -Scopes $scopes -Scope $profileId -Label $profileLabel -Type "Billing profile"
+
+            $invoiceSections = @(Get-AzRestCollection -Path "$profileId/invoiceSections?api-version=$BILLING_API_VERSION" -Quiet $true)
+            foreach ($invoiceSection in $invoiceSections) {
+                $sectionLabel = Get-BillingResourceDisplayName -Resource $invoiceSection
+                $scopes = Add-UniqueBillingScope -SeenScopes $seenScopes -Scopes $scopes -Scope $invoiceSection.id -Label $sectionLabel -Type "Invoice section"
+            }
+        }
+    }
+
+    return @($scopes)
+}
+
+function Select-BillingCostExportScopes {
+    $checkBillingScopes = Read-Host "Check for existing billing-scope exports that may cover multiple subscriptions? (yes/no, default yes)"
+    if (-not (Test-YesResponse -Value $checkBillingScopes)) {
+        $script:billingScopeExportStatus = "skipped"
+        return @()
+    }
+
+    $accessibleScopes = @(Get-AccessibleBillingCostScopes)
+    $selectedScopes = @()
+
+    if ($accessibleScopes.Count -gt 0) {
+        Write-Host ""
+        Write-SectionLabel "Accessible billing scopes"
+        for ($i = 0; $i -lt $accessibleScopes.Count; $i++) {
+            $scope = $accessibleScopes[$i]
+            Write-Host ("  [{0,2}] {1} ({2})" -f ($i + 1), $scope.Label, $scope.Type)
+            Write-DetailRow -Label "Scope" -Value $scope.Scope
+        }
+        Write-Host ""
+        $selection = Read-Host "Enter billing scope numbers to check, paste scope IDs, or press Enter to skip"
+    } else {
+        Write-Info "No billing scopes were automatically discovered for this signed-in user."
+        Write-Info "If you already know the billing scope, paste it in the format /providers/Microsoft.Billing/billingAccounts/..."
+        $selection = Read-Host "Paste billing scope IDs to check, comma-separated, or press Enter to skip"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($selection)) {
+        $script:billingScopeExportStatus = "skipped"
+        return @()
+    }
+
+    foreach ($entry in ($selection -split ",")) {
+        $trimmedEntry = $entry.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmedEntry)) {
+            continue
+        }
+
+        $selectedIndex = 0
+        if ([int]::TryParse($trimmedEntry, [ref]$selectedIndex) -and $selectedIndex -ge 1 -and $selectedIndex -le $accessibleScopes.Count) {
+            $selectedScopes += $accessibleScopes[$selectedIndex - 1]
+            continue
+        }
+
+        $scope = Normalize-CostExportScope -Scope $trimmedEntry
+        if (Test-BillingCostExportScope -Scope $scope) {
+            $selectedScopes += [pscustomobject]@{
+                Scope = $scope
+                Label = Get-CostExportScopeLabel -Scope $scope
+                Type = "Billing scope"
+            }
+            continue
+        }
+
+        Write-Warning-Custom "Ignoring invalid billing scope '$trimmedEntry'."
+    }
+
+    $uniqueScopes = @($selectedScopes | Where-Object { $_ } | Sort-Object -Property Scope -Unique)
+    if ($uniqueScopes.Count -gt 0) {
+        $script:billingScopeExportStatus = "processed"
+    } else {
+        $script:billingScopeExportStatus = "skipped"
+    }
+
+    return $uniqueScopes
+}
+
+function Write-BillingScopeReaderGuidance {
+    param(
+        [string]$PrincipalId,
+        [string]$Scope
+    )
+
+    Write-Warning-Custom "Billing-scope export detected. Spotto also needs read access at this billing scope to discover the export later."
+    Write-DetailRow -Label "Billing scope" -Value $Scope
+    Write-DetailRow -Label "Service principal object" -Value $PrincipalId
+    Write-Info "Cost Management Reader is the read-only role for Azure RBAC cost scopes, but EA/MCA billing hierarchy scopes use billing reader roles."
+    Write-Info "For Microsoft Customer Agreement scopes, assign the matching Billing account/profile/invoice section reader role to the Spotto enterprise application at this billing scope."
+    Write-Info "For Enterprise Agreement scopes, assign the equivalent EA read role to the Spotto service principal with the Azure Billing role assignment API."
+}
+
 function Get-CostExportsForScope {
     param([string]$Scope)
 
+    $normalizedScope = Normalize-CostExportScope -Scope $Scope
+
     try {
-        if ($Scope -notmatch "^/subscriptions/([^/]+)$") {
-            throw "Cost export scope is not a subscription scope: $Scope"
+        $subscriptionId = Get-SubscriptionIdFromCostExportScope -Scope $normalizedScope
+        if (-not [string]::IsNullOrWhiteSpace($subscriptionId)) {
+            Set-AzContext -SubscriptionId $subscriptionId -TenantId $script:tenantId | Out-Null
         }
 
-        Set-AzContext -SubscriptionId $Matches[1] -TenantId $script:tenantId | Out-Null
-        return @(Get-AzResource -ResourceType "Microsoft.CostManagement/exports" -ApiVersion $COST_EXPORT_API_VERSION -ExpandProperties -ErrorAction Stop)
+        if ((Test-SubscriptionCostExportScope -Scope $normalizedScope) -or (Test-BillingCostExportScope -Scope $normalizedScope)) {
+            return @(Get-AzRestCollection -Path "$normalizedScope/providers/Microsoft.CostManagement/exports?api-version=$COST_EXPORT_API_VERSION")
+        }
+
+        throw "Cost export scope is not supported: $Scope"
     } catch {
-        Write-Info "Unable to list Cost Management exports at $Scope. $_"
+        Write-Info "Unable to list Cost Management exports at $normalizedScope. $_"
     }
 
     return @()
@@ -1102,8 +1417,15 @@ function Get-CostExport {
         [string]$ExportName
     )
 
+    $normalizedScope = Normalize-CostExportScope -Scope $Scope
+
     try {
-        return Get-AzResource -ResourceId (Get-CostExportResourceId -Scope $Scope -ExportName $ExportName) -ApiVersion $COST_EXPORT_API_VERSION -ExpandProperties -ErrorAction Stop
+        $subscriptionId = Get-SubscriptionIdFromCostExportScope -Scope $normalizedScope
+        if (-not [string]::IsNullOrWhiteSpace($subscriptionId)) {
+            Set-AzContext -SubscriptionId $subscriptionId -TenantId $script:tenantId | Out-Null
+        }
+
+        return Invoke-AzRestGetJson -Path "$(Get-CostExportResourceId -Scope $normalizedScope -ExportName $ExportName)?api-version=$COST_EXPORT_API_VERSION"
     } catch {
         return $null
     }
@@ -1115,7 +1437,7 @@ function Get-CostExportResourceId {
         [string]$ExportName
     )
 
-    return "$Scope/providers/Microsoft.CostManagement/exports/$ExportName"
+    return "$(Normalize-CostExportScope -Scope $Scope)/providers/Microsoft.CostManagement/exports/$ExportName"
 }
 
 function Get-CostExportProperties {
@@ -1290,6 +1612,16 @@ function Find-ExistingRecurringBillingExports {
     )
 
     $scope = "/subscriptions/$($Subscription.Id)"
+    return @(Find-ExistingRecurringBillingExportsAtScope -Scope $scope -DatasetType $DatasetType)
+}
+
+function Find-ExistingRecurringBillingExportsAtScope {
+    param(
+        [string]$Scope,
+        [string]$DatasetType
+    )
+
+    $scope = Normalize-CostExportScope -Scope $Scope
     $exports = @()
 
     $spottoExportName = Get-SpottoRecurringExportName -DatasetType $DatasetType
@@ -1674,6 +2006,7 @@ Write-DetailRow -Label "Client secret" -Value "Create a 12-month secret or use a
 Write-DetailRow -Label "Azure Reader" -Value "Assign at tenant root for all subscriptions, or on selected subscriptions."
 Write-DetailRow -Label "Governance" -Value "Assign Reader and Management Group Reader at the root management group."
 Write-DetailRow -Label "Billing" -Value "Assign Reservations Reader and Savings plan Reader provider-scope access."
+Write-DetailRow -Label "Billing-scope exports" -Value "Can reuse existing billing-level exports; billing-scope reader access may need manual assignment."
 Write-Host ""
 
 Write-SectionLabel "Recommended and optional prompts"
@@ -2139,15 +2472,17 @@ if (Test-YesResponse -Value $grantGraphPermission) {
 Write-Header -Message "Step 12 of 13: Cost Management Billing Exports"
 
 Write-SectionLabel "Highly recommended billing export setup"
-Write-NumberedStep -Number 1 -Message "Detect existing daily actual and amortized Cost Management exports."
+Write-NumberedStep -Number 1 -Message "Detect existing daily actual and amortized Cost Management exports at billing or subscription scope."
 Write-NumberedStep -Number 2 -Message "Grant the Spotto service principal Storage Blob Data Reader on export containers."
-Write-NumberedStep -Number 3 -Message "Create missing daily exports and queue one-time exports for the previous 13 closed months."
+Write-NumberedStep -Number 3 -Message "Create missing subscription-level daily exports and queue one-time exports for the previous 13 closed months where needed."
 Write-Host ""
 Write-Info "Exports are written to customer-owned Azure Storage. Spotto cloud-engine reads them later."
 Write-Info "This is highly recommended because it reduces Cost Management API calls and Azure rate limiting."
-Write-Info "The script keeps the storage public endpoint enabled, anonymous access disabled, and containers private."
+Write-Info "The script keeps anonymous blob access disabled and containers private."
+Write-Info "Spotto still needs the storage account public network endpoint reachable; RBAC alone cannot bypass a disabled public endpoint or blocking firewall."
 Write-Info "New daily recurring exports are run immediately when Azure accepts the run request."
 Write-Info "Historical backfill exports are queued once and marked so reruns can recover interrupted backfills without repeated queueing."
+Write-Info "When a billing-scope export is reused, assign Spotto read access at that billing scope so it can discover the export later."
 Write-Host ""
 
 $configureBillingExports = Read-Host "Set up highly recommended Cost Management exports for Spotto? (yes/no, default yes)"
@@ -2155,8 +2490,10 @@ $configureBillingExports = Read-Host "Set up highly recommended Cost Management 
 if (Test-YesResponse -Value $configureBillingExports) {
     $script:billingExportSetupStatus = "processed"
     $existingRecurringExports = @{}
+    $acceptedBillingScopeExports = @()
     $detectedExistingExports = @()
     $billingExportSubscriptions = @()
+    $selectedBillingScopes = @(Select-BillingCostExportScopes)
 
     Write-Info "Checking Cost Management export availability on selected subscriptions..."
     foreach ($sub in $selectedSubscriptions) {
@@ -2165,12 +2502,35 @@ if (Test-YesResponse -Value $configureBillingExports) {
         }
     }
 
-    if ($billingExportSubscriptions.Count -eq 0) {
+    if ($billingExportSubscriptions.Count -eq 0 -and $selectedBillingScopes.Count -eq 0) {
         $script:billingExportSetupStatus = "unavailable"
-        Write-Warning-Custom "Cost Management billing exports are not available for any selected subscription. Skipping storage setup and continuing onboarding."
+        Write-Warning-Custom "Cost Management billing exports are not available for any selected subscription or billing scope. Skipping storage setup and continuing onboarding."
     }
 
     if ($script:billingExportSetupStatus -ne "unavailable") {
+        if ($selectedBillingScopes.Count -gt 0) {
+            Write-Info "Checking for existing daily Cost Management exports on selected billing scopes..."
+            foreach ($billingScope in $selectedBillingScopes) {
+                foreach ($datasetType in @("ActualCost", "AmortizedCost")) {
+                    $matches = @(Find-ExistingRecurringBillingExportsAtScope -Scope $billingScope.Scope -DatasetType $datasetType)
+                    if ($matches.Count -gt 0) {
+                        $export = $matches | Select-Object -First 1
+                        $destination = Get-ExportDestinationInfo -Export $export
+                        $detectedExistingExports += [pscustomobject]@{
+                            Scope = $billingScope.Scope
+                            ScopeLabel = $billingScope.Label
+                            ScopeType = $billingScope.Type
+                            IsBillingScope = $true
+                            Subscription = $null
+                            DatasetType = $datasetType
+                            Export = $export
+                            Destination = $destination
+                        }
+                    }
+                }
+            }
+        }
+
         Write-Info "Checking for existing daily Cost Management exports on available subscriptions..."
         foreach ($sub in $billingExportSubscriptions) {
             foreach ($datasetType in @("ActualCost", "AmortizedCost")) {
@@ -2179,6 +2539,10 @@ if (Test-YesResponse -Value $configureBillingExports) {
                     $export = $matches | Select-Object -First 1
                     $destination = Get-ExportDestinationInfo -Export $export
                     $detectedExistingExports += [pscustomobject]@{
+                        Scope = "/subscriptions/$($sub.Id)"
+                        ScopeLabel = $sub.Name
+                        ScopeType = "Subscription"
+                        IsBillingScope = $false
                         Subscription = $sub
                         DatasetType = $datasetType
                         Export = $export
@@ -2192,42 +2556,93 @@ if (Test-YesResponse -Value $configureBillingExports) {
             Write-Host ""
             Write-SectionLabel "Detected compatible recurring exports"
             foreach ($detected in $detectedExistingExports) {
-                Write-DetailRow -Label "Subscription" -Value $detected.Subscription.Name
+                Write-DetailRow -Label "Scope" -Value "$($detected.ScopeLabel) ($($detected.ScopeType))"
                 Write-DetailRow -Label "Dataset" -Value $detected.DatasetType
                 Write-DetailRow -Label "Export" -Value $detected.Export.name
                 Write-DetailRow -Label "Container" -Value $detected.Destination.Container
+                if ($detected.IsBillingScope) {
+                    Write-DetailRow -Label "Billing scope" -Value $detected.Scope
+                }
                 Write-Host ""
             }
 
-            Write-Info "If accepted, storage accounts for existing exports may be updated to keep the public endpoint enabled with anonymous blob access disabled."
+            Write-Info "If accepted, subscription-scope export storage may be updated to keep the public endpoint enabled with anonymous blob access disabled."
+            Write-Info "Billing-scope export storage is not changed; the script only grants Spotto blob read access on the existing container."
+            Write-Info "If billing-scope export storage has public network access disabled or a blocking firewall, Spotto cannot read it over the internet even with Storage Blob Data Reader."
             $useExistingExports = Read-Host "Use compatible existing recurring exports where found? (yes/no, default yes)"
             if (Test-YesResponse -Value $useExistingExports) {
                 foreach ($detected in $detectedExistingExports) {
                     try {
                         $storageAccountId = $detected.Destination.StorageAccountId
                         $containerName = $detected.Destination.Container
-                        Ensure-BillingExportStorageSettings -StorageAccountId $storageAccountId
-                        $containerScope = Ensure-BillingExportContainer -StorageAccountId $storageAccountId -ContainerName $containerName
+
+                        if ($detected.IsBillingScope) {
+                            Write-Info "Preparing Spotto blob read access for an existing billing-scope export without changing storage account network settings."
+                            $storageParts = Get-StorageAccountParts -StorageAccountId $storageAccountId
+                            Set-AzContext -SubscriptionId $storageParts.SubscriptionId -TenantId $script:tenantId | Out-Null
+                            try {
+                                $account = Get-StorageAccountResource -StorageAccountId $storageAccountId
+                                if ($account.PublicNetworkAccess -ne "Enabled" -or (-not $account.NetworkRuleSet -or $account.NetworkRuleSet.DefaultAction -ne "Allow")) {
+                                    Write-Warning-Custom "The billing-scope export storage account may not be reachable by Spotto cloud-engine through the public endpoint."
+                                    Write-Info "Storage Blob Data Reader grants identity access only; it does not bypass a disabled public endpoint or storage firewall."
+                                    Write-Info "The script does not change billing-scope export storage networking. Update it manually if Spotto cannot read the export, or keep the subscription-level export fallback."
+                                }
+                            } catch {
+                                Write-Info "Unable to verify billing-scope export storage network settings. The script will still try to assign blob read access. $_"
+                            }
+                            $containerScope = "$storageAccountId/blobServices/default/containers/$containerName"
+                        } else {
+                            Ensure-BillingExportStorageSettings -StorageAccountId $storageAccountId
+                            $containerScope = Ensure-BillingExportContainer -StorageAccountId $storageAccountId -ContainerName $containerName
+                        }
+
                         $storageReaderStatus = Ensure-StorageBlobDataReaderAssignment -PrincipalId $sp.Id -Scope $containerScope
                         if ($storageReaderStatus -eq "failed") {
                             throw "Storage Blob Data Reader could not be assigned on export container '$containerName'."
                         }
 
-                        $key = "$($detected.Subscription.Id)|$($detected.DatasetType)"
-                        $existingRecurringExports[$key] = $detected.Export
+                        if ($detected.IsBillingScope) {
+                            Write-BillingScopeReaderGuidance -PrincipalId $sp.Id -Scope $detected.Scope
+                            $acceptedBillingScopeExports += $detected
+                            Add-BillingExportResult -SubscriptionName $detected.ScopeLabel -SubscriptionId $detected.Scope -DatasetType $detected.DatasetType -ExportKind "BillingScopeRecurring" -ExportName $detected.Export.name -Status "existing" -StorageAccountId $storageAccountId -ContainerName $containerName -RootFolderPath $detected.Destination.RootFolderPath -Message "Billing-scope export reused; billing-scope reader access must be granted separately if Spotto cannot already read this scope."
+                        } else {
+                            $key = "$($detected.Subscription.Id)|$($detected.DatasetType)"
+                            $existingRecurringExports[$key] = $detected.Export
+                        }
                     } catch {
                         Write-Error-Custom "Existing export '$($detected.Export.name)' could not be prepared for Spotto: $_"
                     }
                 }
             }
         } else {
-            Write-Info "No compatible recurring exports were found on the selected subscriptions."
+            Write-Info "No compatible recurring exports were found on the selected billing or subscription scopes."
         }
 
         $storageDestination = $null
         $billingExportContainerName = $BILLING_EXPORT_CONTAINER_NAME
+        $skipSubscriptionLevelExports = $false
 
-        if ($existingRecurringExports.Count -gt 0) {
+        if ($acceptedBillingScopeExports.Count -gt 0) {
+            Write-Info "Billing-scope export(s) were accepted."
+            Write-Info "Per-subscription exports can still be created as a fallback when the billing-scope export does not cover every selected subscription or dataset."
+            $skipSubscriptionExports = Read-Host "Skip subscription-level exports because the accepted billing-scope export covers all selected subscriptions and datasets? (yes/no, default no)"
+            $skipSubscriptionLevelExports = Test-YesResponse -Value $skipSubscriptionExports -DefaultYes $false
+            if ($skipSubscriptionLevelExports) {
+                Write-Info "Skipping subscription-level export creation because you confirmed the billing-scope export is sufficient."
+            } else {
+                Write-Info "Continuing with subscription-level export setup where supported."
+            }
+        }
+
+        if (-not $skipSubscriptionLevelExports -and $billingExportSubscriptions.Count -eq 0) {
+            if ($acceptedBillingScopeExports.Count -gt 0) {
+                Write-Warning-Custom "No selected subscription supports subscription-level export fallback. Continuing with the accepted billing-scope export(s)."
+                $skipSubscriptionLevelExports = $true
+            } else {
+                $script:billingExportSetupStatus = "unavailable"
+                Write-Warning-Custom "No compatible billing-scope exports were accepted and no selected subscription supports subscription-level exports. Skipping export creation."
+            }
+        } elseif (-not $skipSubscriptionLevelExports -and $existingRecurringExports.Count -gt 0) {
             $firstExistingExport = $existingRecurringExports.Values | Select-Object -First 1
             $firstDestination = Get-ExportDestinationInfo -Export $firstExistingExport
             $useExistingStorageForNewExports = Read-Host "Use the first existing export storage account for backfill and missing exports? (yes/no, default yes)"
@@ -2248,7 +2663,7 @@ if (Test-YesResponse -Value $configureBillingExports) {
             }
         }
 
-        if (-not $storageDestination) {
+        if (-not $skipSubscriptionLevelExports -and $script:billingExportSetupStatus -ne "unavailable" -and -not $storageDestination) {
             try {
                 $storageDestination = Select-BillingExportStorageAccount -Subscriptions $billingExportSubscriptions
                 $billingExportContainerName = Get-DefaultedInput -Prompt "Blob container for Spotto billing exports" -DefaultValue $BILLING_EXPORT_CONTAINER_NAME
@@ -2259,7 +2674,7 @@ if (Test-YesResponse -Value $configureBillingExports) {
             }
         }
 
-        if ($script:billingExportSetupStatus -ne "failed") {
+        if (-not $skipSubscriptionLevelExports -and $script:billingExportSetupStatus -notin @("failed", "unavailable")) {
             try {
                 Ensure-ResourceProviderRegistered -SubscriptionId $storageDestination.SubscriptionId -ProviderNamespace "Microsoft.CostManagementExports" -MaxAttempts 60 -PollSeconds 5 | Out-Null
                 Ensure-BillingExportStorageSettings -StorageAccountId $storageDestination.ResourceId
@@ -2274,7 +2689,7 @@ if (Test-YesResponse -Value $configureBillingExports) {
             }
         }
 
-        if ($script:billingExportSetupStatus -ne "failed") {
+        if (-not $skipSubscriptionLevelExports -and $script:billingExportSetupStatus -notin @("failed", "unavailable")) {
             foreach ($sub in $billingExportSubscriptions) {
                 Write-Header -Message "Billing exports: $($sub.Name)" -Subtitle "Daily recurring plus 13-month backfill"
                 try {
@@ -2451,9 +2866,14 @@ switch ($script:graphPermissionStatus) {
 switch ($script:billingExportSetupStatus) {
     "processed" { Write-Success "Cost Management billing exports processed" }
     "failed" { Write-Error-Custom "Cost Management billing export setup failed before export creation completed" }
-    "unavailable" { Write-Warning-Custom "Cost Management billing exports were not available for the selected subscription(s)" }
+    "unavailable" { Write-Warning-Custom "Cost Management billing exports were not available for the selected subscription(s) or billing scope(s)" }
     "skipped" { Write-Skipped "Cost Management billing export setup skipped (highly recommended)" }
     default { Write-Skipped "Cost Management billing export setup was not processed" }
+}
+switch ($script:billingScopeExportStatus) {
+    "processed" { Write-Success "Billing-scope export discovery processed" }
+    "skipped" { Write-Skipped "Billing-scope export discovery skipped" }
+    default { Write-Skipped "Billing-scope export discovery was not processed" }
 }
 if ($script:billingExportResults.Count -gt 0) {
     $failedBillingExports = @($script:billingExportResults | Where-Object { $_.Status -eq "failed" })
