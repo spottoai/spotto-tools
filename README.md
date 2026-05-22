@@ -14,6 +14,7 @@ Automated PowerShell script to connect your Azure environment to Spotto:
 - Assigns Reader access across your subscriptions, or inherits it via tenant root scope when onboarding all subscriptions
 - Optionally assigns recommended Monitoring Reader and Log Analytics Reader roles
 - Configures management-group governance visibility, tenant-wide or per-subscription Log Analytics Reader access, plus Reservations Reader and Savings plan Reader access
+- Asks by default for Reservations Contributor so Spotto can calculate reservation refund quotes and support reservation management workflows
 - Optionally grants Microsoft Graph `Application.Read.All` with admin consent for governance and credential posture
 - Highly recommended: Detects or creates Azure Cost Management exports to customer-owned storage, with daily CSV/GZIP exports, immediate first runs when supported, and one-time 13-month backfill where supported
 - Detects compatible existing Cost Management exports at billing scope when provided or discoverable, grants Spotto blob read access to their containers without changing billing-scope export storage networking, warns if the storage public endpoint appears blocked, and can still fall back to per-subscription exports
@@ -37,6 +38,7 @@ The script is **idempotent** - safe to run multiple times.
   - Global Administrator or Application Administrator to create the service principal
   - Owner or User Access Administrator on subscriptions, and at tenant root scope (`/`) if onboarding all subscriptions
   - Management Group Contributor or Owner at the root management group
+  - Recommended reservation management support: permission to assign Reservations Contributor at `/providers/Microsoft.Capacity`
   - Tenant admin consent for Microsoft Graph `Application.Read.All` if you choose to grant Graph governance permissions
   - Highly recommended billing export setup: permission to manage Cost Management exports, storage accounts, containers, and `Storage Blob Data Reader` role assignments
   - Existing billing-scope exports: reader access for the Spotto service principal at the exact export scope. Use `Cost Management Reader` for Azure RBAC cost scopes, or the relevant MCA billing reader / EA read role at billing account/profile/invoice section/department/enrollment scope
@@ -55,11 +57,12 @@ cd spotto-tools
 The script will:
 1. Check and install required PowerShell modules
 2. Guide you through selecting your tenant and subscriptions
-3. Create a service principal named "Spotto AI"
+3. Create a service principal named "Spotto", or reuse an existing "Spotto" / "Spotto AI" service principal
 4. Assign the required governance, billing, and optional monitoring permissions
-5. Ask whether to grant Microsoft Graph `Application.Read.All` with admin consent
-6. Configure or reuse the highly recommended Azure Cost Management exports for Spotto cloud-engine to read later
-7. Display credentials to copy into the Spotto portal
+5. Ask whether to grant recommended Reservations Contributor for refund quote and reservation management support, defaulting to yes
+6. Ask whether to grant Microsoft Graph `Application.Read.All` with admin consent
+7. Configure or reuse the highly recommended Azure Cost Management exports for Spotto cloud-engine to read later
+8. Display credentials to copy into the Spotto portal
 
 You can safely rerun the script. It checks for existing Spotto resources, role assignments, storage containers, and export definitions, then reuses or updates them where possible.
 

@@ -19,6 +19,8 @@
     - Management Group Reader at the root management group
       (read management group hierarchy plus management-group policy and RBAC metadata)
     - Reservations Reader at /providers/Microsoft.Capacity
+    - Recommended: Reservations Contributor at /providers/Microsoft.Capacity
+      (calculate reservation refund quotes and support reservation management workflows)
     - Savings plan Reader at /providers/Microsoft.BillingBenefits
     - Optional prompt: Application.Read.All in Microsoft Graph with admin consent
       (read applications and service principals for governance and credential posture)
@@ -53,7 +55,9 @@
 
 # Script configuration
 $ErrorActionPreference = "Stop"
-$APP_NAME = "Spotto AI"
+$APP_NAME = "Spotto"
+$LEGACY_APP_NAMES = @("Spotto AI")
+$APP_LOOKUP_NAMES = @($APP_NAME) + $LEGACY_APP_NAMES
 $CUSTOM_ROLE_NAME = "Spotto Access"
 $BILLING_EXPORT_CONTAINER_NAME = "spotto-cost-exports"
 $BILLING_EXPORT_ROOT_PATH = "spotto"
@@ -192,6 +196,7 @@ $script:clientId = $null
 $script:tenantId = $null
 $script:clientSecret = $null
 $script:secretExpiry = $null
+$script:appDisplayName = $APP_NAME
 $script:isNewSecret = $false
 $script:useTenantRootReader = $false
 $script:rootManagementGroup = $null
@@ -200,6 +205,7 @@ $script:rootManagementGroupReaderStatus = "not-run"
 $script:managementGroupReaderStatus = "not-run"
 $script:logAnalyticsReaderStatus = "not-run"
 $script:reservationReaderStatus = "not-run"
+$script:reservationContributorStatus = "not-run"
 $script:savingsPlanReaderStatus = "not-run"
 $script:graphPermissionStatus = "not-run"
 $script:billingExportSetupStatus = "not-run"
@@ -340,7 +346,7 @@ function Show-Credentials {
     Write-DetailRow -Label "Secret Expiry Date" -Value $script:secretExpiry -ValueColor Green
     Write-Host ""
     if ($script:isNewSecret) {
-        Write-Host "⚠ IMPORTANT: This secret will not be shown again! Save it now." -ForegroundColor Red
+        Write-Host "Note: This new client secret is shown only for this run. You can rerun the script later to create a replacement." -ForegroundColor Cyan
     }
     Write-Divider -Color Yellow
     Write-Host ""
@@ -2001,7 +2007,7 @@ Write-Host "and reuses them where possible, so rerunning is the normal way to re
 Write-Host ""
 
 Write-SectionLabel "Required access"
-Write-DetailRow -Label "Service principal" -Value "Create or reuse '$APP_NAME'."
+Write-DetailRow -Label "Service principal" -Value "Create '$APP_NAME' or reuse '$APP_NAME' / '$($LEGACY_APP_NAMES[0])'."
 Write-DetailRow -Label "Client secret" -Value "Create a 12-month secret or use an existing credential."
 Write-DetailRow -Label "Azure Reader" -Value "Assign at tenant root for all subscriptions, or on selected subscriptions."
 Write-DetailRow -Label "Governance" -Value "Assign Reader and Management Group Reader at the root management group."
@@ -2010,6 +2016,7 @@ Write-DetailRow -Label "Billing-scope exports" -Value "Can reuse existing billin
 Write-Host ""
 
 Write-SectionLabel "Recommended and optional prompts"
+Write-DetailRow -Label "Reservations" -Value "Recommended Reservations Contributor for refund quotes and reservation management."
 Write-DetailRow -Label "Microsoft Graph" -Value "Application.Read.All admin consent for governance and credential posture."
 Write-DetailRow -Label "Monitoring" -Value "Monitoring Reader and Log Analytics Reader for richer telemetry analysis."
 Write-DetailRow -Label "Billing exports" -Value "Highly recommended daily exports plus 13-month backfill to reduce billing API calls."
@@ -2191,17 +2198,26 @@ while (-not $scopeSelected) {
 Write-Header -Message "Step 4 of 13: Create Service Principal"
 
 try {
-    # Check if app already exists
-    $existingApp = Get-AzADApplication -DisplayName $APP_NAME
+    # Prefer the current app name, but keep reusing the previous Spotto AI app name for reruns.
+    $existingApp = $null
+    foreach ($appLookupName in $APP_LOOKUP_NAMES) {
+        $matchingApps = @(Get-AzADApplication -DisplayName $appLookupName -ErrorAction SilentlyContinue)
+        if ($matchingApps.Count -gt 0) {
+            $existingApp = $matchingApps | Select-Object -First 1
+            break
+        }
+    }
     
     if ($existingApp) {
-        Write-Info "Service principal '$APP_NAME' already exists."
+        $script:appDisplayName = $existingApp.DisplayName
+        Write-Info "Service principal '$script:appDisplayName' already exists."
         $app = $existingApp
         $sp = Get-AzADServicePrincipal -ApplicationId $app.AppId
         Write-Success "Using existing application"
     } else {
         # Create new application
         $app = New-AzADApplication -DisplayName $APP_NAME
+        $script:appDisplayName = $APP_NAME
         Write-Success "Created new application: $APP_NAME"
         
         # Create service principal
@@ -2338,10 +2354,10 @@ try {
 }
 
 # ============================================================================
-# Step 9: Assign Reservations Reader
+# Step 9: Assign Reservations Reader and optional Reservations Contributor
 # ============================================================================
 
-Write-Header -Message "Step 9 of 13: Assign Reservations Reader"
+Write-Header -Message "Step 9 of 13: Assign Reservation Roles"
 
 try {
     $reservationScope = "/providers/Microsoft.Capacity"
@@ -2361,6 +2377,42 @@ try {
     $script:reservationReaderStatus = "failed"
     Write-Error-Custom "Failed to assign Reservations Reader role: $_"
     Write-Info "You may need elevated permissions to assign this role at /providers/Microsoft.Capacity"
+}
+
+Write-SectionLabel "Optional reservation management permission"
+Write-DetailRow -Label "Role" -Value "Reservations Contributor at /providers/Microsoft.Capacity."
+Write-DetailRow -Label "Purpose" -Value "Calculate reservation refund quotes and support future reservation management workflows."
+Write-DetailRow -Label "Impact" -Value "Can manage reservations in the tenant but cannot delegate reservation RBAC roles."
+Write-Host ""
+
+$existingReservationContributor = $null
+try {
+    $existingReservationContributor = Get-AzRoleAssignment -ObjectId $sp.Id -Scope $reservationScope -RoleDefinitionName "Reservations Contributor" -ErrorAction SilentlyContinue
+} catch {
+    Write-Info "Could not check for an existing Reservations Contributor assignment. The assignment attempt can still be tried if you choose yes."
+}
+
+if ($existingReservationContributor) {
+    Write-Info "Reservations Contributor role already assigned"
+    $script:reservationContributorStatus = "existing"
+} else {
+    $grantReservationsContributor = Read-Host "Do you want to grant recommended Reservations Contributor? (yes/no, default yes)"
+}
+
+if (-not $existingReservationContributor -and (Test-YesResponse -Value $grantReservationsContributor)) {
+    try {
+        New-AzRoleAssignment -ObjectId $sp.Id -RoleDefinitionName "Reservations Contributor" -Scope $reservationScope | Out-Null
+        Write-Success "Assigned Reservations Contributor role at /providers/Microsoft.Capacity"
+        $script:reservationContributorStatus = "created"
+    } catch {
+        $script:reservationContributorStatus = "failed"
+        Write-Error-Custom "Failed to assign Reservations Contributor role: $_"
+        Write-Info "Continuing with Reservations Reader access only. Reservation refund quotes and management may not work until this role is assigned."
+        Write-Info "You may need elevated permissions to assign this role at /providers/Microsoft.Capacity"
+    }
+} elseif (-not $existingReservationContributor) {
+    $script:reservationContributorStatus = "skipped"
+    Write-Info "Skipping optional Reservations Contributor role. Reservation refund quote and management features may be limited."
 }
 
 # ============================================================================
@@ -2808,7 +2860,7 @@ if ($grantWritePerms -eq "yes") {
 
 Write-Header -Message "Setup Complete" -Subtitle "Review the results, then copy the credentials into Spotto"
 
-Write-Success "Service Principal: $APP_NAME ($script:clientId)"
+Write-Success "Service Principal: $script:appDisplayName ($script:clientId)"
 if ($script:useTenantRootReader) {
     switch ($script:rootReaderAssignmentStatus) {
         "created" { Write-Success "Reader role assigned at tenant root scope (/), covering all subscriptions" }
@@ -2849,6 +2901,13 @@ switch ($script:reservationReaderStatus) {
     "existing" { Write-Success "Reservations Reader already existed at /providers/Microsoft.Capacity" }
     "failed" { Write-Error-Custom "Reservations Reader was not assigned at /providers/Microsoft.Capacity" }
     default { Write-Skipped "Reservations Reader was not processed" }
+}
+switch ($script:reservationContributorStatus) {
+    "created" { Write-Success "Reservations Contributor assigned at /providers/Microsoft.Capacity" }
+    "existing" { Write-Success "Reservations Contributor already existed at /providers/Microsoft.Capacity" }
+    "failed" { Write-Error-Custom "Reservations Contributor was not assigned at /providers/Microsoft.Capacity" }
+    "skipped" { Write-Skipped "Reservations Contributor skipped (optional)" }
+    default { Write-Skipped "Reservations Contributor was not processed" }
 }
 switch ($script:savingsPlanReaderStatus) {
     "created" { Write-Success "Savings plan Reader assigned at /providers/Microsoft.BillingBenefits" }
@@ -2925,8 +2984,8 @@ Show-Credentials
 Show-NextSteps
 
 if ($script:isNewSecret) {
-    Write-Host "⚠ REMINDER: The client secret shown above will NOT be displayed again!" -ForegroundColor Red
-    Write-Host "              Make sure you've saved it before closing this window.`n" -ForegroundColor Red
+    Write-Host "Client secret note: The secret above is shown only for this run." -ForegroundColor Cyan
+    Write-Host "If you lose it, rerun this script to create a new secret.`n" -ForegroundColor DarkGray
 }
 
 Write-Host "For support, visit: https://docs.spotto.ai`n"
