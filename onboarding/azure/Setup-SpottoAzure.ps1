@@ -40,7 +40,10 @@
     - Azure PowerShell module (will be installed if missing)
     - Microsoft Graph PowerShell module if granting Application.Read.All (will be installed if missing)
     - Global Administrator, Application Administrator, or appropriate permissions to create service principals
-    - Owner or User Access Administrator on subscriptions, or at tenant root scope (/)
+    - Owner on subscriptions, or at tenant root scope (/), for full role-assignment and billing export automation
+    - If Owner is not available, User Access Administrator plus Contributor on each selected subscription
+      can cover role assignment and storage/export resource creation. User Access Administrator alone cannot create
+      Cost Management exports, resource groups, storage accounts, or containers.
     - Tenant admin consent for Microsoft Graph Application.Read.All if granting Graph governance permissions
     - Management Group Contributor or Owner role for management group access
     - Billing-scope reader access if reusing Cost Management exports created at an EA/MCA
@@ -367,6 +370,119 @@ function Show-NextSteps {
     Write-Host ""
 }
 
+function Write-PimTroubleshootingHint {
+    Write-Info "Confirm the required role from the upfront access checklist is active for the failed scope."
+    Write-Info "If access was activated after signing in, let this script reconnect the Azure session when prompted or rerun it and answer yes to the session refresh prompt."
+    Write-Info "Azure RBAC changes are eventually consistent. If Azure Portal shows the role but commands still return Forbidden, wait a few minutes and rerun this idempotent script."
+}
+
+function Write-SubscriptionPimTroubleshootingHint {
+    param([object]$Subscription)
+
+    Write-Warning-Custom "Spotto cannot continue with this subscription until your Azure session has active access."
+    if ($Subscription) {
+        Write-Info "Subscription: $($Subscription.Name) ($($Subscription.Id))"
+    }
+    Write-Info "Required access: Owner, or Contributor plus User Access Administrator, on each selected subscription."
+    Write-Info "After activating access, let this script reconnect the Azure session when prompted or rerun it and answer yes to the session refresh prompt."
+    Write-Info "The script is idempotent and will reuse existing Spotto resources where possible."
+}
+
+function Write-TenantWidePimTroubleshootingHint {
+    param([string]$ScopeLabel)
+
+    Write-Warning-Custom "This step needs tenant-wide or provider-scope Azure access from the upfront checklist."
+    if (-not [string]::IsNullOrWhiteSpace($ScopeLabel)) {
+        Write-Info "Scope: $ScopeLabel"
+    }
+    Write-Info "Activate the relevant role for this scope, then reconnect the Azure session or rerun the script if the current session predates that activation."
+    Write-Info "If your organization does not allow this access, continue with subscription onboarding and complete this role manually later."
+}
+
+function Write-NoAccessibleSubscriptionsHint {
+    param(
+        [string]$TenantId,
+        [object[]]$VisibleSubscriptions = @()
+    )
+
+    $currentContext = Get-AzContext -ErrorAction SilentlyContinue
+    $accountId = if ($currentContext -and $currentContext.Account) { $currentContext.Account.Id } else { "current Azure account" }
+
+    Write-Error-Custom "No accessible subscriptions were found for tenant $TenantId."
+    Write-Info "Signed-in account: $accountId"
+    Write-Info "Nothing has been changed yet; the service principal has not been created."
+    Write-Info "Check the upfront access checklist, activate the required subscription access, wait until Azure shows it as active, then rerun this script."
+    Write-Info "If your company uses PIM, make sure the Azure resource role is active for the target subscription or inherited parent scope before rerunning."
+    Write-Info "If you activated access after signing in, answer yes to the Azure session refresh prompt on the next run."
+
+    if ($VisibleSubscriptions.Count -gt 0) {
+        Write-Host ""
+        Write-SectionLabel "Subscriptions visible to this account in other tenants"
+        foreach ($subscription in $VisibleSubscriptions | Select-Object -First 10) {
+            $tenantLabel = if ($subscription.TenantId) { $subscription.TenantId } else { "unknown tenant" }
+            Write-Info "$($subscription.Name) ($($subscription.Id)) - tenant $tenantLabel"
+        }
+
+        if ($VisibleSubscriptions.Count -gt 10) {
+            Write-Info "Showing 10 of $($VisibleSubscriptions.Count) visible subscriptions."
+        }
+
+        Write-Info "If the target subscription is listed above, rerun the script and select that subscription's tenant in Step 2."
+    }
+}
+
+function Connect-AzForTenantAndSubscription {
+    param(
+        [string]$TenantId,
+        [string]$SubscriptionId
+    )
+
+    $connectParameters = @{}
+    if (-not [string]::IsNullOrWhiteSpace($TenantId)) {
+        $connectParameters.TenantId = $TenantId
+    }
+    if (-not [string]::IsNullOrWhiteSpace($SubscriptionId) -and (Get-Command Connect-AzAccount).Parameters.ContainsKey("Subscription")) {
+        $connectParameters.Subscription = $SubscriptionId
+    }
+
+    if ($connectParameters.Count -gt 0) {
+        Connect-AzAccount @connectParameters | Out-Null
+    } else {
+        Connect-AzAccount | Out-Null
+    }
+}
+
+function Disconnect-CurrentAzSession {
+    try {
+        $disconnectParameters = @{ ErrorAction = "SilentlyContinue" }
+        if ((Get-Command Disconnect-AzAccount).Parameters.ContainsKey("Scope")) {
+            $disconnectParameters.Scope = "Process"
+        }
+        Disconnect-AzAccount @disconnectParameters | Out-Null
+    } catch {
+        Write-Info "Could not clear the existing Azure session automatically. Continuing with a fresh sign-in attempt."
+    }
+}
+
+function Invoke-PimAzReconnect {
+    param(
+        [string]$TenantId,
+        [string]$SubscriptionId,
+        [string]$Reason = "Azure may still be using a token from before your temporary access was activated."
+    )
+
+    Write-Warning-Custom $Reason
+    Write-Info "The script can disconnect this PowerShell Azure session and sign you in again so Microsoft issues fresh tokens."
+    $reconnect = Read-Host "Reconnect to Azure now? (yes/no, default yes)"
+    if (-not (Test-YesResponse -Value $reconnect)) {
+        return $false
+    }
+
+    Disconnect-CurrentAzSession
+    Connect-AzForTenantAndSubscription -TenantId $TenantId -SubscriptionId $SubscriptionId
+    return $true
+}
+
 function Set-SubscriptionContext {
     param([object]$Subscription)
 
@@ -375,17 +491,18 @@ function Set-SubscriptionContext {
         return $false
     }
 
-    $tenantId = $Subscription.TenantId
+    $tenantId = if ($Subscription.TenantId) { $Subscription.TenantId } else { $script:tenantId }
     try {
         Set-AzContext -SubscriptionId $Subscription.Id -TenantId $tenantId | Out-Null
         return $true
     } catch {
-        Write-Info "Re-authentication required for tenant $tenantId. You may see an MFA prompt."
         try {
-            if ($tenantId) {
-                Connect-AzAccount -TenantId $tenantId | Out-Null
-            } else {
-                Connect-AzAccount | Out-Null
+            $reconnected = Invoke-PimAzReconnect `
+                -TenantId $tenantId `
+                -SubscriptionId $Subscription.Id `
+                -Reason "Could not set Azure context for '$($Subscription.Name)'. If you just activated temporary access, your current session probably needs fresh tokens."
+            if (-not $reconnected) {
+                throw "Azure session reconnect was declined."
             }
             Set-AzContext -SubscriptionId $Subscription.Id -TenantId $tenantId | Out-Null
             return $true
@@ -394,9 +511,146 @@ function Set-SubscriptionContext {
             if ($tenantId) {
                 Write-Info "Try: Connect-AzAccount -TenantId $tenantId"
             }
+            Write-SubscriptionPimTroubleshootingHint -Subscription $Subscription
             return $false
         }
     }
+}
+
+function Test-SelectedSubscriptionAccess {
+    param([object[]]$Subscriptions)
+
+    Write-SectionLabel "Validating selected subscription access"
+
+    $failedSubscriptions = @()
+    foreach ($sub in $Subscriptions) {
+        if (Set-SubscriptionContext -Subscription $sub) {
+            Write-Success "Validated access to: $($sub.Name)"
+        } else {
+            $failedSubscriptions += $sub
+        }
+    }
+
+    if ($failedSubscriptions.Count -eq 0) {
+        return $true
+    }
+
+    Write-Host ""
+    Write-Error-Custom "Cannot continue because $($failedSubscriptions.Count) selected subscription(s) are not accessible with the current Azure session."
+    foreach ($failedSubscription in $failedSubscriptions) {
+        Write-Error-Custom "  - $($failedSubscription.Name) ($($failedSubscription.Id))"
+    }
+    Write-SubscriptionPimTroubleshootingHint
+    return $false
+}
+
+function Test-AzureActionMatchesPattern {
+    param(
+        [string]$RequiredAction,
+        [string]$ActionPattern
+    )
+
+    return -not [string]::IsNullOrWhiteSpace($RequiredAction) `
+        -and -not [string]::IsNullOrWhiteSpace($ActionPattern) `
+        -and $RequiredAction -like $ActionPattern
+}
+
+function Test-AzurePermissionActionAtScope {
+    param(
+        [string]$Scope,
+        [string]$RequiredAction
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Scope) -or [string]::IsNullOrWhiteSpace($RequiredAction)) {
+        return $false
+    }
+
+    $normalizedScope = $Scope.Trim().TrimEnd("/")
+    $permissionsPath = if ([string]::IsNullOrWhiteSpace($normalizedScope)) {
+        "/providers/Microsoft.Authorization/permissions?api-version=2022-04-01"
+    } else {
+        "$normalizedScope/providers/Microsoft.Authorization/permissions?api-version=2022-04-01"
+    }
+
+    try {
+        $permissionsResponse = Invoke-AzRestGetJson -Path $permissionsPath
+        foreach ($permission in @($permissionsResponse.value)) {
+            $isAllowed = $false
+            foreach ($action in @($permission.actions)) {
+                if (Test-AzureActionMatchesPattern -RequiredAction $RequiredAction -ActionPattern $action) {
+                    $isAllowed = $true
+                    break
+                }
+            }
+
+            if (-not $isAllowed) {
+                continue
+            }
+
+            foreach ($notAction in @($permission.notActions)) {
+                if (Test-AzureActionMatchesPattern -RequiredAction $RequiredAction -ActionPattern $notAction) {
+                    $isAllowed = $false
+                    break
+                }
+            }
+
+            if ($isAllowed) {
+                return $true
+            }
+        }
+    } catch {
+        Write-Info "Unable to confirm '$RequiredAction' at scope '$Scope'. $_"
+    }
+
+    return $false
+}
+
+function Test-SelectedSubscriptionRoleAssignmentAccess {
+    param([object[]]$Subscriptions)
+
+    Write-SectionLabel "Validating selected subscription role-assignment access"
+
+    $failedSubscriptions = @()
+    foreach ($sub in $Subscriptions) {
+        if (-not (Set-SubscriptionContext -Subscription $sub)) {
+            $failedSubscriptions += $sub
+            continue
+        }
+
+        $scope = "/subscriptions/$($sub.Id)"
+        if (Test-AzurePermissionActionAtScope -Scope $scope -RequiredAction "Microsoft.Authorization/roleAssignments/write") {
+            Write-Success "Validated role assignment access on: $($sub.Name)"
+        } else {
+            Write-Error-Custom "Missing role assignment access on: $($sub.Name)"
+            $failedSubscriptions += $sub
+        }
+    }
+
+    if ($failedSubscriptions.Count -eq 0) {
+        return $true
+    }
+
+    Write-Host ""
+    Write-Error-Custom "Cannot continue because the current Azure session cannot assign Reader access on $($failedSubscriptions.Count) selected subscription(s)."
+    foreach ($failedSubscription in $failedSubscriptions) {
+        Write-Error-Custom "  - $($failedSubscription.Name) ($($failedSubscription.Id))"
+    }
+    Write-SubscriptionPimTroubleshootingHint
+    return $false
+}
+
+function Test-TenantRootRoleAssignmentAccess {
+    Write-SectionLabel "Validating tenant root role-assignment access"
+
+    if (Test-AzurePermissionActionAtScope -Scope "/" -RequiredAction "Microsoft.Authorization/roleAssignments/write") {
+        Write-Success "Validated role assignment access at tenant root scope (/)"
+        return $true
+    }
+
+    Write-Error-Custom "Cannot confirm role assignment access at tenant root scope (/)."
+    Write-Info "All-subscriptions onboarding needs Owner or User Access Administrator at tenant root scope (/)."
+    Write-PimTroubleshootingHint
+    return $false
 }
 
 function Ensure-SubscriptionRoleAssignments {
@@ -434,11 +688,14 @@ function Ensure-SubscriptionRoleAssignments {
             Write-Error-Custom "Failed to assign $RoleLabel on $($sub.Name): $_"
             if ($_.Exception.Message -match "Forbidden") {
                 Write-Info "Requires Owner or User Access Administrator on the subscription."
+                Write-PimTroubleshootingHint
+                Write-SubscriptionPimTroubleshootingHint -Subscription $sub
             }
         }
     }
 
     Write-Info "Summary: $successCount new assignments, $skipCount already existed, $failureCount failed"
+    return ($failureCount -eq 0)
 }
 
 function Ensure-TenantRootReaderAssignment {
@@ -464,6 +721,7 @@ function Ensure-TenantRootReaderAssignment {
             Write-Info "This requires Owner or User Access Administrator at tenant root scope (/)."
             Write-Info "If you are a Global Administrator, enable Microsoft Entra ID > Properties > Access management for Azure resources."
             Write-Info "After enabling it, sign out, sign back in, and rerun the script."
+            Write-PimTroubleshootingHint
         }
 
         Write-Info "If you cannot get root-scope access, rerun the script and choose specific subscriptions to use per-subscription Reader assignments."
@@ -545,6 +803,10 @@ function Ensure-RootManagementGroupRoleAssignment {
         Write-Info "  - Management Groups are not enabled in your tenant"
         Write-Info "  - The root management group could not be resolved in the selected tenant"
         Write-Info "  - You need to manually assign this at the root management group in Azure Portal > Management Groups"
+        if ($_.Exception.Message -match "Forbidden|AuthorizationFailed|does not have authorization") {
+            Write-PimTroubleshootingHint
+            Write-TenantWidePimTroubleshootingHint -ScopeLabel "Root management group"
+        }
         return "failed"
     }
 }
@@ -2009,7 +2271,7 @@ Write-Host ""
 Write-SectionLabel "Required access"
 Write-DetailRow -Label "Service principal" -Value "Create '$APP_NAME' or reuse '$APP_NAME' / '$($LEGACY_APP_NAMES[0])'."
 Write-DetailRow -Label "Client secret" -Value "Create a 12-month secret or use an existing credential."
-Write-DetailRow -Label "Azure Reader" -Value "Assign at tenant root for all subscriptions, or on selected subscriptions."
+Write-DetailRow -Label "Azure RBAC" -Value "Owner is simplest. Without Owner, activate both User Access Administrator and Contributor on selected subscriptions."
 Write-DetailRow -Label "Governance" -Value "Assign Reader and Management Group Reader at the root management group."
 Write-DetailRow -Label "Billing" -Value "Assign Reservations Reader and Savings plan Reader provider-scope access."
 Write-DetailRow -Label "Billing-scope exports" -Value "Can reuse existing billing-level exports; billing-scope reader access may need manual assignment."
@@ -2023,9 +2285,21 @@ Write-DetailRow -Label "Billing exports" -Value "Highly recommended daily export
 Write-DetailRow -Label "Write permissions" -Value "Custom role for Advisor dismissals and Storage Inventory reports."
 Write-Host ""
 
+Write-SectionLabel "Using Privileged Identity Management (PIM)?"
+Write-Host "  Activate the required eligible roles in Azure Portal before continuing:" -ForegroundColor Yellow
+Write-Host "  1. Microsoft Entra: Application Administrator or Cloud Application Administrator for app setup." -ForegroundColor Yellow
+Write-Host "  2. Graph consent: Privileged Role Administrator or Global Administrator if granting Application.Read.All." -ForegroundColor Yellow
+Write-Host "  3. Subscriptions: Owner, or Contributor plus User Access Administrator, on every selected subscription." -ForegroundColor Yellow
+Write-Host "  4. All subscriptions mode: the same Azure RBAC access at tenant root scope (/)." -ForegroundColor Yellow
+Write-Host "  5. Optional governance: Management Group Contributor or Owner at the root management group." -ForegroundColor Yellow
+Write-Host "  6. Optional savings: role-assignment access at /providers/Microsoft.Capacity and /providers/Microsoft.BillingBenefits." -ForegroundColor Yellow
+Write-Host "  Wait until Azure shows the roles as Active. If activation happened after sign-in, use the session refresh prompt below." -ForegroundColor Yellow
+Write-Host ""
+
 Write-SectionLabel "Important for all subscriptions"
 Write-Host "  - Reader is assigned once at tenant root scope (/)." -ForegroundColor Yellow
-Write-Host "  - This needs Owner or User Access Administrator at root scope." -ForegroundColor Yellow
+Write-Host "  - Full automation needs Owner at root scope, or User Access Administrator plus Contributor." -ForegroundColor Yellow
+Write-Host "  - User Access Administrator alone can assign RBAC but cannot create billing exports or storage." -ForegroundColor Yellow
 Write-Host "  - Global Administrators usually need to enable Microsoft Entra ID > Properties >" -ForegroundColor Yellow
 Write-Host "    Access management for Azure resources, then sign out and sign back in." -ForegroundColor Yellow
 Write-Host "  - Microsoft Graph Application.Read.All requires tenant admin consent if granted." -ForegroundColor Yellow
@@ -2117,22 +2391,51 @@ try {
     exit 1
 }
 
+Write-SectionLabel "Azure session refresh"
+Write-Info "If you activated temporary access after this PowerShell session signed in, Azure may still be using old tokens."
+$refreshPimSession = Read-Host "Have you just activated temporary Azure access and want the script to reconnect now? (yes/no, default no)"
+if (Test-YesResponse -Value $refreshPimSession -DefaultYes $false) {
+    try {
+        Invoke-PimAzReconnect `
+            -TenantId $script:tenantId `
+            -Reason "Refreshing the Azure session after temporary access activation." |
+            Out-Null
+        Set-AzContext -TenantId $script:tenantId | Out-Null
+        Write-Success "Azure session refreshed for tenant $script:tenantId"
+    } catch {
+        Write-Error-Custom "Failed to refresh Azure session after temporary access activation: $_"
+        Write-PimTroubleshootingHint
+        exit 1
+    }
+}
+
 # ============================================================================
 # Step 3: Select Subscriptions
 # ============================================================================
 
 Write-Header -Message "Step 3 of 13: Select Subscriptions"
 
-$subscriptions = Get-AzSubscription -TenantId $script:tenantId
-Write-Host "Found $($subscriptions.Count) subscription(s) in your tenant:`n"
-
-if ($subscriptions.Count -eq 0) {
-    Write-Error-Custom "No subscriptions were found for tenant $script:tenantId."
+try {
+    $subscriptions = @(Get-AzSubscription -TenantId $script:tenantId -WarningAction SilentlyContinue -ErrorAction Stop)
+} catch {
+    Write-Error-Custom ("Could not list subscriptions for tenant {0}: {1}" -f $script:tenantId, $_)
+    Write-PimTroubleshootingHint
     exit 1
 }
 
-for ($i = 0; $i -lt $subscriptions.Count; $i++) {
-    Write-Host ("  [{0,2}] {1} ({2})" -f ($i + 1), $subscriptions[$i].Name, $subscriptions[$i].Id)
+Write-Host "Found $($subscriptions.Count) subscription(s) in your tenant."
+
+if ($subscriptions.Count -eq 0) {
+    $visibleSubscriptions = @()
+    try {
+        $visibleSubscriptions = @(Get-AzSubscription -WarningAction SilentlyContinue -ErrorAction SilentlyContinue |
+            Where-Object { $_.TenantId -ne $script:tenantId })
+    } catch {
+        $visibleSubscriptions = @()
+    }
+
+    Write-NoAccessibleSubscriptionsHint -TenantId $script:tenantId -VisibleSubscriptions $visibleSubscriptions
+    exit 1
 }
 
 Write-Host ""
@@ -2155,6 +2458,13 @@ while (-not $scopeSelected) {
         Write-Info "Reader access will be assigned once at tenant root scope (/)."
     } elseif ($normalizedSelection -in @("2", "s", "specific")) {
         $script:useTenantRootReader = $false
+
+        Write-Host ""
+        Write-SectionLabel "Available subscriptions"
+        for ($i = 0; $i -lt $subscriptions.Count; $i++) {
+            Write-Host ("  [{0,2}] {1} ({2})" -f ($i + 1), $subscriptions[$i].Name, $subscriptions[$i].Id)
+        }
+        Write-Host ""
 
         while ($selectedSubscriptions.Count -eq 0) {
             $subscriptionSelection = Read-Host "Enter subscription numbers (comma-separated, e.g., 1,3,5)"
@@ -2188,6 +2498,20 @@ while (-not $scopeSelected) {
         Write-Success "Selected $($selectedSubscriptions.Count) subscription(s)"
     } else {
         Write-Error-Custom "Invalid option. Enter 1 for all subscriptions or 2 to choose specific subscriptions."
+    }
+}
+
+if ($script:useTenantRootReader) {
+    if (-not (Test-TenantRootRoleAssignmentAccess)) {
+        exit 1
+    }
+} else {
+    if (-not (Test-SelectedSubscriptionAccess -Subscriptions $selectedSubscriptions)) {
+        exit 1
+    }
+
+    if (-not (Test-SelectedSubscriptionRoleAssignmentAccess -Subscriptions $selectedSubscriptions)) {
+        exit 1
     }
 }
 
@@ -2301,8 +2625,17 @@ Write-Header -Message "Step 6 of 13: Assign Reader Access"
 if ($script:useTenantRootReader) {
     Write-Info "All subscriptions were selected, so Reader will be assigned at tenant root scope (/)."
     $script:rootReaderAssignmentStatus = Ensure-TenantRootReaderAssignment -PrincipalId $sp.Id
+    if ($script:rootReaderAssignmentStatus -eq "failed") {
+        Write-Error-Custom "Reader access is required. Activate the required role from the upfront checklist and rerun this script."
+        Write-PimTroubleshootingHint
+        exit 1
+    }
 } else {
-    Ensure-SubscriptionRoleAssignments -PrincipalId $sp.Id -Subscriptions $selectedSubscriptions -RoleDefinitionName "Reader" -RoleLabel "Reader role"
+    $readerAssignmentsSucceeded = Ensure-SubscriptionRoleAssignments -PrincipalId $sp.Id -Subscriptions $selectedSubscriptions -RoleDefinitionName "Reader" -RoleLabel "Reader role"
+    if (-not $readerAssignmentsSucceeded) {
+        Write-Error-Custom "Reader access is required for every selected subscription. Activate the required role from the upfront checklist and rerun this script."
+        exit 1
+    }
 }
 
 # ============================================================================
@@ -2344,13 +2677,27 @@ if ([string]::IsNullOrWhiteSpace($grantMonitoringReadPerms) -or $grantMonitoring
 
 Write-Header -Message "Step 8 of 13: Assign Governance Reader Roles"
 
-try {
-    $script:rootManagementGroupReaderStatus = Ensure-RootManagementGroupRoleAssignment -PrincipalId $sp.Id -RoleDefinitionName "Reader" -RoleLabel "Reader role (root management group)"
-    $script:managementGroupReaderStatus = Ensure-RootManagementGroupRoleAssignment -PrincipalId $sp.Id -RoleDefinitionName "Management Group Reader" -RoleLabel "Management Group Reader role"
-} catch {
-    $script:rootManagementGroupReaderStatus = "failed"
-    $script:managementGroupReaderStatus = "failed"
-    Write-Error-Custom "Failed to assign root management group governance reader roles: $_"
+Write-SectionLabel "Tenant governance permissions"
+Write-DetailRow -Label "Scope" -Value "Root management group."
+Write-DetailRow -Label "Roles" -Value "Reader and Management Group Reader."
+Write-DetailRow -Label "Requires" -Value "Management Group Contributor or Owner at the root management group."
+Write-Host ""
+$grantGovernanceReaderRoles = Read-Host "Do you want to grant root management group governance reader roles now? (yes/no, default yes)"
+
+if (Test-YesResponse -Value $grantGovernanceReaderRoles) {
+    try {
+        $script:rootManagementGroupReaderStatus = Ensure-RootManagementGroupRoleAssignment -PrincipalId $sp.Id -RoleDefinitionName "Reader" -RoleLabel "Reader role (root management group)"
+        $script:managementGroupReaderStatus = Ensure-RootManagementGroupRoleAssignment -PrincipalId $sp.Id -RoleDefinitionName "Management Group Reader" -RoleLabel "Management Group Reader role"
+    } catch {
+        $script:rootManagementGroupReaderStatus = "failed"
+        $script:managementGroupReaderStatus = "failed"
+        Write-Error-Custom "Failed to assign root management group governance reader roles: $_"
+        Write-TenantWidePimTroubleshootingHint -ScopeLabel "Root management group"
+    }
+} else {
+    $script:rootManagementGroupReaderStatus = "skipped"
+    $script:managementGroupReaderStatus = "skipped"
+    Write-Info "Skipping root management group governance reader roles. Tenant hierarchy and management group governance analysis may be limited."
 }
 
 # ============================================================================
@@ -2359,60 +2706,78 @@ try {
 
 Write-Header -Message "Step 9 of 13: Assign Reservation Roles"
 
-try {
-    $reservationScope = "/providers/Microsoft.Capacity"
-    
-    # Check if role assignment already exists
-    $existingReservation = Get-AzRoleAssignment -ObjectId $sp.Id -Scope $reservationScope -RoleDefinitionName "Reservations Reader" -ErrorAction SilentlyContinue
-    
-    if ($existingReservation) {
-        Write-Info "Reservations Reader role already assigned"
-        $script:reservationReaderStatus = "existing"
-    } else {
-        New-AzRoleAssignment -ObjectId $sp.Id -RoleDefinitionName "Reservations Reader" -Scope $reservationScope | Out-Null
-        Write-Success "Assigned Reservations Reader role at /providers/Microsoft.Capacity"
-        $script:reservationReaderStatus = "created"
-    }
-} catch {
-    $script:reservationReaderStatus = "failed"
-    Write-Error-Custom "Failed to assign Reservations Reader role: $_"
-    Write-Info "You may need elevated permissions to assign this role at /providers/Microsoft.Capacity"
-}
-
-Write-SectionLabel "Optional reservation management permission"
-Write-DetailRow -Label "Role" -Value "Reservations Contributor at /providers/Microsoft.Capacity."
-Write-DetailRow -Label "Purpose" -Value "Calculate reservation refund quotes and support future reservation management workflows."
-Write-DetailRow -Label "Impact" -Value "Can manage reservations in the tenant but cannot delegate reservation RBAC roles."
+Write-SectionLabel "Reservation permissions"
+Write-DetailRow -Label "Scope" -Value "/providers/Microsoft.Capacity."
+Write-DetailRow -Label "Reader role" -Value "Read reservation benefits for savings analysis."
+Write-DetailRow -Label "Recommended contributor" -Value "Calculate reservation refund quotes and support future reservation management workflows."
+Write-DetailRow -Label "Requires" -Value "Permission to assign roles at the Microsoft.Capacity provider scope."
 Write-Host ""
+$grantReservationRoles = Read-Host "Do you want to grant reservation roles now? (yes/no, default yes)"
 
-$existingReservationContributor = $null
-try {
-    $existingReservationContributor = Get-AzRoleAssignment -ObjectId $sp.Id -Scope $reservationScope -RoleDefinitionName "Reservations Contributor" -ErrorAction SilentlyContinue
-} catch {
-    Write-Info "Could not check for an existing Reservations Contributor assignment. The assignment attempt can still be tried if you choose yes."
-}
-
-if ($existingReservationContributor) {
-    Write-Info "Reservations Contributor role already assigned"
-    $script:reservationContributorStatus = "existing"
-} else {
-    $grantReservationsContributor = Read-Host "Do you want to grant recommended Reservations Contributor? (yes/no, default yes)"
-}
-
-if (-not $existingReservationContributor -and (Test-YesResponse -Value $grantReservationsContributor)) {
+if (Test-YesResponse -Value $grantReservationRoles) {
     try {
-        New-AzRoleAssignment -ObjectId $sp.Id -RoleDefinitionName "Reservations Contributor" -Scope $reservationScope | Out-Null
-        Write-Success "Assigned Reservations Contributor role at /providers/Microsoft.Capacity"
-        $script:reservationContributorStatus = "created"
+        $reservationScope = "/providers/Microsoft.Capacity"
+
+        # Check if role assignment already exists
+        $existingReservation = Get-AzRoleAssignment -ObjectId $sp.Id -Scope $reservationScope -RoleDefinitionName "Reservations Reader" -ErrorAction SilentlyContinue
+
+        if ($existingReservation) {
+            Write-Info "Reservations Reader role already assigned"
+            $script:reservationReaderStatus = "existing"
+        } else {
+            New-AzRoleAssignment -ObjectId $sp.Id -RoleDefinitionName "Reservations Reader" -Scope $reservationScope | Out-Null
+            Write-Success "Assigned Reservations Reader role at /providers/Microsoft.Capacity"
+            $script:reservationReaderStatus = "created"
+        }
     } catch {
-        $script:reservationContributorStatus = "failed"
-        Write-Error-Custom "Failed to assign Reservations Contributor role: $_"
-        Write-Info "Continuing with Reservations Reader access only. Reservation refund quotes and management may not work until this role is assigned."
-        Write-Info "You may need elevated permissions to assign this role at /providers/Microsoft.Capacity"
+        $script:reservationReaderStatus = "failed"
+        Write-Error-Custom "Failed to assign Reservations Reader role: $_"
+        Write-TenantWidePimTroubleshootingHint -ScopeLabel "/providers/Microsoft.Capacity"
     }
-} elseif (-not $existingReservationContributor) {
+
+    if ($script:reservationReaderStatus -in @("created", "existing")) {
+        Write-SectionLabel "Optional reservation management permission"
+        Write-DetailRow -Label "Role" -Value "Reservations Contributor at /providers/Microsoft.Capacity."
+        Write-DetailRow -Label "Impact" -Value "Can manage reservations in the tenant but cannot delegate reservation RBAC roles."
+        Write-Host ""
+
+        $existingReservationContributor = $null
+        try {
+            $existingReservationContributor = Get-AzRoleAssignment -ObjectId $sp.Id -Scope $reservationScope -RoleDefinitionName "Reservations Contributor" -ErrorAction SilentlyContinue
+        } catch {
+            Write-Info "Could not check for an existing Reservations Contributor assignment. The assignment attempt can still be tried if you choose yes."
+        }
+
+        if ($existingReservationContributor) {
+            Write-Info "Reservations Contributor role already assigned"
+            $script:reservationContributorStatus = "existing"
+        } else {
+            $grantReservationsContributor = Read-Host "Do you want to grant recommended Reservations Contributor? (yes/no, default yes)"
+        }
+
+        if (-not $existingReservationContributor -and (Test-YesResponse -Value $grantReservationsContributor)) {
+            try {
+                New-AzRoleAssignment -ObjectId $sp.Id -RoleDefinitionName "Reservations Contributor" -Scope $reservationScope | Out-Null
+                Write-Success "Assigned Reservations Contributor role at /providers/Microsoft.Capacity"
+                $script:reservationContributorStatus = "created"
+            } catch {
+                $script:reservationContributorStatus = "failed"
+                Write-Error-Custom "Failed to assign Reservations Contributor role: $_"
+                Write-Info "Continuing with Reservations Reader access only. Reservation refund quotes and management may not work until this role is assigned."
+                Write-TenantWidePimTroubleshootingHint -ScopeLabel "/providers/Microsoft.Capacity"
+            }
+        } elseif (-not $existingReservationContributor) {
+            $script:reservationContributorStatus = "skipped"
+            Write-Info "Skipping optional Reservations Contributor role. Reservation refund quote and management features may be limited."
+        }
+    } else {
+        $script:reservationContributorStatus = "skipped"
+        Write-Info "Skipping Reservations Contributor because Reservations Reader was not assigned."
+    }
+} else {
+    $script:reservationReaderStatus = "skipped"
     $script:reservationContributorStatus = "skipped"
-    Write-Info "Skipping optional Reservations Contributor role. Reservation refund quote and management features may be limited."
+    Write-Info "Skipping reservation provider-scope roles. Reservation benefit and refund quote features may be limited."
 }
 
 # ============================================================================
@@ -2421,24 +2786,36 @@ if (-not $existingReservationContributor -and (Test-YesResponse -Value $grantRes
 
 Write-Header -Message "Step 10 of 13: Assign Savings Plan Reader"
 
-try {
-    $savingsPlanScope = "/providers/Microsoft.BillingBenefits"
-    
-    # Check if role assignment already exists
-    $existingSavingsPlan = Get-AzRoleAssignment -ObjectId $sp.Id -Scope $savingsPlanScope -RoleDefinitionName "Savings plan Reader" -ErrorAction SilentlyContinue
-    
-    if ($existingSavingsPlan) {
-        Write-Info "Savings plan Reader role already assigned"
-        $script:savingsPlanReaderStatus = "existing"
-    } else {
-        New-AzRoleAssignment -ObjectId $sp.Id -RoleDefinitionName "Savings plan Reader" -Scope $savingsPlanScope | Out-Null
-        Write-Success "Assigned Savings plan Reader role at /providers/Microsoft.BillingBenefits"
-        $script:savingsPlanReaderStatus = "created"
+Write-SectionLabel "Savings plan permission"
+Write-DetailRow -Label "Scope" -Value "/providers/Microsoft.BillingBenefits."
+Write-DetailRow -Label "Role" -Value "Savings plan Reader."
+Write-DetailRow -Label "Requires" -Value "Permission to assign roles at the Microsoft.BillingBenefits provider scope."
+Write-Host ""
+$grantSavingsPlanReader = Read-Host "Do you want to grant Savings plan Reader now? (yes/no, default yes)"
+
+if (Test-YesResponse -Value $grantSavingsPlanReader) {
+    try {
+        $savingsPlanScope = "/providers/Microsoft.BillingBenefits"
+
+        # Check if role assignment already exists
+        $existingSavingsPlan = Get-AzRoleAssignment -ObjectId $sp.Id -Scope $savingsPlanScope -RoleDefinitionName "Savings plan Reader" -ErrorAction SilentlyContinue
+
+        if ($existingSavingsPlan) {
+            Write-Info "Savings plan Reader role already assigned"
+            $script:savingsPlanReaderStatus = "existing"
+        } else {
+            New-AzRoleAssignment -ObjectId $sp.Id -RoleDefinitionName "Savings plan Reader" -Scope $savingsPlanScope | Out-Null
+            Write-Success "Assigned Savings plan Reader role at /providers/Microsoft.BillingBenefits"
+            $script:savingsPlanReaderStatus = "created"
+        }
+    } catch {
+        $script:savingsPlanReaderStatus = "failed"
+        Write-Error-Custom "Failed to assign Savings plan Reader role: $_"
+        Write-TenantWidePimTroubleshootingHint -ScopeLabel "/providers/Microsoft.BillingBenefits"
     }
-} catch {
-    $script:savingsPlanReaderStatus = "failed"
-    Write-Error-Custom "Failed to assign Savings plan Reader role: $_"
-    Write-Info "You may need elevated permissions to assign this role at /providers/Microsoft.BillingBenefits"
+} else {
+    $script:savingsPlanReaderStatus = "skipped"
+    Write-Info "Skipping Savings plan Reader. Savings plan benefit analysis may be limited."
 }
 
 # ============================================================================
@@ -2532,6 +2909,8 @@ Write-Info "Exports are written to customer-owned Azure Storage. Spotto cloud-en
 Write-Info "This is highly recommended because it reduces Cost Management API calls and Azure rate limiting."
 Write-Info "The script keeps anonymous blob access disabled and containers private."
 Write-Info "Spotto still needs the storage account public network endpoint reachable; RBAC alone cannot bypass a disabled public endpoint or blocking firewall."
+Write-Info "Creating or updating exports and storage needs Owner, or Contributor plus User Access Administrator, on the selected subscription/storage scope."
+Write-Info "User Access Administrator alone can grant RBAC roles but cannot create Cost Management exports, resource groups, storage accounts, or containers."
 Write-Info "New daily recurring exports are run immediately when Azure accepts the run request."
 Write-Info "Historical backfill exports are queued once and marked so reruns can recover interrupted backfills without repeated queueing."
 Write-Info "When a billing-scope export is reused, assign Spotto read access at that billing scope so it can discover the export later."
@@ -2888,18 +3267,21 @@ switch ($script:rootManagementGroupReaderStatus) {
     "created" { Write-Success "Reader assigned at the root management group for tenant governance hierarchy access" }
     "existing" { Write-Success "Reader already existed at the root management group for tenant governance hierarchy access" }
     "failed" { Write-Error-Custom "Reader was not assigned at the root management group" }
+    "skipped" { Write-Skipped "Reader at the root management group skipped" }
     default { Write-Skipped "Reader at the root management group was not processed" }
 }
 switch ($script:managementGroupReaderStatus) {
     "created" { Write-Success "Management Group Reader assigned at the root management group" }
     "existing" { Write-Success "Management Group Reader already existed at the root management group" }
     "failed" { Write-Error-Custom "Management Group Reader was not assigned at the root management group" }
+    "skipped" { Write-Skipped "Management Group Reader skipped" }
     default { Write-Skipped "Management Group Reader was not processed" }
 }
 switch ($script:reservationReaderStatus) {
     "created" { Write-Success "Reservations Reader assigned at /providers/Microsoft.Capacity" }
     "existing" { Write-Success "Reservations Reader already existed at /providers/Microsoft.Capacity" }
     "failed" { Write-Error-Custom "Reservations Reader was not assigned at /providers/Microsoft.Capacity" }
+    "skipped" { Write-Skipped "Reservations Reader skipped" }
     default { Write-Skipped "Reservations Reader was not processed" }
 }
 switch ($script:reservationContributorStatus) {
@@ -2913,6 +3295,7 @@ switch ($script:savingsPlanReaderStatus) {
     "created" { Write-Success "Savings plan Reader assigned at /providers/Microsoft.BillingBenefits" }
     "existing" { Write-Success "Savings plan Reader already existed at /providers/Microsoft.BillingBenefits" }
     "failed" { Write-Error-Custom "Savings plan Reader was not assigned at /providers/Microsoft.BillingBenefits" }
+    "skipped" { Write-Skipped "Savings plan Reader skipped" }
     default { Write-Skipped "Savings plan Reader was not processed" }
 }
 switch ($script:graphPermissionStatus) {
@@ -2978,19 +3361,17 @@ if ($script:graphPermissionStatus -in @("created", "existing")) {
     Write-Host "  You can grant Graph consent manually or rerun this script and choose yes for Step 11." -ForegroundColor Yellow
 }
 
+# Stop logging before showing credentials so the client secret is not written to the transcript.
+Write-Host ""
+Write-Info "Stopping transcript before showing credentials. Client secrets are intentionally not written to the setup log."
+Stop-Transcript | Out-Null
+
 # Display credentials for copy/paste
 Show-Credentials
 
 Show-NextSteps
 
-if ($script:isNewSecret) {
-    Write-Host "Client secret note: The secret above is shown only for this run." -ForegroundColor Cyan
-    Write-Host "If you lose it, rerun this script to create a new secret.`n" -ForegroundColor DarkGray
-}
-
 Write-Host "For support, visit: https://docs.spotto.ai`n"
 
 # Keep credentials visible
 Read-Host "Press Enter to exit"
-
-Stop-Transcript

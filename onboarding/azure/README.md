@@ -6,18 +6,19 @@ This directory contains the `Setup-SpottoAzure.ps1` PowerShell script, which aut
 
 The script performs the following actions:
 1.  Creates an Azure AD Application and Service Principal for Spotto.
-2.  Assigns **Reader** access based on your selection:
+2.  Creates or reuses a client secret and immediately shows a **Spotto registration checkpoint** so you can add/update the cloud account in Spotto before the remaining Azure role and export steps run.
+3.  Assigns **Reader** access based on your selection:
     *   **All subscriptions**: assigns **Reader** once at tenant root scope (`/`) so it inherits to all current and future subscriptions.
     *   **Specific subscriptions**: assigns **Reader** on each selected subscription.
-3.  (Optional, recommended) Assigns **Monitoring Reader** and **Log Analytics Reader**.
+4.  (Optional, recommended) Assigns **Monitoring Reader** and **Log Analytics Reader**.
     *   **Monitoring Reader** adds access needed for Application Insights queries via `Microsoft.Insights/Components/Query/Read`.
     *   **Log Analytics Reader** is assigned at the **root management group** when you choose **All subscriptions** for tenant-wide workspace log access, otherwise on the selected subscriptions.
     *   **Log Analytics Reader** is broader than **Log Analytics Data Reader** and supports current plus future Log Analytics workspace analysis scenarios.
-4.  Assigns **Reader** and **Management Group Reader** at the root management group for tenant governance hierarchy plus management-group policy and RBAC metadata.
-5.  Assigns **Reservations Reader** at `/providers/Microsoft.Capacity` and asks by default for **Reservations Contributor** at the same scope so Spotto can calculate reservation refund quotes and support reservation management workflows.
-6.  Assigns **Savings plan Reader** at `/providers/Microsoft.BillingBenefits`.
-7.  Optionally grants **Application.Read.All** in Microsoft Graph with admin consent so Spotto can read applications and service principals for governance and credential posture.
-8.  (Highly recommended) Configures **Cost Management exports** to customer-owned Azure Storage:
+5.  Assigns **Reader** and **Management Group Reader** at the root management group for tenant governance hierarchy plus management-group policy and RBAC metadata.
+6.  Assigns **Reservations Reader** at `/providers/Microsoft.Capacity` and asks by default for **Reservations Contributor** at the same scope so Spotto can calculate reservation refund quotes and support reservation management workflows.
+7.  Assigns **Savings plan Reader** at `/providers/Microsoft.BillingBenefits`.
+8.  Optionally grants **Application.Read.All** in Microsoft Graph with admin consent so Spotto can read applications and service principals for governance and credential posture.
+9.  (Highly recommended) Configures **Cost Management exports** to customer-owned Azure Storage. This can be skipped and rerun later; the service principal credentials are shown before this step so export delays do not block basic cloud account registration:
     *   Detects compatible existing billing-scope exports when you select or paste an EA/MCA billing scope, then can grant the Spotto service principal **Storage Blob Data Reader** on their containers without changing the billing-scope export storage account networking.
     *   Warns when reused billing-scope export storage appears unreachable through its public network endpoint. **Storage Blob Data Reader** grants identity access only; it does not bypass a disabled public endpoint or storage firewall.
     *   Detects compatible existing daily actual/amortized exports and can grant the Spotto service principal **Storage Blob Data Reader** on their containers.
@@ -25,8 +26,8 @@ The script performs the following actions:
     *   Creates daily CSV/GZIP exports and queues one-time exports for the previous 13 closed months where the subscription supports the dataset.
     *   Continues with per-subscription exports as a fallback unless you explicitly confirm the billing-scope export covers all selected subscriptions and datasets.
     *   Skips export setup with a friendly warning when Cost Management exports are unavailable for a subscription offer, billing scope, or dataset.
-9.  (Optional) Creates and assigns a custom role for **write permissions** (Advisor recommendations, Storage inventory).
-10. Outputs the credentials needed to configure Spotto.
+10.  (Optional) Creates and assigns a custom role for **write permissions** (Advisor recommendations, Storage inventory).
+11. Outputs the credentials needed to configure Spotto again at completion.
 
 You can safely rerun the script if validation needs more time, permissions change, or you need to retry a failed step. It checks for existing Spotto resources, role assignments, storage containers, and export definitions, then reuses or updates them where possible.
 
@@ -43,6 +44,11 @@ Before running the script, ensure you have:
     *   Highly recommended billing export setup requires rights to manage Cost Management exports, storage accounts, blob containers, and `Storage Blob Data Reader` role assignments.
     *   If reusing an export created at billing scope, the Spotto service principal also needs reader access at that billing scope. For MCA scopes, assign the relevant Billing account/profile/invoice section reader role. For EA scopes, assign the equivalent EA read role such as enrollment or department reader using Azure Billing role assignments.
     *   If reusing billing-scope export storage, the storage account must also be reachable by Spotto cloud-engine. Keep anonymous blob access disabled, but public network access must be enabled and the firewall must allow access unless you have a supported private connectivity path.
+*   **Privileged Identity Management (PIM)**:
+    *   Activate the Microsoft Entra role used for app registration work, such as Application Administrator, before starting the script.
+    *   Activate the Azure RBAC role used for role assignments, such as Owner or User Access Administrator at the selected subscription/root scope, before starting the script.
+    *   If you activate PIM after signing in, reconnect with `Disconnect-AzAccount` then `Connect-AzAccount -TenantId <tenantId>` so the PowerShell session receives fresh permissions.
+    *   Make sure the activation window is long enough for the selected role and export steps. The script is idempotent, so it can be rerun after reactivating PIM.
 *   **PowerShell Modules** (the script will attempt to install these if missing):
     *   `Az.Accounts`
     *   `Az.Resources`
@@ -103,22 +109,23 @@ The script is interactive and will guide you through the process:
     *   If you choose **Specific**, the script assigns **Reader** only on the subscriptions you selected.
 4.  **Service Principal**: It checks for an existing "Spotto" app first, then "Spotto AI" for compatibility. If neither exists, it creates a new "Spotto" app.
 5.  **Client Secret**: It generates a new client secret (valid for 1 year) or asks to use an existing one if available.
-6.  **Optional Recommended Monitoring Roles**: You will be asked if you want to grant these optional recommended roles using a `yes` or `no` prompt. Press **Enter** to accept the default of **yes**.
+6.  **Spotto Registration Checkpoint**: After the service principal credential exists, the script shows the Application ID, Tenant ID, client secret/secret note, and Spotto Portal next steps. Add or update the Spotto cloud account at this point if you want a recoverable checkpoint before RBAC or export work continues.
+7.  **Optional Recommended Monitoring Roles**: You will be asked if you want to grant these optional recommended roles using a `yes` or `no` prompt. Press **Enter** to accept the default of **yes**.
     *   **Monitoring Reader** on selected subscriptions.
         Adds `Microsoft.Insights/Components/Query/Read` for Application Insights queries.
     *   **Log Analytics Reader**.
         For **All subscriptions**, the script assigns this once at the root management group for tenant-wide workspace log access.
         For **Specific subscriptions**, the script assigns it on each selected subscription.
         This broader role supports current query needs plus future Log Analytics optimization analysis.
-7.  **Governance + Billing Reader Roles**: The script assigns:
+8.  **Governance + Billing Reader Roles**: The script assigns:
     *   **Reader** at the root management group for tenant governance hierarchy access.
     *   **Management Group Reader** at the root management group for hierarchy plus policy/RBAC metadata.
     *   **Reservations Reader** at `/providers/Microsoft.Capacity`.
     *   Asks for **Reservations Contributor** at `/providers/Microsoft.Capacity` with a default of **yes**.
         This enables reservation refund quote calculation and future reservation management workflows. If you answer **no** or the assignment fails, onboarding continues with read-only reservation access.
     *   **Savings plan Reader** at `/providers/Microsoft.BillingBenefits`.
-8.  **Microsoft Graph Governance Permission**: You will be asked if you want the script to connect to Microsoft Graph and grant **Application.Read.All** with admin consent. If you answer **no**, the script skips Microsoft Graph and continues with the remaining onboarding steps.
-9.  **Highly Recommended Cost Management Exports**: You will be asked if you want to configure exports. The default is **yes** because exports reduce Cost Management API calls and Azure rate limiting.
+9.  **Microsoft Graph Governance Permission**: You will be asked if you want the script to connect to Microsoft Graph and grant **Application.Read.All** with admin consent. If you answer **no**, the script skips Microsoft Graph and continues with the remaining onboarding steps.
+10. **Highly Recommended Cost Management Exports**: You will be asked if you want to configure exports. The default is **yes** because exports reduce Cost Management API calls and Azure rate limiting.
     *   The script can check billing scopes that your signed-in account can access, or you can paste a billing scope resource ID such as `/providers/Microsoft.Billing/billingAccounts/...`.
     *   If a compatible billing-scope export is accepted, the script prepares Spotto blob read access and asks whether to skip subscription-level exports. The default is to keep the per-subscription fallback.
     *   For billing-scope export storage, the script warns about public endpoint/firewall settings but does not change them automatically.
@@ -130,7 +137,7 @@ The script is interactive and will guide you through the process:
     *   The script creates actual-cost exports and attempts amortized-cost exports. Amortized exports are skipped where Azure does not support them.
     *   Newly created daily recurring exports are run immediately when Azure accepts the run request, so Spotto does not have to wait for the first scheduled daily run.
     *   Historical backfill exports are marked after they are queued, so rerunning the script can recover interrupted backfills without repeated queueing.
-10. **Optional Write Permissions**: You will be asked if you want to grant optional write permissions for:
+11. **Optional Write Permissions**: You will be asked if you want to grant optional write permissions for:
     *   Dismissing Azure Advisor recommendations.
     *   Enabling Storage Inventory reports.
 
@@ -155,6 +162,7 @@ Upon successful completion, the script will display the credentials you need to 
     ```
     This allows scripts to run for the current PowerShell session only. The policy resets to its default when you close the terminal window.
 *   **Permission Errors**: If you see errors regarding role assignments, ensure your user account has `Owner` or `User Access Administrator` rights on the target subscriptions. If you selected **All subscriptions**, ensure you also have that access at tenant root scope (`/`). The management group and billing-scope role assignments also need rights at those scopes.
+*   **PIM activated but the script still gets Forbidden**: Reconnect after activation with `Disconnect-AzAccount` and `Connect-AzAccount -TenantId <tenantId>`, then rerun the script. Azure RBAC changes can take several minutes to become visible to all Azure Resource Manager calls.
 *   **Root scope Reader assignment failed**: If the script says it could not assign **Reader** at tenant root scope (`/`), and you are a Global Administrator, enable **Microsoft Entra ID** > **Properties** > **Access management for Azure resources**, sign out, sign back in, and rerun the script. If you cannot get root-scope access, rerun the script and choose specific subscriptions instead.
 *   **"Please provide a valid tenant or a valid subscription"**: Re-authenticate for the tenant shown in the warning:
     ```powershell
