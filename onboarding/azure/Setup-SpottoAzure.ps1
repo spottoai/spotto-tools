@@ -2270,7 +2270,7 @@ Write-Host ""
 
 Write-SectionLabel "Required access"
 Write-DetailRow -Label "Service principal" -Value "Create '$APP_NAME' or reuse '$APP_NAME' / '$($LEGACY_APP_NAMES[0])'."
-Write-DetailRow -Label "Client secret" -Value "Create a 12-month secret or use an existing credential."
+Write-DetailRow -Label "Client secret" -Value "Create the longest allowed secret (24, then 12, then 6 months) or use an existing credential."
 Write-DetailRow -Label "Azure RBAC" -Value "Owner is simplest. Without Owner, activate both User Access Administrator and Contributor on selected subscriptions."
 Write-DetailRow -Label "Governance" -Value "Assign Reader and Management Group Reader at the root management group."
 Write-DetailRow -Label "Billing" -Value "Assign Reservations Reader and Savings plan Reader provider-scope access."
@@ -2598,17 +2598,40 @@ try {
     }
     
     if ($createNew -eq "yes") {
-        $secretEndDate = (Get-Date).AddMonths(12)
-        
-        # Create credential
-        $credential = New-AzADAppCredential -ApplicationId $app.AppId -EndDate $secretEndDate
-        
-        $script:clientSecret = $credential.SecretText
-        $script:secretExpiry = $secretEndDate.ToString("yyyy-MM-dd")
-        $script:isNewSecret = $true
-        
-        Write-Success "Created new client secret"
-        Write-Info "Secret expires on: $script:secretExpiry"
+        $secretDurationMonthsToTry = @(24, 12, 6)
+        $credential = $null
+        $lastSecretError = $null
+
+        foreach ($durationMonths in $secretDurationMonthsToTry) {
+            $secretEndDate = (Get-Date).AddMonths($durationMonths)
+
+            try {
+                Write-Info "Creating a $durationMonths-month client secret..."
+                $credential = New-AzADAppCredential -ApplicationId $app.AppId -EndDate $secretEndDate -ErrorAction Stop
+
+                $script:clientSecret = $credential.SecretText
+                $actualSecretEndDate = if ($credential.EndDateTime) { $credential.EndDateTime } else { $secretEndDate }
+                $script:secretExpiry = $actualSecretEndDate.ToString("yyyy-MM-dd")
+                $script:isNewSecret = $true
+
+                Write-Success "Created new $durationMonths-month client secret"
+                Write-Info "Secret expires on: $script:secretExpiry"
+                break
+            } catch {
+                $lastSecretError = $_
+                if ($durationMonths -ne $secretDurationMonthsToTry[-1]) {
+                    Write-Warning-Custom "The $durationMonths-month client secret attempt failed. Trying a shorter duration in case tenant policy limits secret lifetime..."
+                    Write-Info "Azure response: $($_.Exception.Message)"
+                }
+            }
+        }
+
+        if (-not $credential) {
+            if ($lastSecretError) {
+                throw $lastSecretError
+            }
+            throw "Failed to create a client secret at 24, 12, or 6 months."
+        }
     }
     
 } catch {
