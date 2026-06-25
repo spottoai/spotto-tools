@@ -17,7 +17,7 @@ The script performs the following actions:
 5.  Assigns **Reader** and **Management Group Reader** at the root management group for tenant governance hierarchy plus management-group policy and RBAC metadata.
 6.  Assigns **Reservations Reader** at `/providers/Microsoft.Capacity` and asks by default for **Reservations Contributor** at the same scope so Spotto can calculate reservation refund quotes and support reservation management workflows.
 7.  Assigns **Savings plan Reader** at `/providers/Microsoft.BillingBenefits`.
-8.  Optionally grants **Application.Read.All** in Microsoft Graph with admin consent so Spotto can read applications and service principals for governance and credential posture.
+8.  Optionally grants Microsoft Graph application permissions with admin consent so Spotto can read applications, service principals, directory roles, Global Admin/PIM schedules, group membership, users, and audit logs for governance visibility.
 9.  (Highly recommended) Configures **Cost Management exports** to customer-owned Azure Storage. This can be skipped and rerun later; the service principal credentials are shown before this step so export delays do not block basic cloud account registration:
     *   Detects compatible existing billing-scope exports when you select or paste an EA/MCA billing scope, then can grant the Spotto service principal **Storage Blob Data Reader** on their containers without changing the billing-scope export storage account networking.
     *   Warns when reused billing-scope export storage appears unreachable through its public network endpoint. **Storage Blob Data Reader** grants identity access only; it does not bypass a disabled public endpoint or storage firewall.
@@ -40,12 +40,13 @@ Before running the script, ensure you have:
     *   **Global Administrator** or **Application Administrator** (to create the Service Principal).
     *   **Owner** or **User Access Administrator** on the subscriptions you want to onboard, or at tenant root scope (`/`) if you choose **All subscriptions**.
     *   If you choose **All subscriptions** and want the script to assign **Reader** at tenant root scope (`/`), a **Global Administrator** typically needs to enable **Microsoft Entra ID** > **Properties** > **Access management for Azure resources**, then sign out and sign back in before running the script.
-    *   A tenant admin able to grant **Microsoft Graph Application.Read.All** admin consent, if you choose to grant Graph governance permissions.
+    *   A tenant admin able to grant Microsoft Graph governance permissions with admin consent, if you choose to grant Graph governance permissions.
     *   Highly recommended billing export setup requires rights to manage Cost Management exports, storage accounts, blob containers, and `Storage Blob Data Reader` role assignments.
     *   If reusing an export created at billing scope, the Spotto service principal also needs reader access at that billing scope. For MCA scopes, assign the relevant Billing account/profile/invoice section reader role. For EA scopes, assign the equivalent EA read role such as enrollment or department reader using Azure Billing role assignments.
     *   If reusing billing-scope export storage, the storage account must also be reachable by Spotto cloud-engine. Keep anonymous blob access disabled, but public network access must be enabled and the firewall must allow access unless you have a supported private connectivity path.
 *   **Privileged Identity Management (PIM)**:
     *   Activate the Microsoft Entra role used for app registration work, such as Application Administrator, before starting the script.
+    *   Activate Privileged Role Administrator or Global Administrator before the Graph consent step if you want Spotto to see Global Admin/PIM role schedules and audit context.
     *   Activate the Azure RBAC role used for role assignments, such as Owner or User Access Administrator at the selected subscription/root scope, before starting the script.
     *   If you activate PIM after signing in, reconnect with `Disconnect-AzAccount` then `Connect-AzAccount -TenantId <tenantId>` so the PowerShell session receives fresh permissions.
     *   Make sure the activation window is long enough for the selected role and export steps. The script is idempotent, so it can be rerun after reactivating PIM.
@@ -69,7 +70,14 @@ Before running the script, ensure you have:
 *   **Reservations Reader**: Permission to assign the role at `/providers/Microsoft.Capacity`.
 *   **Reservations Contributor**: Recommended permission to assign the role at `/providers/Microsoft.Capacity` so Spotto can calculate reservation refund quotes and support reservation management workflows. The script defaults to assigning it, but if this is skipped or fails, onboarding continues with read-only reservation access.
 *   **Savings plan Reader**: Permission to assign the role at `/providers/Microsoft.BillingBenefits`.
-*   **Microsoft Graph Application.Read.All**: Optional tenant admin consent for the application permission so Spotto can read applications and service principals for governance and credential posture.
+*   **Microsoft Graph governance permissions**: Optional tenant admin consent for the application permissions Spotto uses for Global Admin/PIM, audit, directory, and credential posture visibility:
+    *   `Application.Read.All`
+    *   `RoleAssignmentSchedule.Read.Directory`
+    *   `RoleEligibilitySchedule.Read.Directory`
+    *   `RoleManagement.Read.Directory`
+    *   `GroupMember.Read.All`
+    *   `User.Read.All`
+    *   `AuditLog.Read.All`
 *   **Cost Management exports**: Permission to create/update `Microsoft.CostManagement/exports` on selected subscriptions.
     *   Cost Management export availability depends on the Azure agreement, subscription offer, billing scope, and dataset. Some subscription offers, newly created subscriptions, or amortized datasets might not be available.
 *   **Existing billing-scope Cost Management exports**: Permission for the signed-in operator to list exports at the billing scope during setup, plus reader access for the Spotto service principal at the same billing scope so Spotto can discover the export later.
@@ -124,7 +132,7 @@ The script is interactive and will guide you through the process:
     *   Asks for **Reservations Contributor** at `/providers/Microsoft.Capacity` with a default of **yes**.
         This enables reservation refund quote calculation and future reservation management workflows. If you answer **no** or the assignment fails, onboarding continues with read-only reservation access.
     *   **Savings plan Reader** at `/providers/Microsoft.BillingBenefits`.
-9.  **Microsoft Graph Governance Permission**: You will be asked if you want the script to connect to Microsoft Graph and grant **Application.Read.All** with admin consent. If you answer **no**, the script skips Microsoft Graph and continues with the remaining onboarding steps.
+9.  **Microsoft Graph Governance Permissions**: You will be asked if you want the script to connect to Microsoft Graph and grant the required application permissions with admin consent. These cover application posture, Global Admin/PIM role schedules, role management, group membership, user profile data, and audit logs. If you answer **no**, the script skips Microsoft Graph and continues with the remaining onboarding steps.
 10. **Highly Recommended Cost Management Exports**: You will be asked if you want to configure exports. The default is **yes** because exports reduce Cost Management API calls and Azure rate limiting.
     *   The script can check billing scopes that your signed-in account can access, or you can paste a billing scope resource ID such as `/providers/Microsoft.Billing/billingAccounts/...`.
     *   If a compatible billing-scope export is accepted, the script prepares Spotto blob read access and asks whether to skip subscription-level exports. The default is to keep the per-subscription fallback.
@@ -152,7 +160,7 @@ Upon successful completion, the script will display the credentials you need to 
 
 > **⚠️ Important:** The Client Secret is shown only once. Make sure to copy it immediately.
 
-> **Note:** Azure RBAC changes and Microsoft Graph admin consent, if granted, can take 5-15 minutes to propagate after the script completes. During that window, Spotto may validate the credentials successfully while tenant-level governance data such as management group hierarchy, policy/RBAC context, or service principal posture still shows access denied.
+> **Note:** Azure RBAC changes and Microsoft Graph admin consent, if granted, can take 5-15 minutes to propagate after the script completes. During that window, Spotto may validate the credentials successfully while tenant-level governance data such as management group hierarchy, policy/RBAC context, Global Admin/PIM schedules, audit logs, group membership, users, or service principal posture still shows access denied.
 
 ## Troubleshooting
 
@@ -170,11 +178,11 @@ Upon successful completion, the script will display the credentials you need to 
     ```
     Then re-run the script and select the affected subscriptions.
 *   **Root management group Reader or Management Group Reader failed**: Confirm management groups are enabled and that you have `Management Group Contributor` or `Owner` at the root management group. If not, assign the missing role manually in **Azure Portal > Management Groups**.
-*   **Tenant governance shows "access denied" after onboarding**: Wait 5-15 minutes and retry first, because tenant-scope RBAC and Microsoft Graph consent can lag behind the script output. If the error remains, confirm both **Reader** and **Management Group Reader** are assigned at the root management group, confirm Microsoft Graph **Application.Read.All** shows admin consent granted if you chose the Graph step, and confirm the service principal received the intended tenant/root-scope access rather than subscription-only assignments.
+*   **Tenant governance, Global Admin/PIM, or audit data shows "access denied" after onboarding**: Wait 5-15 minutes and retry first, because tenant-scope RBAC and Microsoft Graph consent can lag behind the script output. If the error remains, confirm both **Reader** and **Management Group Reader** are assigned at the root management group, confirm all Microsoft Graph governance permissions show admin consent granted if you chose the Graph step, and confirm the service principal received the intended tenant/root-scope access rather than subscription-only assignments.
 *   **Log Analytics Reader failed**: Confirm you have permission to assign roles at the root management group for tenant-wide onboarding, or at each selected subscription for per-subscription onboarding. If needed, assign **Log Analytics Reader** manually and rerun the script.
 *   **Reservations Reader / Savings plan Reader failed**: Your account lacks permission at the billing provider scopes `/providers/Microsoft.Capacity` or `/providers/Microsoft.BillingBenefits`. Ask a tenant admin to assign these roles manually if needed.
 *   **Reservations Contributor failed or skipped**: Spotto can still read reservations if **Reservations Reader** was assigned, but reservation refund quote calculation and reservation management features might not work. The script asks for this recommended role by default; ask a tenant admin to assign **Reservations Contributor** at `/providers/Microsoft.Capacity` if those features are required.
-*   **Microsoft Graph Application.Read.All failed or skipped**: The tenant still needs admin consent for the Microsoft Graph application permission before Spotto can read application and service principal posture. Have a tenant admin grant **Application.Read.All** with admin consent in **Azure Portal > App Registrations > API permissions**, or rerun the script and choose **yes** for the Microsoft Graph step.
+*   **Microsoft Graph governance permissions failed or skipped**: The tenant still needs admin consent for the Microsoft Graph application permissions before Spotto can read application posture, Global Admin/PIM schedules, group membership, user profile data, and audit logs. Have a tenant admin grant the permissions listed above with admin consent in **Azure Portal > App Registrations > API permissions**, or rerun the script and choose **yes** for the Microsoft Graph step.
 *   **Cost Management export setup failed**: Confirm the subscription supports Cost Management exports and that your account can create or update `Microsoft.CostManagement/exports`. Some subscriptions do not support amortized exports; the script continues with actual cost where possible.
 *   **Billing-scope export is reused but Spotto cannot discover it later**: Confirm the Spotto service principal has reader access at the billing scope shown by the script. Subscription Reader, tenant root Reader, and storage blob access do not grant billing-scope export discovery by themselves.
 *   **Cost Management exports unavailable**: The selected subscription offer, billing scope, or dataset does not expose Cost Management exports. This can be expected for unsupported offers, some newly created subscriptions while Cost Management data is still becoming available, or amortized datasets that are not available for that scope. The script skips those exports and continues onboarding.

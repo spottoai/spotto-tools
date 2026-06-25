@@ -22,8 +22,9 @@
     - Recommended: Reservations Contributor at /providers/Microsoft.Capacity
       (calculate reservation refund quotes and support reservation management workflows)
     - Savings plan Reader at /providers/Microsoft.BillingBenefits
-    - Optional prompt: Application.Read.All in Microsoft Graph with admin consent
-      (read applications and service principals for governance and credential posture)
+    - Optional prompt: Microsoft Graph application permissions with admin consent
+      (read applications, service principals, directory roles, Global Admin/PIM state,
+       group membership, users, and audit logs for governance visibility)
     - Highly recommended: Cost Management exports to customer-owned Azure Storage
       (daily actual/amortized exports plus one-time historical backfill where supported)
       Existing billing-scope exports can be reused when the operator has access to the
@@ -38,13 +39,13 @@
     Prerequisites:
     - PowerShell 5.1 or PowerShell 7+
     - Azure PowerShell module (will be installed if missing)
-    - Microsoft Graph PowerShell module if granting Application.Read.All (will be installed if missing)
+    - Microsoft Graph PowerShell module if granting Graph governance permissions (will be installed if missing)
     - Global Administrator, Application Administrator, or appropriate permissions to create service principals
     - Owner on subscriptions, or at tenant root scope (/), for full role-assignment and billing export automation
     - If Owner is not available, User Access Administrator plus Contributor on each selected subscription
       can cover role assignment and storage/export resource creation. User Access Administrator alone cannot create
       Cost Management exports, resource groups, storage accounts, or containers.
-    - Tenant admin consent for Microsoft Graph Application.Read.All if granting Graph governance permissions
+    - Tenant admin consent for Microsoft Graph governance permissions if granting Graph governance permissions
     - Management Group Contributor or Owner role for management group access
     - Billing-scope reader access if reusing Cost Management exports created at an EA/MCA
       billing account, billing profile, invoice section, department, or enrollment scope
@@ -68,6 +69,15 @@ $BILLING_EXPORT_DEFAULT_LOCATION = "australiaeast"
 $COST_EXPORT_API_VERSION = "2025-03-01"
 $BILLING_API_VERSION = "2020-05-01"
 $SPOTTO_BACKFILL_QUEUED_PREFIX = "Spotto backfill queued"
+$GRAPH_GOVERNANCE_PERMISSION_VALUES = @(
+    "Application.Read.All",
+    "RoleAssignmentSchedule.Read.Directory",
+    "RoleEligibilitySchedule.Read.Directory",
+    "RoleManagement.Read.Directory",
+    "GroupMember.Read.All",
+    "User.Read.All",
+    "AuditLog.Read.All"
+)
 $script:ConsolePanelWidth = 80
 
 # Start logging
@@ -211,6 +221,7 @@ $script:reservationReaderStatus = "not-run"
 $script:reservationContributorStatus = "not-run"
 $script:savingsPlanReaderStatus = "not-run"
 $script:graphPermissionStatus = "not-run"
+$script:graphPermissionSummary = ""
 $script:billingExportSetupStatus = "not-run"
 $script:billingScopeExportStatus = "not-run"
 $script:billingExportResults = @()
@@ -2279,7 +2290,7 @@ Write-Host ""
 
 Write-SectionLabel "Recommended and optional prompts"
 Write-DetailRow -Label "Reservations" -Value "Recommended Reservations Contributor for refund quotes and reservation management."
-Write-DetailRow -Label "Microsoft Graph" -Value "Application.Read.All admin consent for governance and credential posture."
+Write-DetailRow -Label "Microsoft Graph" -Value "Admin consent for app, Global Admin/PIM, group, user, and audit visibility."
 Write-DetailRow -Label "Monitoring" -Value "Monitoring Reader and Log Analytics Reader for richer telemetry analysis."
 Write-DetailRow -Label "Billing exports" -Value "Highly recommended daily exports plus 13-month backfill to reduce billing API calls."
 Write-DetailRow -Label "Write permissions" -Value "Custom role for Advisor dismissals and Storage Inventory reports."
@@ -2288,7 +2299,7 @@ Write-Host ""
 Write-SectionLabel "Using Privileged Identity Management (PIM)?"
 Write-Host "  Activate the required eligible roles in Azure Portal before continuing:" -ForegroundColor Yellow
 Write-Host "  1. Microsoft Entra: Application Administrator or Cloud Application Administrator for app setup." -ForegroundColor Yellow
-Write-Host "  2. Graph consent: Privileged Role Administrator or Global Administrator if granting Application.Read.All." -ForegroundColor Yellow
+Write-Host "  2. Graph consent: Privileged Role Administrator or Global Administrator for Global Admin/PIM and audit visibility permissions." -ForegroundColor Yellow
 Write-Host "  3. Subscriptions: Owner, or Contributor plus User Access Administrator, on every selected subscription." -ForegroundColor Yellow
 Write-Host "  4. All subscriptions mode: the same Azure RBAC access at tenant root scope (/)." -ForegroundColor Yellow
 Write-Host "  5. Optional governance: Management Group Contributor or Owner at the root management group." -ForegroundColor Yellow
@@ -2302,7 +2313,7 @@ Write-Host "  - Full automation needs Owner at root scope, or User Access Admini
 Write-Host "  - User Access Administrator alone can assign RBAC but cannot create billing exports or storage." -ForegroundColor Yellow
 Write-Host "  - Global Administrators usually need to enable Microsoft Entra ID > Properties >" -ForegroundColor Yellow
 Write-Host "    Access management for Azure resources, then sign out and sign back in." -ForegroundColor Yellow
-Write-Host "  - Microsoft Graph Application.Read.All requires tenant admin consent if granted." -ForegroundColor Yellow
+Write-Host "  - Microsoft Graph governance permissions require tenant admin consent if granted." -ForegroundColor Yellow
 Write-Host ""
 
 $confirmation = Read-Host "Do you want to continue? (yes/no, default yes)"
@@ -2842,20 +2853,25 @@ if (Test-YesResponse -Value $grantSavingsPlanReader) {
 }
 
 # ============================================================================
-# Step 11: Grant Microsoft Graph Application.Read.All
+# Step 11: Grant Microsoft Graph Governance Permissions
 # ============================================================================
 
-Write-Header -Message "Step 11 of 13: Grant Microsoft Graph Application.Read.All"
+Write-Header -Message "Step 11 of 13: Grant Microsoft Graph Governance Permissions"
 
 Write-SectionLabel "Microsoft Graph governance permission"
-Write-DetailRow -Label "Permission" -Value "Application.Read.All application permission with admin consent."
-Write-DetailRow -Label "Purpose" -Value "Read applications and service principals for governance and credential posture."
+Write-DetailRow -Label "Permissions" -Value "$($GRAPH_GOVERNANCE_PERMISSION_VALUES.Count) Microsoft Graph application permissions with admin consent."
+Write-DetailRow -Label "Purpose" -Value "Read app posture, Global Admin/PIM schedules, groups, users, and audit logs."
 Write-DetailRow -Label "Requires" -Value "Tenant admin consent and Microsoft Graph authentication."
 Write-DetailRow -Label "Admin sign-in scopes" -Value "Application.ReadWrite.All and AppRoleAssignment.ReadWrite.All."
 Write-Host ""
+Write-SectionLabel "Permissions requested"
+foreach ($permissionValue in $GRAPH_GOVERNANCE_PERMISSION_VALUES) {
+    Write-Host "  - $permissionValue" -ForegroundColor White
+}
+Write-Host ""
 Write-Info "Press Enter to accept the default answer of yes."
 
-$grantGraphPermission = Read-Host "Do you want to connect to Microsoft Graph and grant Application.Read.All? (yes/no, default yes)"
+$grantGraphPermission = Read-Host "Do you want to connect to Microsoft Graph and grant these governance permissions? (yes/no, default yes)"
 
 if (Test-YesResponse -Value $grantGraphPermission) {
     if (Ensure-PowerShellModules -Modules $graphRequiredModules -ModuleSetName "Microsoft Graph" -ManualInstallCommands @(
@@ -2864,38 +2880,63 @@ if (Test-YesResponse -Value $grantGraphPermission) {
         $graphConnected = $false
 
         try {
-            Write-Info "Connecting to Microsoft Graph to grant Application.Read.All with admin consent..."
+            Write-Info "Connecting to Microsoft Graph to grant governance permissions with admin consent..."
             Connect-MgGraph -Scopes "Application.ReadWrite.All", "AppRoleAssignment.ReadWrite.All" -TenantId $script:tenantId -NoWelcome
             $graphConnected = $true
 
             # Get Microsoft Graph service principal
-            $graphSp = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'"
+            $graphSp = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'" -Property "id", "appId", "appRoles"
 
-            # Get Application.Read.All application permission
-            $appReadAllPermission = $graphSp.AppRoles | Where-Object { $_.Value -eq "Application.Read.All" }
-
-            if ($null -eq $appReadAllPermission) {
-                $script:graphPermissionStatus = "failed"
-                Write-Error-Custom "Could not find Application.Read.All permission"
-            } else {
-                # Check if permission already granted
-                $existingPermission = Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id |
-                    Where-Object { $_.AppRoleId -eq $appReadAllPermission.Id }
-
-                if ($existingPermission) {
-                    Write-Info "Application.Read.All already granted for governance and credential posture"
-                    $script:graphPermissionStatus = "existing"
-                } else {
-                    # Grant the permission
-                    New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -PrincipalId $sp.Id -ResourceId $graphSp.Id -AppRoleId $appReadAllPermission.Id | Out-Null
-                    Write-Success "Granted Application.Read.All with admin consent for governance and credential posture"
-                    $script:graphPermissionStatus = "created"
+            $graphAppRolesByValue = @{}
+            foreach ($graphAppRole in $graphSp.AppRoles) {
+                if ($graphAppRole.AllowedMemberTypes -contains "Application") {
+                    $graphAppRolesByValue[$graphAppRole.Value] = $graphAppRole
                 }
+            }
+
+            $missingGraphAppRoles = @($GRAPH_GOVERNANCE_PERMISSION_VALUES | Where-Object { -not $graphAppRolesByValue.ContainsKey($_) })
+            if ($missingGraphAppRoles.Count -gt 0) {
+                $script:graphPermissionStatus = "failed"
+                Write-Error-Custom "Could not find Microsoft Graph application permission(s): $($missingGraphAppRoles -join ', ')"
+            } else {
+                $existingAssignments = @(Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -All |
+                    Where-Object { $_.ResourceId -eq $graphSp.Id })
+                $existingAppRoleIds = @{}
+                foreach ($existingAssignment in $existingAssignments) {
+                    $existingAppRoleIds[[string]$existingAssignment.AppRoleId] = $true
+                }
+
+                $createdPermissionCount = 0
+                $existingPermissionCount = 0
+
+                foreach ($permissionValue in $GRAPH_GOVERNANCE_PERMISSION_VALUES) {
+                    $graphAppRole = $graphAppRolesByValue[$permissionValue]
+                    if ($existingAppRoleIds.ContainsKey([string]$graphAppRole.Id)) {
+                        Write-Info "$permissionValue already granted"
+                        $existingPermissionCount++
+                        continue
+                    }
+
+                    New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -PrincipalId $sp.Id -ResourceId $graphSp.Id -AppRoleId $graphAppRole.Id | Out-Null
+                    Write-Success "Granted $permissionValue"
+                    $createdPermissionCount++
+                }
+
+                $script:graphPermissionSummary = "$createdPermissionCount granted, $existingPermissionCount already existed"
+                if ($createdPermissionCount -gt 0 -and $existingPermissionCount -gt 0) {
+                    $script:graphPermissionStatus = "processed"
+                } elseif ($createdPermissionCount -gt 0) {
+                    $script:graphPermissionStatus = "created"
+                } else {
+                    $script:graphPermissionStatus = "existing"
+                }
+
+                Write-Success "Microsoft Graph governance permissions processed: $script:graphPermissionSummary"
             }
 
         } catch {
             $script:graphPermissionStatus = "failed"
-            Write-Error-Custom "Failed to grant Microsoft Graph Application.Read.All: $_"
+            Write-Error-Custom "Failed to grant Microsoft Graph governance permissions: $_"
             Write-Info "You may need a tenant admin to grant admin consent."
             Write-Info "You can also grant this manually through Azure Portal > App Registrations > API Permissions"
         } finally {
@@ -2910,11 +2951,11 @@ if (Test-YesResponse -Value $grantGraphPermission) {
         }
     } else {
         $script:graphPermissionStatus = "skipped"
-        Write-Info "Skipping Microsoft Graph Application.Read.All because the Microsoft Graph modules are unavailable."
+        Write-Info "Skipping Microsoft Graph governance permissions because the Microsoft Graph modules are unavailable."
     }
 } else {
     $script:graphPermissionStatus = "skipped"
-    Write-Info "Skipping Microsoft Graph Application.Read.All. You can grant it later in Azure Portal or rerun this script."
+    Write-Info "Skipping Microsoft Graph governance permissions. You can grant them later in Azure Portal or rerun this script."
 }
 
 # ============================================================================
@@ -3322,11 +3363,12 @@ switch ($script:savingsPlanReaderStatus) {
     default { Write-Skipped "Savings plan Reader was not processed" }
 }
 switch ($script:graphPermissionStatus) {
-    "created" { Write-Success "Microsoft Graph Application.Read.All granted for governance and credential posture" }
-    "existing" { Write-Success "Microsoft Graph Application.Read.All already existed for governance and credential posture" }
-    "failed" { Write-Error-Custom "Microsoft Graph Application.Read.All was not granted" }
-    "skipped" { Write-Skipped "Microsoft Graph Application.Read.All skipped" }
-    default { Write-Skipped "Microsoft Graph Application.Read.All was not processed" }
+    "created" { Write-Success "Microsoft Graph governance permissions granted for Global Admin/PIM, audit, and posture visibility ($script:graphPermissionSummary)" }
+    "existing" { Write-Success "Microsoft Graph governance permissions already existed for Global Admin/PIM, audit, and posture visibility ($script:graphPermissionSummary)" }
+    "processed" { Write-Success "Microsoft Graph governance permissions processed for Global Admin/PIM, audit, and posture visibility ($script:graphPermissionSummary)" }
+    "failed" { Write-Error-Custom "Microsoft Graph governance permissions were not fully granted" }
+    "skipped" { Write-Skipped "Microsoft Graph governance permissions skipped" }
+    default { Write-Skipped "Microsoft Graph governance permissions were not processed" }
 }
 switch ($script:billingExportSetupStatus) {
     "processed" { Write-Success "Cost Management billing exports processed" }
@@ -3374,13 +3416,13 @@ if ($grantWritePerms -eq "yes") {
 }
 Write-Host ""
 Write-Host "Propagation note:" -ForegroundColor Yellow
-if ($script:graphPermissionStatus -in @("created", "existing")) {
+if ($script:graphPermissionStatus -in @("created", "existing", "processed")) {
     Write-Host "  Azure RBAC changes and Microsoft Graph admin consent can take 5-15 minutes to apply." -ForegroundColor Yellow
-    Write-Host "  During that time, Spotto may validate the account or list subscriptions while tenant governance data still shows access denied." -ForegroundColor Yellow
+    Write-Host "  During that time, Spotto may validate the account or list subscriptions while Global Admin/PIM, audit, or governance data still shows access denied." -ForegroundColor Yellow
     Write-Host "  If that happens, wait a few minutes and rerun validation or retry the tenant sync." -ForegroundColor Yellow
 } else {
     Write-Host "  Azure RBAC changes can take 5-15 minutes to apply." -ForegroundColor Yellow
-    Write-Host "  Microsoft Graph Application.Read.All was not granted, so application and service principal posture may show access denied." -ForegroundColor Yellow
+    Write-Host "  Microsoft Graph governance permissions were not granted, so Global Admin/PIM, audit, group, user, and posture data may show access denied." -ForegroundColor Yellow
     Write-Host "  You can grant Graph consent manually or rerun this script and choose yes for Step 11." -ForegroundColor Yellow
 }
 
