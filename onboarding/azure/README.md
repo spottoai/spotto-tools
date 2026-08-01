@@ -27,7 +27,8 @@ The script performs the following actions:
     *   Continues with per-subscription exports as a fallback unless you explicitly confirm the billing-scope export covers all selected subscriptions and datasets.
     *   Skips export setup with a friendly warning when Cost Management exports are unavailable for a subscription offer, billing scope, or dataset.
 10.  (Optional) Creates and assigns a custom role for **write permissions** (Advisor recommendations, Storage inventory).
-11. Outputs the credentials needed to configure Spotto again at completion.
+11.  (Separately optional) Creates a least-privilege **Azure Policy exemption** role on selected subscriptions and, only after a second confirmation, an action-only role at selected management-group assignment scopes.
+12. Outputs the credentials needed to configure Spotto again at completion.
 
 You can safely rerun the script if validation needs more time, permissions change, or you need to retry a failed step. It checks for existing Spotto resources, role assignments, storage containers, and export definitions, then reuses or updates them where possible.
 
@@ -38,7 +39,7 @@ Before running the script, ensure you have:
 *   **PowerShell 5.1** or **PowerShell 7+**
 *   **Azure Account Permissions**:
     *   **Global Administrator** or **Application Administrator** (to create the Service Principal).
-    *   **Owner** or **User Access Administrator** on the subscriptions you want to onboard, or at tenant root scope (`/`) if you choose **All subscriptions**.
+    *   A role with `Microsoft.Authorization/roleAssignments/write`, such as **Owner**, **User Access Administrator**, or **Role Based Access Control Administrator**, on the subscriptions you want to onboard, or at tenant root scope (`/`) if you choose **All subscriptions**.
     *   If you choose **All subscriptions** and want the script to assign **Reader** at tenant root scope (`/`), a **Global Administrator** typically needs to enable **Microsoft Entra ID** > **Properties** > **Access management for Azure resources**, then sign out and sign back in before running the script.
     *   A tenant admin able to grant Microsoft Graph governance permissions with admin consent, if you choose to grant Graph governance permissions.
     *   Highly recommended billing export setup requires rights to manage Cost Management exports, storage accounts, blob containers, and `Storage Blob Data Reader` role assignments.
@@ -47,7 +48,7 @@ Before running the script, ensure you have:
 *   **Privileged Identity Management (PIM)**:
     *   Activate the Microsoft Entra role used for app registration work, such as Application Administrator, before starting the script.
     *   Activate Privileged Role Administrator or Global Administrator before the Graph consent step if you want Spotto to see Global Admin/PIM role schedules and audit context.
-    *   Activate the Azure RBAC role used for role assignments, such as Owner or User Access Administrator at the selected subscription/root scope, before starting the script.
+    *   Activate the Azure RBAC role used for role assignments, such as Owner, User Access Administrator, or Role Based Access Control Administrator at the selected subscription/root scope, before starting the script.
     *   If you activate PIM after signing in, reconnect with `Disconnect-AzAccount` then `Connect-AzAccount -TenantId <tenantId>` so the PowerShell session receives fresh permissions.
     *   Make sure the activation window is long enough for the selected role and export steps. The script is idempotent, so it can be rerun after reactivating PIM.
 *   **PowerShell Modules** (the script will attempt to install these if missing):
@@ -61,12 +62,10 @@ Before running the script, ensure you have:
 ## Required Permissions by Scope
 
 *   **App registration**: Global Administrator or Application Administrator.
-*   **Subscription Reader assignments**: Owner or User Access Administrator on each selected subscription.
-*   **Tenant root Reader assignment for All subscriptions**: Owner or User Access Administrator at root scope (`/`). Global Administrators usually get this by enabling **Access management for Azure resources** in Microsoft Entra ID.
-*   **Reader at the root management group**: Management Group Contributor or Owner at the root management group.
-*   **Management Group Reader at the root management group**: Management Group Contributor or Owner at the root management group.
-*   **Log Analytics Reader at the root management group for All subscriptions**: Management Group Contributor or Owner at the root management group.
-*   **Log Analytics Reader on selected subscriptions**: Owner or User Access Administrator on each selected subscription if you are not using tenant-wide onboarding.
+*   **Subscription Reader assignments**: `Microsoft.Authorization/roleAssignments/write` on each selected subscription, such as Owner, User Access Administrator, or Role Based Access Control Administrator.
+*   **Tenant root Reader assignment for All subscriptions**: `Microsoft.Authorization/roleAssignments/write` at root scope (`/`). Global Administrators usually get this by enabling **Access management for Azure resources** in Microsoft Entra ID.
+*   **Reader, Management Group Reader, and Log Analytics Reader at the root management group**: `Microsoft.Authorization/roleAssignments/write` at that management group, such as Owner, User Access Administrator, or Role Based Access Control Administrator. Management Group Contributor alone cannot assign Azure RBAC access.
+*   **Log Analytics Reader on selected subscriptions**: `Microsoft.Authorization/roleAssignments/write` on each selected subscription if you are not using tenant-wide onboarding.
 *   **Reservations Reader**: Permission to assign the role at `/providers/Microsoft.Capacity`.
 *   **Reservations Contributor**: Recommended permission to assign the role at `/providers/Microsoft.Capacity` so Spotto can calculate reservation refund quotes and support reservation management workflows. The script defaults to assigning it, but if this is skipped or fails, onboarding continues with read-only reservation access.
 *   **Savings plan Reader**: Permission to assign the role at `/providers/Microsoft.BillingBenefits`.
@@ -87,6 +86,8 @@ Before running the script, ensure you have:
 *   **Billing export storage**: Permission to create or update the selected storage account and container, plus Owner or User Access Administrator permission to assign **Storage Blob Data Reader** at the container scope.
     *   Spotto authenticates with the service principal, so anonymous blob access should stay disabled.
     *   The storage account still needs a reachable public network endpoint. If public network access is disabled or the firewall blocks Spotto, RBAC permissions are not enough for Spotto cloud-engine to read the export.
+*   **Policy exemption target**: `Microsoft.Authorization/roleDefinitions/write` and `Microsoft.Authorization/roleAssignments/write` on each selected subscription. Owner or User Access Administrator provides both; Role Based Access Control Administrator alone cannot create the custom role definition. The role assigned to Spotto contains `Microsoft.Authorization/policyExemptions/write` and `Microsoft.Authorization/policyAssignments/exempt/action` only.
+*   **Inherited policy assignment**: the same role-definition and role-assignment write permissions at every management group you explicitly select. Azure permits only one management group in each custom role's assignable scopes; every generated role contains `Microsoft.Authorization/policyAssignments/exempt/action` only.
 
 ## Usage
 
@@ -148,6 +149,11 @@ The script is interactive and will guide you through the process:
 11. **Optional Write Permissions**: You will be asked if you want to grant optional write permissions for:
     *   Dismissing Azure Advisor recommendations.
     *   Enabling Storage Inventory reports.
+12. **Azure Policy Exemptions (Separate Consent)**: You will be asked independently whether Spotto may create scoped policy exemptions on the selected subscriptions.
+    *   Direct subscription assignments need only the subscription role.
+    *   Inherited initiatives also need the assignment action at the management group that owns the assignment.
+    *   The management-group selector defaults to none and displays the exact scopes and action before a final confirmation.
+    *   Answering no leaves regulatory compliance read-only and does not change Advisor/Storage permissions.
 
 ## Output
 
@@ -169,7 +175,7 @@ Upon successful completion, the script will display the credentials you need to 
     Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
     ```
     This allows scripts to run for the current PowerShell session only. The policy resets to its default when you close the terminal window.
-*   **Permission Errors**: If you see errors regarding role assignments, ensure your user account has `Owner` or `User Access Administrator` rights on the target subscriptions. If you selected **All subscriptions**, ensure you also have that access at tenant root scope (`/`). The management group and billing-scope role assignments also need rights at those scopes.
+*   **Permission Errors**: If you see errors regarding role assignments, ensure your user account has `Microsoft.Authorization/roleAssignments/write`, such as through Owner, User Access Administrator, or Role Based Access Control Administrator, on the target subscriptions. If you selected **All subscriptions**, ensure you also have that access at tenant root scope (`/`). The management group and billing-scope role assignments also need rights at those scopes.
 *   **PIM activated but the script still gets Forbidden**: Reconnect after activation with `Disconnect-AzAccount` and `Connect-AzAccount -TenantId <tenantId>`, then rerun the script. Azure RBAC changes can take several minutes to become visible to all Azure Resource Manager calls.
 *   **Root scope Reader assignment failed**: If the script says it could not assign **Reader** at tenant root scope (`/`), and you are a Global Administrator, enable **Microsoft Entra ID** > **Properties** > **Access management for Azure resources**, sign out, sign back in, and rerun the script. If you cannot get root-scope access, rerun the script and choose specific subscriptions instead.
 *   **"Please provide a valid tenant or a valid subscription"**: Re-authenticate for the tenant shown in the warning:
@@ -177,7 +183,7 @@ Upon successful completion, the script will display the credentials you need to 
     Connect-AzAccount -TenantId <tenantId>
     ```
     Then re-run the script and select the affected subscriptions.
-*   **Root management group Reader or Management Group Reader failed**: Confirm management groups are enabled and that you have `Management Group Contributor` or `Owner` at the root management group. If not, assign the missing role manually in **Azure Portal > Management Groups**.
+*   **Root management group Reader or Management Group Reader failed**: Confirm management groups are enabled and that you have `Microsoft.Authorization/roleAssignments/write` at the root management group. Owner, User Access Administrator, or Role Based Access Control Administrator can provide it; Management Group Contributor alone cannot assign access. If needed, assign the missing role manually in **Azure Portal > Management Groups**.
 *   **Tenant governance, Global Admin/PIM, or audit data shows "access denied" after onboarding**: Wait 5-15 minutes and retry first, because tenant-scope RBAC and Microsoft Graph consent can lag behind the script output. If the error remains, confirm both **Reader** and **Management Group Reader** are assigned at the root management group, confirm all Microsoft Graph governance permissions show admin consent granted if you chose the Graph step, and confirm the service principal received the intended tenant/root-scope access rather than subscription-only assignments.
 *   **Log Analytics Reader failed**: Confirm you have permission to assign roles at the root management group for tenant-wide onboarding, or at each selected subscription for per-subscription onboarding. If needed, assign **Log Analytics Reader** manually and rerun the script.
 *   **Reservations Reader / Savings plan Reader failed**: Your account lacks permission at the billing provider scopes `/providers/Microsoft.Capacity` or `/providers/Microsoft.BillingBenefits`. Ask a tenant admin to assign these roles manually if needed.
@@ -189,6 +195,7 @@ Upon successful completion, the script will display the credentials you need to 
 *   **Billing export storage access failed**: Confirm the storage account allows access through the public endpoint, anonymous blob access is disabled, and the Spotto service principal has **Storage Blob Data Reader** on the export container. If public network access is disabled or a firewall blocks access, Spotto cloud-engine cannot read the blobs even when RBAC is correct.
 *   **"Forbidden" role assignment errors**: Your account lacks permission at that scope (subscription, root management group, or tenant billing scopes). Ask a tenant admin or subscription owner to run the script or assign the roles manually.
 *   **"Conflict" during custom role creation**: The custom role already exists in the tenant. This is safe to ignore; re-run the script if you need to assign it to more subscriptions.
+*   **Policy exemption returns Forbidden**: Confirm the service principal has `policyExemptions/write` at the exemption target and `policyAssignments/exempt/action` at the selected assignment scope. For inherited initiatives, the latter is normally a management-group scope. Wait for RBAC propagation, then retry.
 *   **Module Errors**: If module installation fails, try running PowerShell as Administrator or install them manually:
     ```powershell
     Install-Module -Name Az -Scope CurrentUser -Force
@@ -198,3 +205,9 @@ Upon successful completion, the script will display the credentials you need to 
 ## Security Note
 
 The script is designed to be **idempotent**. You can run it multiple times safely to update permissions or rotate secrets without creating duplicate service principals.
+
+Policy exemption access is never enabled by the Advisor/Storage answer. The legacy Advisor/Storage role reconciliation adds missing Spotto-managed actions and scopes while preserving any additional actions already present on that role. To roll back policy access, remove the policy custom-role assignments (and definitions when no longer used); existing exemption resources are not deleted.
+
+Policy-specific role reconciliation fails closed if a role with the expected Spotto name already contains unrelated actions or, for an inherited-assignment role, another management-group scope. Review that role manually instead of allowing the script to extend broader access.
+
+Run `./Setup-SpottoAzure.PolicyExemptions.Tests.ps1` to execute the native policy-role reconciliation regression tests without contacting Azure.
