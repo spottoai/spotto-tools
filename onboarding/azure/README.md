@@ -194,7 +194,7 @@ Upon successful completion, the script will display the credentials you need to 
 *   **Cost Management exports unavailable**: The selected subscription offer, billing scope, or dataset does not expose Cost Management exports. This can be expected for unsupported offers, some newly created subscriptions while Cost Management data is still becoming available, or amortized datasets that are not available for that scope. The script skips those exports and continues onboarding.
 *   **Billing export storage access failed**: Confirm the storage account allows access through the public endpoint, anonymous blob access is disabled, and the Spotto service principal has **Storage Blob Data Reader** on the export container. If public network access is disabled or a firewall blocks access, Spotto cloud-engine cannot read the blobs even when RBAC is correct.
 *   **"Forbidden" role assignment errors**: Your account lacks permission at that scope (subscription, root management group, or tenant billing scopes). Ask a tenant admin or subscription owner to run the script or assign the roles manually.
-*   **"Conflict" during custom role creation**: The custom role already exists in the tenant. This is safe to ignore; re-run the script if you need to assign it to more subscriptions.
+*   **"Conflict" during custom role creation**: Do not ignore this result because the requested assignment was not completed. Update to the latest script and rerun it. Policy-exemption roles use deterministic scope-specific names so an existing role on another subscription does not collide with the selected scope.
 *   **Policy exemption returns Forbidden**: Confirm the service principal has `policyExemptions/write` at the exemption target and `policyAssignments/exempt/action` at the selected assignment scope. For inherited initiatives, the latter is normally a management-group scope. Wait for RBAC propagation, then retry.
 *   **Module Errors**: If module installation fails, try running PowerShell as Administrator or install them manually:
     ```powershell
@@ -206,7 +206,7 @@ Upon successful completion, the script will display the credentials you need to 
 
 The script is designed to be **idempotent**. You can run it multiple times safely to update permissions or rotate secrets without creating duplicate service principals.
 
-Policy exemption access is never enabled by the Advisor/Storage answer. The legacy Advisor/Storage role reconciliation adds missing Spotto-managed actions and scopes while preserving any additional actions already present on that role. To roll back policy access, remove the policy custom-role assignments (and definitions when no longer used); existing exemption resources are not deleted.
+Policy exemption access is never enabled by the Advisor/Storage answer. New Advisor/Storage and policy roles use deterministic scope-specific names and fail closed if a same-name role contains unrelated actions, exclusions, or assignable scopes. Existing legacy roles are not deleted automatically; remove them only after verifying the replacement assignments. To roll back policy access, remove the policy custom-role assignments (and definitions when no longer used); existing exemption resources are not deleted.
 
 Policy-specific role reconciliation fails closed if a role with the expected Spotto name already contains unrelated actions or, for an inherited-assignment role, another management-group scope. Review that role manually instead of allowing the script to extend broader access.
 

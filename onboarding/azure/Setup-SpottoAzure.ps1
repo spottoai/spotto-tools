@@ -68,7 +68,6 @@ $LEGACY_APP_NAMES = @("Spotto AI")
 $APP_LOOKUP_NAMES = @($APP_NAME) + $LEGACY_APP_NAMES
 $CUSTOM_ROLE_NAME = "Spotto Access"
 $POLICY_EXEMPTION_ROLE_NAME = "Spotto Policy Exemptions"
-$POLICY_ASSIGNMENT_EXEMPT_ROLE_NAME = "Spotto Policy Assignment Exempt"
 $BILLING_EXPORT_CONTAINER_NAME = "spotto-cost-exports"
 $BILLING_EXPORT_ROOT_PATH = "spotto"
 $BILLING_EXPORT_DEFAULT_LOCATION = "australiaeast"
@@ -3211,6 +3210,58 @@ if (Test-YesResponse -Value $configureBillingExports) {
 # Step 13: Optional Custom Roles
 # ============================================================================
 
+function Get-ScopedCustomRoleName {
+    param(
+        [string]$BaseName,
+        [string]$Scope
+    )
+
+    $normalizedScope = $Scope.Trim().TrimEnd('/').ToLowerInvariant()
+    $scopeHasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $scopeBytes = [System.Text.Encoding]::UTF8.GetBytes($normalizedScope)
+        $scopeHash = ([System.BitConverter]::ToString($scopeHasher.ComputeHash($scopeBytes))).Replace("-", "").ToLowerInvariant().Substring(0, 10)
+    } finally {
+        $scopeHasher.Dispose()
+    }
+
+    return "$BaseName - $scopeHash"
+}
+
+function Get-PolicyExemptionRoleName {
+    param([string]$Scope)
+
+    return Get-ScopedCustomRoleName -BaseName $POLICY_EXEMPTION_ROLE_NAME -Scope $Scope
+}
+
+function Find-CustomRoleDefinition {
+    param(
+        [string]$RoleName,
+        [string[]]$Scopes
+    )
+
+    foreach ($lookupScope in $Scopes) {
+        $role = Get-AzRoleDefinition `
+            -Name $RoleName `
+            -Scope $lookupScope `
+            -SkipClientSideScopeValidation `
+            -WarningAction SilentlyContinue `
+            -ErrorAction SilentlyContinue
+        if ($role) {
+            return $role
+        }
+    }
+
+    return $null
+}
+
+function Test-RoleDefinitionConflict {
+    param($ErrorRecord)
+
+    $statusCode = $ErrorRecord.Exception.Response.StatusCode
+    return $statusCode -eq 409 -or $statusCode.value__ -eq 409 -or $ErrorRecord.Exception.Message -match '(?i)\bConflict\b'
+}
+
 function Ensure-SpottoCustomRoleAssignments {
     param(
         [string]$RoleName,
@@ -3231,23 +3282,43 @@ function Ensure-SpottoCustomRoleAssignments {
     }
 
     try {
-        $role = Get-AzRoleDefinition -Name $RoleName -ErrorAction SilentlyContinue
+        $role = Find-CustomRoleDefinition -RoleName $RoleName -Scopes $normalizedScopes
         if (-not $role) {
-            $role = New-AzRoleDefinition -Role @{
-                Name = $RoleName
-                Description = $Description
-                Actions = @($Actions)
-                AssignableScopes = $normalizedScopes
+            try {
+                $role = New-AzRoleDefinition -Role @{
+                    Name = $RoleName
+                    Description = $Description
+                    Actions = @($Actions)
+                    AssignableScopes = $normalizedScopes
+                }
+                Write-Success "Created custom role '$RoleName'."
+            } catch {
+                if (-not (Test-RoleDefinitionConflict -ErrorRecord $_)) {
+                    throw
+                }
+
+                Write-Info "Custom role '$RoleName' exists but is still propagating. Waiting for Azure to return it."
+                for ($attempt = 1; $attempt -le 12 -and -not $role; $attempt++) {
+                    Start-Sleep -Seconds 5
+                    $role = Find-CustomRoleDefinition -RoleName $RoleName -Scopes $normalizedScopes
+                }
+                if (-not $role) {
+                    throw
+                }
             }
-            Write-Success "Created custom role '$RoleName'."
-            Start-Sleep -Seconds 10
-        } else {
+        }
+
+        if ($role) {
             $unexpectedActions = @($role.Actions |
                 Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $Actions -notcontains $_ })
             $unexpectedDataActions = @($role.DataActions |
                 Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-            if ($RejectUnexpectedActions -and ($unexpectedActions.Count -gt 0 -or $unexpectedDataActions.Count -gt 0)) {
-                Write-Error-Custom "Custom role '$RoleName' contains permissions outside the Spotto policy-exemption action set."
+            $unexpectedNotActions = @($role.NotActions |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            $unexpectedNotDataActions = @($role.NotDataActions |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            if ($RejectUnexpectedActions -and ($unexpectedActions.Count -gt 0 -or $unexpectedDataActions.Count -gt 0 -or $unexpectedNotActions.Count -gt 0 -or $unexpectedNotDataActions.Count -gt 0)) {
+                Write-Error-Custom "Custom role '$RoleName' contains permissions or exclusions outside the requested Spotto action set."
                 Write-Info "Review the existing role manually. The script will not extend or assign a broader role to additional scopes."
                 return [PSCustomObject]@{ Status = "failed"; Created = 0; Existing = 0; Failed = $normalizedScopes.Count }
             }
@@ -3288,16 +3359,52 @@ function Ensure-SpottoCustomRoleAssignments {
     $created = 0
     $existing = 0
     $failed = 0
+    $roleDefinitionId = ([string]$role.Id).Trim().TrimEnd('/').Split('/')[-1]
+    if ([string]::IsNullOrWhiteSpace($roleDefinitionId)) {
+        Write-Error-Custom "Custom role '$RoleName' did not return a usable role definition ID."
+        return [PSCustomObject]@{ Status = "failed"; Created = 0; Existing = 0; Failed = $normalizedScopes.Count }
+    }
     foreach ($scope in $normalizedScopes) {
         try {
-            $assignment = Get-AzRoleAssignment -ObjectId $PrincipalId -RoleDefinitionName $RoleName -Scope $scope -ErrorAction SilentlyContinue
+            $assignment = Get-AzRoleAssignment `
+                -ObjectId $PrincipalId `
+                -RoleDefinitionId $roleDefinitionId `
+                -Scope $scope `
+                -AtScope `
+                -SkipClientSideScopeValidation `
+                -ErrorAction SilentlyContinue
             if ($assignment) {
                 Write-Info "Custom role '$RoleName' is already assigned at $scope."
                 $existing++
             } else {
-                New-AzRoleAssignment -ObjectId $PrincipalId -RoleDefinitionName $RoleName -Scope $scope | Out-Null
-                Write-Success "Assigned '$RoleName' at $scope."
-                $created++
+                $assignmentCreated = $false
+                $assignmentAlreadyExists = $false
+                for ($attempt = 1; $attempt -le 12 -and -not $assignmentCreated; $attempt++) {
+                    try {
+                        New-AzRoleAssignment `
+                            -ObjectId $PrincipalId `
+                            -RoleDefinitionId $roleDefinitionId `
+                            -Scope $scope `
+                            -SkipClientSideScopeValidation | Out-Null
+                        $assignmentCreated = $true
+                    } catch {
+                        if ($_.Exception.Message -match '(?i)(RoleAssignmentExists|role assignment already exists)') {
+                            $assignmentAlreadyExists = $true
+                            $assignmentCreated = $true
+                        } elseif ($attempt -eq 12 -or $_.Exception.Message -notmatch '(?i)(cannot find role definition|could not be found|not found)') {
+                            throw
+                        } else {
+                            Start-Sleep -Seconds 5
+                        }
+                    }
+                }
+                if ($assignmentAlreadyExists) {
+                    Write-Info "Custom role '$RoleName' is already assigned at $scope."
+                    $existing++
+                } else {
+                    Write-Success "Assigned '$RoleName' at $scope."
+                    $created++
+                }
             }
         } catch {
             Write-Error-Custom "Failed to assign '$RoleName' at ${scope}: $_"
@@ -3376,18 +3483,32 @@ $grantWritePerms = Read-Host "Do you want to grant these optional write permissi
 
 if ($grantWritePerms -eq "yes") {
     $subscriptionWriteScopes = @($selectedSubscriptions | ForEach-Object { "/subscriptions/$($_.Id)" })
-    $script:optionalWriteRoleResult = Ensure-SpottoCustomRoleAssignments `
-        -RoleName $CUSTOM_ROLE_NAME `
-        -Description "Custom role for Spotto to manage Azure Advisor recommendations and Storage inventory" `
-        -Actions @(
-            "Microsoft.Advisor/recommendations/write",
-            "Microsoft.Advisor/recommendations/suppressions/write",
-            "Microsoft.Advisor/recommendations/suppressions/delete",
-            "Microsoft.Storage/storageAccounts/inventoryPolicies/write",
-            "Microsoft.Storage/storageAccounts/inventoryPolicies/read"
-        ) `
-        -Scopes $subscriptionWriteScopes `
-        -PrincipalId $sp.Id
+    $optionalWriteRoleResults = foreach ($scope in $subscriptionWriteScopes) {
+        Ensure-SpottoCustomRoleAssignments `
+            -RoleName (Get-ScopedCustomRoleName -BaseName $CUSTOM_ROLE_NAME -Scope $scope) `
+            -Description "Custom role for Spotto to manage Azure Advisor recommendations and Storage inventory" `
+            -Actions @(
+                "Microsoft.Advisor/recommendations/write",
+                "Microsoft.Advisor/recommendations/suppressions/write",
+                "Microsoft.Advisor/recommendations/suppressions/delete",
+                "Microsoft.Storage/storageAccounts/inventoryPolicies/write",
+                "Microsoft.Storage/storageAccounts/inventoryPolicies/read"
+            ) `
+            -Scopes @($scope) `
+            -PrincipalId $sp.Id `
+            -RejectUnexpectedActions `
+            -RejectUnexpectedScopes
+    }
+    $optionalWriteCreated = [int](($optionalWriteRoleResults | Measure-Object -Property Created -Sum).Sum)
+    $optionalWriteExisting = [int](($optionalWriteRoleResults | Measure-Object -Property Existing -Sum).Sum)
+    $optionalWriteFailed = [int](($optionalWriteRoleResults | Measure-Object -Property Failed -Sum).Sum)
+    $optionalWriteStatus = if ($optionalWriteFailed -eq 0) { "processed" } elseif (($optionalWriteCreated + $optionalWriteExisting) -gt 0) { "partial" } else { "failed" }
+    $script:optionalWriteRoleResult = [PSCustomObject]@{
+        Status = $optionalWriteStatus
+        Created = $optionalWriteCreated
+        Existing = $optionalWriteExisting
+        Failed = $optionalWriteFailed
+    }
     Write-Info "Summary: $($script:optionalWriteRoleResult.Created) new assignments, $($script:optionalWriteRoleResult.Existing) already existed, $($script:optionalWriteRoleResult.Failed) failed"
 } else {
     Write-Info "Skipping optional write permissions"
@@ -3403,16 +3524,35 @@ $script:policyAssignmentExemptRoleResult = [PSCustomObject]@{ Status = "skipped"
 
 if ($grantPolicyExemptionPerms -eq "yes") {
     $subscriptionPolicyScopes = @($selectedSubscriptions | ForEach-Object { "/subscriptions/$($_.Id)" })
-    $script:policyExemptionRoleResult = Ensure-SpottoCustomRoleAssignments `
-        -RoleName $POLICY_EXEMPTION_ROLE_NAME `
-        -Description "Custom role for Spotto to create narrowly scoped Azure Policy exemptions" `
-        -Actions @(
-            "Microsoft.Authorization/policyExemptions/write",
-            "Microsoft.Authorization/policyAssignments/exempt/action"
-        ) `
-        -Scopes $subscriptionPolicyScopes `
-        -PrincipalId $sp.Id `
-        -RejectUnexpectedActions
+    $subscriptionPolicyRoleResults = foreach ($scope in $subscriptionPolicyScopes) {
+        Ensure-SpottoCustomRoleAssignments `
+            -RoleName (Get-PolicyExemptionRoleName -Scope $scope) `
+            -Description "Custom role for Spotto to create narrowly scoped Azure Policy exemptions" `
+            -Actions @(
+                "Microsoft.Authorization/policyExemptions/write",
+                "Microsoft.Authorization/policyAssignments/exempt/action"
+            ) `
+            -Scopes @($scope) `
+            -PrincipalId $sp.Id `
+            -RejectUnexpectedActions `
+            -RejectUnexpectedScopes
+    }
+    $subscriptionPolicyCreated = [int](($subscriptionPolicyRoleResults | Measure-Object -Property Created -Sum).Sum)
+    $subscriptionPolicyExisting = [int](($subscriptionPolicyRoleResults | Measure-Object -Property Existing -Sum).Sum)
+    $subscriptionPolicyFailed = [int](($subscriptionPolicyRoleResults | Measure-Object -Property Failed -Sum).Sum)
+    $subscriptionPolicyStatus = if ($subscriptionPolicyFailed -eq 0) {
+        "processed"
+    } elseif (($subscriptionPolicyCreated + $subscriptionPolicyExisting) -gt 0) {
+        "partial"
+    } else {
+        "failed"
+    }
+    $script:policyExemptionRoleResult = [PSCustomObject]@{
+        Status = $subscriptionPolicyStatus
+        Created = $subscriptionPolicyCreated
+        Existing = $subscriptionPolicyExisting
+        Failed = $subscriptionPolicyFailed
+    }
 
     Write-Host ""
     Write-Info "Initiatives inherited from a management group need the assignment action at that exact management-group scope."
@@ -3428,16 +3568,9 @@ if ($grantPolicyExemptionPerms -eq "yes") {
             $confirmManagementGroupScopes = Read-Host "Grant this action at the listed scopes? (yes/no, default no)"
             if ($confirmManagementGroupScopes -eq "yes") {
                 $managementGroupRoleResults = foreach ($scope in $managementGroupScopes) {
-                    $scopeHasher = [System.Security.Cryptography.SHA256]::Create()
-                    try {
-                        $scopeBytes = [System.Text.Encoding]::UTF8.GetBytes($scope.ToLowerInvariant())
-                        $scopeHash = ([System.BitConverter]::ToString($scopeHasher.ComputeHash($scopeBytes))).Replace("-", "").Substring(0, 8)
-                    } finally {
-                        $scopeHasher.Dispose()
-                    }
                     # Azure allows only one management group in a custom role's assignable scopes.
                     Ensure-SpottoCustomRoleAssignments `
-                        -RoleName "$POLICY_ASSIGNMENT_EXEMPT_ROLE_NAME $scopeHash" `
+                        -RoleName (Get-PolicyExemptionRoleName -Scope $scope) `
                         -Description "Allows Spotto to exempt explicitly selected inherited Azure Policy assignments" `
                         -Actions @("Microsoft.Authorization/policyAssignments/exempt/action") `
                         -Scopes @($scope) `
