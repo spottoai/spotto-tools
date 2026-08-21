@@ -84,6 +84,7 @@ $GRAPH_GOVERNANCE_PERMISSION_VALUES = @(
     "AuditLog.Read.All"
 )
 $script:ConsolePanelWidth = 80
+$script:operatorElevatedExportScopes = @()
 
 # Start logging
 $logPath = "SpottoSetup-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
@@ -655,10 +656,90 @@ function Test-SelectedSubscriptionRoleAssignmentAccess {
     return $false
 }
 
+function Get-SignedInPrincipalObjectId {
+    try {
+        $context = Get-AzContext
+        if ($context -and $context.Account -and $context.Account.Type -eq "ServicePrincipal") {
+            $servicePrincipal = Get-AzADServicePrincipal -ApplicationId $context.Account.Id -ErrorAction Stop
+            if ($servicePrincipal) {
+                return $servicePrincipal.Id
+            }
+        }
+
+        $signedInUser = Get-AzADUser -SignedIn -ErrorAction Stop
+        if ($signedInUser) {
+            return $signedInUser.Id
+        }
+    } catch {
+        Write-Info "Unable to resolve the signed-in principal object ID. $_"
+    }
+
+    return $null
+}
+
+function Test-RootScopeRoleAssignmentGrantsAction {
+    param(
+        [string]$PrincipalObjectId,
+        [string]$RequiredAction
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PrincipalObjectId) -or [string]::IsNullOrWhiteSpace($RequiredAction)) {
+        return $false
+    }
+
+    try {
+        # assignedTo() also matches assignments granted through the principal's group memberships.
+        $filter = [uri]::EscapeDataString("atScope() and assignedTo('$PrincipalObjectId')")
+        $assignmentsResponse = Invoke-AzRestGetJson -Path "/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&`$filter=$filter"
+        foreach ($assignment in @($assignmentsResponse.value)) {
+            if (-not $assignment.properties -or $assignment.properties.scope -ne "/") {
+                continue
+            }
+
+            $roleDefinition = Invoke-AzRestGetJson -Path "$($assignment.properties.roleDefinitionId)?api-version=2022-04-01"
+            if (-not $roleDefinition -or -not $roleDefinition.properties) {
+                continue
+            }
+
+            foreach ($permission in @($roleDefinition.properties.permissions)) {
+                $isAllowed = $false
+                foreach ($action in @($permission.actions)) {
+                    if (Test-AzureActionMatchesPattern -RequiredAction $RequiredAction -ActionPattern $action) {
+                        $isAllowed = $true
+                        break
+                    }
+                }
+
+                if (-not $isAllowed) {
+                    continue
+                }
+
+                foreach ($notAction in @($permission.notActions)) {
+                    if (Test-AzureActionMatchesPattern -RequiredAction $RequiredAction -ActionPattern $notAction) {
+                        $isAllowed = $false
+                        break
+                    }
+                }
+
+                if ($isAllowed) {
+                    return $true
+                }
+            }
+        }
+    } catch {
+        Write-Info "Unable to confirm '$RequiredAction' at tenant root scope (/). $_"
+    }
+
+    return $false
+}
+
 function Test-TenantRootRoleAssignmentAccess {
     Write-SectionLabel "Validating tenant root role-assignment access"
 
-    if (Test-AzurePermissionActionAtScope -Scope "/" -RequiredAction "Microsoft.Authorization/roleAssignments/write") {
+    # The Microsoft.Authorization/permissions API is not available at tenant root scope (/),
+    # so validate against the signed-in principal's root-scope role assignments instead.
+    $principalObjectId = Get-SignedInPrincipalObjectId
+    if (Test-RootScopeRoleAssignmentGrantsAction -PrincipalObjectId $principalObjectId -RequiredAction "Microsoft.Authorization/roleAssignments/write") {
         Write-Success "Validated role assignment access at tenant root scope (/)"
         return $true
     }
@@ -1592,6 +1673,48 @@ function Get-AccessibleBillingCostScopes {
     return @($scopes)
 }
 
+function Expand-SelectionToken {
+    param(
+        [string]$Token,
+        [int]$MaxValue,
+        [bool]$AllowAll = $true
+    )
+
+    # Returns 1-based indices for index-like tokens ("all", "7", "3-5"),
+    # an empty array for index-like but out-of-range tokens,
+    # and $null for tokens that are not index-like (e.g. pasted scope IDs).
+    if ([string]::IsNullOrWhiteSpace($Token)) {
+        return $null
+    }
+
+    $trimmed = $Token.Trim()
+
+    if ($AllowAll -and $trimmed -match "^(?i)all$") {
+        return @(1..$MaxValue)
+    }
+
+    if ($trimmed -match "^(\d+)\s*-\s*(\d+)$") {
+        $rangeStart = [int]$Matches[1]
+        $rangeEnd = [int]$Matches[2]
+        if ($rangeStart -ge 1 -and $rangeEnd -le $MaxValue -and $rangeStart -le $rangeEnd) {
+            return @($rangeStart..$rangeEnd)
+        }
+
+        return @()
+    }
+
+    $singleIndex = 0
+    if ([int]::TryParse($trimmed, [ref]$singleIndex)) {
+        if ($singleIndex -ge 1 -and $singleIndex -le $MaxValue) {
+            return @($singleIndex)
+        }
+
+        return @()
+    }
+
+    return $null
+}
+
 function Select-BillingCostExportScopes {
     $checkBillingScopes = Read-Host "Check for existing billing-scope exports that may cover multiple subscriptions? (yes/no, default yes)"
     if (-not (Test-YesResponse -Value $checkBillingScopes)) {
@@ -1611,7 +1734,7 @@ function Select-BillingCostExportScopes {
             Write-DetailRow -Label "Scope" -Value $scope.Scope
         }
         Write-Host ""
-        $selection = Read-Host "Enter billing scope numbers to check, paste scope IDs, or press Enter to skip"
+        $selection = Read-Host "Enter billing scope numbers to check (e.g. 1,3,5-9 or 'all'), paste scope IDs, or press Enter to skip"
     } else {
         Write-Info "No billing scopes were automatically discovered for this signed-in user."
         Write-Info "If you already know the billing scope, paste it in the format /providers/Microsoft.Billing/billingAccounts/..."
@@ -1629,9 +1752,16 @@ function Select-BillingCostExportScopes {
             continue
         }
 
-        $selectedIndex = 0
-        if ([int]::TryParse($trimmedEntry, [ref]$selectedIndex) -and $selectedIndex -ge 1 -and $selectedIndex -le $accessibleScopes.Count) {
-            $selectedScopes += $accessibleScopes[$selectedIndex - 1]
+        $expandedIndexes = Expand-SelectionToken -Token $trimmedEntry -MaxValue $accessibleScopes.Count
+        if ($null -ne $expandedIndexes) {
+            if (@($expandedIndexes).Count -eq 0) {
+                Write-Warning-Custom "Ignoring selection '$trimmedEntry' because it is outside 1-$($accessibleScopes.Count)."
+                continue
+            }
+
+            foreach ($expandedIndex in @($expandedIndexes)) {
+                $selectedScopes += $accessibleScopes[$expandedIndex - 1]
+            }
             continue
         }
 
@@ -1875,6 +2005,110 @@ function Test-CostExportScopeAvailable {
     }
 }
 
+function Wait-AzurePermissionActionAtScope {
+    param(
+        [string]$Scope,
+        [string]$RequiredAction,
+        [int]$TimeoutSeconds = 180,
+        [int]$PollSeconds = 15
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        if (Test-AzurePermissionActionAtScope -Scope $Scope -RequiredAction $RequiredAction) {
+            return $true
+        }
+
+        if ((Get-Date) -ge $deadline) {
+            return $false
+        }
+
+        Start-Sleep -Seconds $PollSeconds
+    }
+}
+
+function Get-OperatorCostExportAccessAssessment {
+    param([object[]]$Subscriptions)
+
+    $assessments = @()
+    foreach ($sub in $Subscriptions) {
+        $scope = "/subscriptions/$($sub.Id)"
+        $hasExportWrite = Test-AzurePermissionActionAtScope -Scope $scope -RequiredAction "Microsoft.CostManagement/exports/write"
+        $canSelfElevate = $false
+        if (-not $hasExportWrite) {
+            $canSelfElevate = Test-AzurePermissionActionAtScope -Scope $scope -RequiredAction "Microsoft.Authorization/roleAssignments/write"
+        }
+
+        $assessments += [pscustomobject]@{
+            Subscription = $sub
+            HasExportWrite = $hasExportWrite
+            CanSelfElevate = $canSelfElevate
+        }
+    }
+
+    return @($assessments)
+}
+
+function Ensure-OperatorCostExportAccess {
+    param([object[]]$Subscriptions)
+
+    Write-SectionLabel "Validating operator Cost Management export access"
+    Write-Info "Creating exports needs Microsoft.CostManagement/exports/write. User Access Administrator alone does not grant it."
+
+    $readySubscriptions = @()
+    $assessments = @(Get-OperatorCostExportAccessAssessment -Subscriptions $Subscriptions)
+
+    foreach ($assessment in $assessments) {
+        $sub = $assessment.Subscription
+        $scope = "/subscriptions/$($sub.Id)"
+
+        if ($assessment.HasExportWrite) {
+            Write-Success "Validated export access on: $($sub.Name)"
+            $readySubscriptions += $sub
+            continue
+        }
+
+        if (-not $assessment.CanSelfElevate) {
+            Write-Warning-Custom "Your account cannot create Cost Management exports on $($sub.Name) and cannot assign itself access."
+            Write-Info "Ask an Owner or User Access Administrator to grant Cost Management Contributor on $($sub.Name), then rerun this script."
+            Write-Info "Skipping export setup for this subscription. Onboarding continues."
+            continue
+        }
+
+        Write-Warning-Custom "Your account cannot create Cost Management exports on $($sub.Name), but it can assign roles at that scope."
+        $answer = Read-Host "Assign Cost Management Contributor to your account on $($sub.Name) now? (yes/no, default yes)"
+        if (-not (Test-YesResponse -Value $answer)) {
+            Write-Skipped "Self-elevation declined. Skipping export setup for $($sub.Name)."
+            continue
+        }
+
+        try {
+            $operatorObjectId = Get-SignedInPrincipalObjectId
+            if ([string]::IsNullOrWhiteSpace($operatorObjectId)) {
+                throw "Unable to resolve the signed-in principal object ID."
+            }
+
+            New-AzRoleAssignment -ObjectId $operatorObjectId -RoleDefinitionName "Cost Management Contributor" -Scope $scope | Out-Null
+            Write-Success "Assigned Cost Management Contributor to your account on: $($sub.Name)"
+            $script:operatorElevatedExportScopes += [pscustomobject]@{ SubscriptionName = $sub.Name; Scope = $scope }
+
+            Write-Info "Waiting for the new role assignment to propagate (up to 3 minutes)..."
+            if (Wait-AzurePermissionActionAtScope -Scope $scope -RequiredAction "Microsoft.CostManagement/exports/write") {
+                Write-Success "Export access confirmed on: $($sub.Name)"
+            } else {
+                Write-Warning-Custom "Role assigned but not yet visible on $($sub.Name). Export creation may still fail with RBACAccessDenied; the script is idempotent, so rerun it in a few minutes if it does."
+            }
+
+            $readySubscriptions += $sub
+        } catch {
+            Write-Error-Custom "Failed to assign Cost Management Contributor on $($sub.Name): $_"
+            Write-Info "Skipping export setup for this subscription. Onboarding continues."
+        }
+    }
+
+    return @($readySubscriptions)
+}
+
 function Get-SpottoRecurringExportName {
     param([string]$DatasetType)
 
@@ -2039,7 +2273,9 @@ function Ensure-CostExport {
     $registrationRetryCount = 0
     while ($true) {
         try {
-            New-AzResource -ResourceId $resourceId -ApiVersion $COST_EXPORT_API_VERSION -Properties $Body.properties -Force -ErrorAction Stop | Out-Null
+            Invoke-WithCostManagementThrottleRetry -OperationLabel "export definition '$ExportName'" -Operation {
+                New-AzResource -ResourceId $resourceId -ApiVersion $COST_EXPORT_API_VERSION -Properties $Body.properties -Force -ErrorAction Stop | Out-Null
+            }
             break
         } catch {
             $message = $_.Exception.Message
@@ -2068,6 +2304,51 @@ function Ensure-CostExport {
     return "created"
 }
 
+function Test-TooManyRequestsMessage {
+    param([string]$Message)
+
+    return -not [string]::IsNullOrWhiteSpace($Message) `
+        -and $Message -match "(?i)too\s*many\s*requests|\b429\b\s*:|TooManyRequests"
+}
+
+function Get-RetryAfterSecondsFromMessage {
+    param(
+        [string]$Message,
+        [int]$DefaultSeconds = 60
+    )
+
+    if ($Message -match "(?i)retry after (\d+) seconds") {
+        return [Math]::Min([int]$Matches[1], 300)
+    }
+
+    return $DefaultSeconds
+}
+
+function Invoke-WithCostManagementThrottleRetry {
+    param(
+        [scriptblock]$Operation,
+        [string]$OperationLabel,
+        [int]$MaxRetries = 5
+    )
+
+    $attempt = 0
+    while ($true) {
+        try {
+            return & $Operation
+        } catch {
+            $message = $_.Exception.Message
+            if (-not (Test-TooManyRequestsMessage -Message $message) -or $attempt -ge $MaxRetries) {
+                throw
+            }
+
+            $attempt++
+            $delaySeconds = Get-RetryAfterSecondsFromMessage -Message $message
+            Write-Info "Azure rate-limited $OperationLabel (429 Too Many Requests). Waiting $delaySeconds seconds before retry $attempt of $MaxRetries."
+            Start-Sleep -Seconds $delaySeconds
+        }
+    }
+}
+
 function Invoke-CostExportRun {
     param(
         [string]$Scope,
@@ -2076,10 +2357,12 @@ function Invoke-CostExportRun {
     )
 
     $resourceId = Get-CostExportResourceId -Scope $Scope -ExportName $ExportName
-    if ($TimePeriod) {
-        Invoke-AzResourceAction -ResourceId $resourceId -Action "run" -ApiVersion $COST_EXPORT_API_VERSION -Parameters @{ timePeriod = $TimePeriod } -Force -ErrorAction Stop | Out-Null
-    } else {
-        Invoke-AzResourceAction -ResourceId $resourceId -Action "run" -ApiVersion $COST_EXPORT_API_VERSION -Force -ErrorAction Stop | Out-Null
+    Invoke-WithCostManagementThrottleRetry -OperationLabel "export run '$ExportName'" -Operation {
+        if ($TimePeriod) {
+            Invoke-AzResourceAction -ResourceId $resourceId -Action "run" -ApiVersion $COST_EXPORT_API_VERSION -Parameters @{ timePeriod = $TimePeriod } -Force -ErrorAction Stop | Out-Null
+        } else {
+            Invoke-AzResourceAction -ResourceId $resourceId -Action "run" -ApiVersion $COST_EXPORT_API_VERSION -Force -ErrorAction Stop | Out-Null
+        }
     }
 }
 
@@ -2483,24 +2766,29 @@ while (-not $scopeSelected) {
         Write-Host ""
 
         while ($selectedSubscriptions.Count -eq 0) {
-            $subscriptionSelection = Read-Host "Enter subscription numbers (comma-separated, e.g., 1,3,5)"
+            $subscriptionSelection = Read-Host "Enter subscription numbers (e.g. 1,3,5-9 or 'all')"
             $invalidSelections = @()
             $selectedSubscriptions = @()
             $seenSubscriptionIds = @{}
 
             foreach ($entry in ($subscriptionSelection -split ",")) {
-                $subscriptionNumber = 0
                 $trimmedEntry = $entry.Trim()
+                if ([string]::IsNullOrWhiteSpace($trimmedEntry)) {
+                    continue
+                }
 
-                if (-not [int]::TryParse($trimmedEntry, [ref]$subscriptionNumber) -or $subscriptionNumber -lt 1 -or $subscriptionNumber -gt $subscriptions.Count) {
+                $expandedIndexes = Expand-SelectionToken -Token $trimmedEntry -MaxValue $subscriptions.Count
+                if ($null -eq $expandedIndexes -or @($expandedIndexes).Count -eq 0) {
                     $invalidSelections += $trimmedEntry
                     continue
                 }
 
-                $subscription = $subscriptions[$subscriptionNumber - 1]
-                if (-not $seenSubscriptionIds.ContainsKey($subscription.Id)) {
-                    $selectedSubscriptions += $subscription
-                    $seenSubscriptionIds[$subscription.Id] = $true
+                foreach ($expandedIndex in @($expandedIndexes)) {
+                    $subscription = $subscriptions[$expandedIndex - 1]
+                    if (-not $seenSubscriptionIds.ContainsKey($subscription.Id)) {
+                        $selectedSubscriptions += $subscription
+                        $seenSubscriptionIds[$subscription.Id] = $true
+                    }
                 }
             }
 
@@ -2995,8 +3283,10 @@ if (Test-YesResponse -Value $configureBillingExports) {
     $billingExportSubscriptions = @()
     $selectedBillingScopes = @(Select-BillingCostExportScopes)
 
+    $exportCapableSubscriptions = @(Ensure-OperatorCostExportAccess -Subscriptions $selectedSubscriptions)
+
     Write-Info "Checking Cost Management export availability on selected subscriptions..."
-    foreach ($sub in $selectedSubscriptions) {
+    foreach ($sub in $exportCapableSubscriptions) {
         if (Test-CostExportScopeAvailable -Subscription $sub) {
             $billingExportSubscriptions += $sub
         }
@@ -3441,7 +3731,7 @@ function Select-PolicyAssignmentManagementGroupScopes {
     }
 
     while ($true) {
-        $selection = Read-Host "Enter management group numbers, comma-separated, or press Enter for none"
+        $selection = Read-Host "Enter management group numbers (e.g. 1,3,5-9), comma-separated, or press Enter for none"
         if ([string]::IsNullOrWhiteSpace($selection)) {
             return @()
         }
@@ -3449,12 +3739,13 @@ function Select-PolicyAssignmentManagementGroupScopes {
         $indexes = @()
         $valid = $true
         foreach ($entry in ($selection -split ',')) {
-            $selectedNumber = 0
-            if (-not [int]::TryParse($entry.Trim(), [ref]$selectedNumber) -or $selectedNumber -lt 1 -or $selectedNumber -gt $managementGroups.Count) {
+            # 'all' is intentionally not accepted here: exemption scopes should be chosen deliberately.
+            $expandedIndexes = Expand-SelectionToken -Token $entry -MaxValue $managementGroups.Count -AllowAll $false
+            if ($null -eq $expandedIndexes -or @($expandedIndexes).Count -eq 0) {
                 $valid = $false
                 break
             }
-            $indexes += ($selectedNumber - 1)
+            $indexes += @($expandedIndexes | ForEach-Object { $_ - 1 })
         }
         if (-not $valid) {
             Write-Error-Custom "Invalid selection. Enter numbers between 1 and $($managementGroups.Count)."
@@ -3717,6 +4008,14 @@ if ($script:billingExportResults.Count -gt 0) {
             Write-Error-Custom "$($failedExport.SubscriptionName) $($failedExport.DatasetType) $($failedExport.ExportKind): $($failedExport.Message)"
         }
     }
+}
+if ($script:operatorElevatedExportScopes.Count -gt 0) {
+    Write-Host ""
+    Write-Warning-Custom "Temporary operator role: Cost Management Contributor was assigned to your account on:"
+    foreach ($elevated in $script:operatorElevatedExportScopes) {
+        Write-Info "  - $($elevated.SubscriptionName) ($($elevated.Scope))"
+    }
+    Write-Info "This was only needed to create the exports. Consider removing it after onboarding completes."
 }
 if ($grantWritePerms -eq "yes") {
     Write-Success "Custom role with write permissions created and assigned"

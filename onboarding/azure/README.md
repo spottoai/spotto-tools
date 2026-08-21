@@ -113,7 +113,7 @@ The script is interactive and will guide you through the process:
 
 1.  **Azure Login**: It will prompt you to log in to Azure if not already connected.
 2.  **Tenant Selection**: If you have access to multiple tenants, you will be asked to select one.
-3.  **Subscription Selection**: You can choose to onboard **All** subscriptions or select specific ones by index.
+3.  **Subscription Selection**: You can choose to onboard **All** subscriptions or select specific ones by index. Index selectors accept comma-separated numbers and ranges (for example `1,3,5-9`), plus `all` where selecting everything is safe.
     *   If you choose **All**, the script assigns **Reader** at tenant root scope (`/`) instead of creating one assignment per subscription.
     *   If you choose **Specific**, the script assigns **Reader** only on the subscriptions you selected.
 4.  **Service Principal**: It checks for an existing "Spotto" app first, then "Spotto AI" for compatibility. If neither exists, it creates a new "Spotto" app.
@@ -135,7 +135,12 @@ The script is interactive and will guide you through the process:
     *   **Savings plan Reader** at `/providers/Microsoft.BillingBenefits`.
 9.  **Microsoft Graph Governance Permissions**: You will be asked if you want the script to connect to Microsoft Graph and grant the required application permissions with admin consent. These cover application posture, Global Admin/PIM role schedules, role management, group membership, user profile data, and audit logs. If you answer **no**, the script skips Microsoft Graph and continues with the remaining onboarding steps.
 10. **Highly Recommended Cost Management Exports**: You will be asked if you want to configure exports. The default is **yes** because exports reduce Cost Management API calls and Azure rate limiting.
+    *   Before touching any subscription, the script validates that your account holds `Microsoft.CostManagement/exports/write` on each selected subscription. User Access Administrator alone does not grant this.
+    *   Where that permission is missing but your account can assign roles at that subscription (for example via User Access Administrator at tenant root or a break-glass elevation), the script offers to assign **Cost Management Contributor** to your own account, waits for RBAC propagation, and reminds you at the end to remove the temporary role after onboarding.
+    *   Where the permission is missing and self-elevation is not possible, that subscription is skipped for export setup with guidance, and onboarding continues.
+    *   Export creation and backfill run requests that hit Cost Management rate limiting (`429 Too Many Requests`) are retried automatically, honouring the retry-after hint in the error.
     *   The script can check billing scopes that your signed-in account can access, or you can paste a billing scope resource ID such as `/providers/Microsoft.Billing/billingAccounts/...`.
+    *   The billing scope selector accepts `all`, comma-separated numbers, and ranges (for example `1,3,5-9`), so large scope lists do not require typing every index.
     *   If a compatible billing-scope export is accepted, the script prepares Spotto blob read access and asks whether to skip subscription-level exports. The default is to keep the per-subscription fallback.
     *   For billing-scope export storage, the script warns about public endpoint/firewall settings but does not change them automatically.
     *   The script displays the billing scope and Spotto service principal object ID so a billing admin can assign the required billing-scope reader role if it is not already present.
@@ -191,6 +196,7 @@ Upon successful completion, the script will display the credentials you need to 
 *   **Microsoft Graph governance permissions failed or skipped**: The tenant still needs admin consent for the Microsoft Graph application permissions before Spotto can read application posture, Global Admin/PIM schedules, group membership, user profile data, and audit logs. Have a tenant admin grant the permissions listed above with admin consent in **Azure Portal > App Registrations > API permissions**, or rerun the script and choose **yes** for the Microsoft Graph step.
 *   **Cost Management export setup failed**: Confirm the subscription supports Cost Management exports and that your account can create or update `Microsoft.CostManagement/exports`. Some subscriptions do not support amortized exports; the script continues with actual cost where possible.
 *   **Billing-scope export is reused but Spotto cannot discover it later**: Confirm the Spotto service principal has reader access at the billing scope shown by the script. Subscription Reader, tenant root Reader, and storage blob access do not grant billing-scope export discovery by themselves.
+*   **"429 : Too many requests" during export or backfill setup**: The script now waits and retries these automatically. If a backfill still fails after retries, rerun the script — queued backfills are marked, so only the failed months are re-queued.
 *   **Cost Management exports unavailable**: The selected subscription offer, billing scope, or dataset does not expose Cost Management exports. This can be expected for unsupported offers, some newly created subscriptions while Cost Management data is still becoming available, or amortized datasets that are not available for that scope. The script skips those exports and continues onboarding.
 *   **Billing export storage access failed**: Confirm the storage account allows access through the public endpoint, anonymous blob access is disabled, and the Spotto service principal has **Storage Blob Data Reader** on the export container. If public network access is disabled or a firewall blocks access, Spotto cloud-engine cannot read the blobs even when RBAC is correct.
 *   **"Forbidden" role assignment errors**: Your account lacks permission at that scope (subscription, root management group, or tenant billing scopes). Ask a tenant admin or subscription owner to run the script or assign the roles manually.
@@ -211,3 +217,11 @@ Policy exemption access is never enabled by the Advisor/Storage answer. New Advi
 Policy-specific role reconciliation fails closed if a role with the expected Spotto name already contains unrelated actions or, for an inherited-assignment role, another management-group scope. Review that role manually instead of allowing the script to extend broader access.
 
 Run `./Setup-SpottoAzure.PolicyExemptions.Tests.ps1` to execute the native policy-role reconciliation regression tests without contacting Azure.
+
+Run `./Setup-SpottoAzure.RootScopeAccess.Tests.ps1` to execute the native tenant root scope access-validation regression tests without contacting Azure.
+
+Run `./Setup-SpottoAzure.CostExportAccess.Tests.ps1` to execute the native operator export-access preflight and self-elevation regression tests without contacting Azure.
+
+Run `./Setup-SpottoAzure.ThrottleRetry.Tests.ps1` to execute the native Cost Management 429 throttle-retry regression tests without contacting Azure.
+
+Run `./Setup-SpottoAzure.BillingScopeSelection.Tests.ps1` to execute the native billing scope selection input regression tests without contacting Azure.
