@@ -1,6 +1,6 @@
 # Spotto Tools
 
-Use the Azure onboarding wizard to connect your Azure environment to Spotto. It creates or repairs the Spotto service principal and permissions through a guided PowerShell workflow. Billing exports are available through Custom setup.
+Use the Azure onboarding wizard to connect your Azure environment to Spotto. It can check prerequisites without changing Azure, or create and repair the Spotto service principal and permissions through a guided PowerShell workflow. Billing exports are available through Custom setup.
 
 The wizard is safe to rerun. If setup is interrupted or Spotto reports a missing permission later, run it again and it will reuse existing resources where possible.
 
@@ -30,8 +30,9 @@ Invoke-WebRequest `
 
 ## Choose a setup mode
 
-- **Recommended read-only access** is the default. Press **Enter** and the wizard selects all subscriptions and configures the reader permissions Spotto needs. It reuses a credential with at least three months remaining and does not configure billing exports, storage, or optional write access.
-- **Custom setup** lets you choose subscriptions and individual capabilities, including billing exports and supported write permissions.
+- **Recommended read-only access** is the default. Press **Enter** and the wizard selects all subscriptions and configures the reader permissions Spotto needs. If Azure does not allow a tenant-root Reader assignment, the wizard automatically tries each subscription instead. It also grants the read-only management-group roles at the exact tenant root when available, or across the management groups visible to the signed-in operator. It reuses a credential with at least three months remaining and does not configure billing exports, storage, or optional write access.
+- **Custom setup** lets you choose subscriptions and individual capabilities. Billing exports and export storage are optional, default to no, and are configured only when you explicitly enable them.
+- **Check prerequisites** is a read-only dry run. It checks active access across subscriptions, visible management groups, Reservations, and Savings Plans, then shows eligible Azure resource PIM roles that may need activation. It does not create an app, secret, role assignment, export, or storage resource.
 
 You will still choose the Azure tenant to connect. The wizard explains anything else it needs as it goes.
 

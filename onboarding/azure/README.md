@@ -1,6 +1,6 @@
 # Azure Onboarding Wizard
 
-`Setup-SpottoAzure.ps1` is the interactive wizard for connecting Azure to Spotto. Run this one script; it guides you through sign-in, tenant selection, and Spotto access. Billing exports are available through Custom setup.
+`Setup-SpottoAzure.ps1` is the interactive wizard for connecting Azure to Spotto. Run this one script; it guides you through sign-in, tenant selection, prerequisite checks, and Spotto access. Billing exports are available through Custom setup.
 
 It is safe to rerun. Use it again to repair interrupted setup, add missing permissions, or update an existing Spotto connection.
 
@@ -38,15 +38,23 @@ The downloaded script remains visible in Cloud Shell so your team can review it 
 
 ### Recommended read-only access
 
-Press **Enter** to use the default. The wizard automatically selects all subscriptions and configures the Azure and Microsoft Graph reader permissions Spotto needs.
+Press **Enter** to use the default. The wizard automatically selects all subscriptions and configures the Azure and Microsoft Graph reader permissions Spotto needs. It first tries one inherited tenant-root Reader assignment; if Azure rejects that scope, it automatically falls back to idempotent Reader assignments on each selected subscription.
 
-This includes Monitoring Reader, Log Analytics Reader, Security Reader, and the exact Microsoft Graph governance permission set, including `Policy.Read.All` and `LicenseAssignment.Read.All`.
+This includes Monitoring Reader, Log Analytics Reader, Security Reader, and the exact Microsoft Graph governance permission set, including `Policy.Read.All` and `LicenseAssignment.Read.All`. Monitoring Reader, Security Reader, and Log Analytics Reader are checked on every selected subscription. The wizard also assigns Reader, Management Group Reader, Monitoring Reader, and Log Analytics Reader at the exact tenant root management group when available, or on each management group visible to the signed-in operator. A child group is never treated as tenant root just because its parent is hidden.
 
 If the existing credential with the latest expiry has at least three months remaining, it is reused. Otherwise the wizard creates a replacement secret. Billing exports, export storage, and optional write access are not configured.
 
 ### Custom setup
 
-Choose Custom setup when you want specific subscriptions, billing exports, individual permission choices, or supported write capabilities.
+Choose Custom setup when you want specific subscriptions, billing exports, individual permission choices, or supported write capabilities. Billing exports and export storage are optional and default to no; press **Enter** to skip them.
+
+### Check prerequisites
+
+Choose **Check prerequisites (no Azure changes)** to assess the signed-in operator before setup. The wizard checks every visible subscription, every visible management group, tenant/provider-scope role-assignment authority, current reservation inventory visibility, and Azure resource-role PIM eligibility. It expands only the scopes that need action, PIM activation, or manual review.
+
+Eligible PIM access is reported separately from active access. Activate the suggested role, reconnect the Azure session, and rerun the check before using Recommended setup. The check does not create or change Azure applications, secrets, role assignments, permissions, exports, storage, policies, or provider registrations. It can install missing PowerShell modules locally.
+
+Microsoft Entra app-management roles, Graph admin-consent roles, and Entra directory-role PIM are left as an explicit manual check because inspecting them safely would require the diagnostic mode to request extra Microsoft Graph permissions.
 
 ## What you need
 

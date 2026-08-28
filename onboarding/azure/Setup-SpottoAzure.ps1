@@ -1,24 +1,23 @@
 ﻿<#
 .SYNOPSIS
-    Sets up Azure service principal with appropriate permissions for Spotto AI.
+    Checks or sets up the Azure service principal permissions used by Spotto AI.
 
 .DESCRIPTION
     This script creates a service principal, assigns the governance and billing permissions Spotto
     uses to analyze your Azure environment, can configure billing exports in Custom setup,
-    and offers recommended read-only or custom setup profiles.
+    and offers recommended read-only, custom, or prerequisite-check profiles.
     
     Permissions granted:
     - Reader role at tenant root scope when all subscriptions are selected
-      (inherits to all current and future subscriptions in the tenant)
+      (inherits to all current and future subscriptions in the tenant), with automatic
+      per-subscription fallback when tenant-root assignment is unavailable
     - Reader role on selected subscriptions when specific subscriptions are chosen
     - Monitoring Reader role on selected subscriptions (includes Microsoft.Insights/Components/Query/Read)
     - Security Reader role on selected subscriptions for Defender for Cloud posture
-    - Log Analytics Reader role
-      (assigned at the root management group when all subscriptions are selected,
-       otherwise on selected subscriptions)
+    - Log Analytics Reader role on selected subscriptions and visible management groups
       (includes workspace query access plus broader monitoring read access)
-    - Management Group Reader at the root management group
-      (read management group hierarchy plus management-group policy and RBAC metadata)
+    - Reader, Management Group Reader, Monitoring Reader, and Log Analytics Reader
+      on visible management groups (tenant root is recognized only by its tenant ID)
     - Reservations Reader at /providers/Microsoft.Capacity
     - Custom setup only: Reservations Contributor at /providers/Microsoft.Capacity
       (calculate reservation refund quotes and support reservation management workflows)
@@ -49,7 +48,7 @@
       can cover role assignment and storage/export resource creation. User Access Administrator alone cannot create
       Cost Management exports, resource groups, storage accounts, or containers.
     - Tenant admin consent for Microsoft Graph governance permissions if granting Graph governance permissions
-    - Management Group Contributor or Reader for management group discovery; assigning governance roles also
+    - Management Group Contributor or Reader for management group discovery; assigning management-group reader roles also
       requires Microsoft.Authorization/roleAssignments/write at the management-group scope, such as through
       Owner, User Access Administrator, or Role Based Access Control Administrator
     - Billing-scope reader access if reusing Cost Management exports created at an EA/MCA
@@ -108,7 +107,7 @@ function Show-StartupSplash {
     Write-Host $logo -ForegroundColor Cyan
     Write-Host ("-" * $script:ConsolePanelWidth) -ForegroundColor DarkGray
     Write-Host "  Azure onboarding for Spotto AI" -ForegroundColor White
-    Write-Host "  Creates the service principal and assigns the Azure access Spotto needs." -ForegroundColor DarkGray
+    Write-Host "  Creates, repairs, or checks the Azure access Spotto needs." -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  Safe to rerun:" -ForegroundColor Green -NoNewline
     Write-Host " existing apps, secrets, and role assignments are reused where possible." -ForegroundColor White
@@ -126,12 +125,14 @@ function Select-SetupMode {
     Write-Host "      Automatically adds the read access Spotto needs across all subscriptions." -ForegroundColor DarkGray
     Write-Host "  [2] Custom setup" -ForegroundColor White
     Write-Host "      Choose permissions individually, including optional write access." -ForegroundColor DarkGray
+    Write-Host "  [3] Check prerequisites (no Azure changes)" -ForegroundColor White
+    Write-Host "      Check subscription, management group, reservation, savings plan, and PIM access." -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "Safe to rerun: existing Spotto resources are reused and missing access is added." -ForegroundColor Green
     Write-Host "The wizard does not remove access that is already assigned." -ForegroundColor DarkGray
 
     while ($true) {
-        $setupModeSelection = Read-Host "Select setup mode (1/2, default 1)"
+        $setupModeSelection = Read-Host "Select setup mode (1/2/3, default 1)"
         if ([string]::IsNullOrWhiteSpace($setupModeSelection) -or $setupModeSelection.Trim() -in @("1", "r", "read-only", "recommended")) {
             Write-Host "`n✓ Recommended read-only access selected" -ForegroundColor Green
             return "recommended-read-only"
@@ -142,16 +143,27 @@ function Select-SetupMode {
             return "custom"
         }
 
-        Write-Host "Invalid option. Enter 1 for recommended read-only access or 2 for custom setup." -ForegroundColor Red
+        if ($setupModeSelection.Trim() -in @("3", "p", "check", "prerequisite", "prerequisites", "dry-run")) {
+            Write-Host "`n✓ Prerequisite check selected" -ForegroundColor Green
+            return "prerequisite-check"
+        }
+
+        Write-Host "Invalid option. Enter 1 for recommended read-only access, 2 for custom setup, or 3 to check prerequisites." -ForegroundColor Red
     }
 }
 
 $script:setupMode = Select-SetupMode
 $script:useRecommendedReadOnlySetup = $script:setupMode -eq "recommended-read-only"
+$script:usePrerequisiteCheck = $script:setupMode -eq "prerequisite-check"
+$script:totalWizardSteps = if ($script:usePrerequisiteCheck) { 3 } else { 13 }
 
 function Get-OnboardingScopeSelection {
-    if ($script:useRecommendedReadOnlySetup) {
-        Write-Info "Recommended read-only access: selecting all subscriptions."
+    if ($script:useRecommendedReadOnlySetup -or $script:usePrerequisiteCheck) {
+        if ($script:usePrerequisiteCheck) {
+            Write-Info "Prerequisite check: assessing all visible subscriptions."
+        } else {
+            Write-Info "Recommended read-only access: selecting all subscriptions."
+        }
         return "1"
     }
 
@@ -199,7 +211,8 @@ function Ensure-PowerShellModules {
 
         if ($InstallMissingByDefault) {
             $install = "yes"
-            Write-Host "`nRecommended read-only access requires these modules; installing them automatically." -ForegroundColor Cyan
+            $automaticModeLabel = if ($script:usePrerequisiteCheck) { "The prerequisite check" } else { "Recommended read-only access" }
+            Write-Host "`n$automaticModeLabel requires these modules; installing them automatically." -ForegroundColor Cyan
         } else {
             $install = Read-Host "`nWould you like to install missing $ModuleSetName modules now? (yes/no, default no)"
         }
@@ -260,7 +273,7 @@ $graphRequiredModules = @(
 
 Ensure-PowerShellModules -Modules $requiredModules -ModuleSetName "Azure" -ManualInstallCommands @(
     "Install-Module -Name Az -Scope CurrentUser -Force"
-) -Required $true -InstallMissingByDefault $script:useRecommendedReadOnlySetup | Out-Null
+) -Required $true -InstallMissingByDefault ($script:useRecommendedReadOnlySetup -or $script:usePrerequisiteCheck) | Out-Null
 
 # Global variables to track credentials
 $script:clientId = $null
@@ -270,11 +283,19 @@ $script:secretExpiry = $null
 $script:appDisplayName = $APP_NAME
 $script:isNewSecret = $false
 $script:useTenantRootReader = $false
-$script:rootManagementGroup = $null
+$script:selectedAllSubscriptions = $false
+$script:usedSubscriptionReaderFallback = $false
 $script:rootReaderAssignmentStatus = "not-applicable"
-$script:rootManagementGroupReaderStatus = "not-run"
+$script:subscriptionMonitoringReaderStatus = "not-run"
+$script:subscriptionSecurityReaderStatus = "not-run"
+$script:subscriptionLogAnalyticsReaderStatus = "not-run"
+$script:managementGroupAzureReaderStatus = "not-run"
 $script:managementGroupReaderStatus = "not-run"
-$script:logAnalyticsReaderStatus = "not-run"
+$script:managementGroupMonitoringReaderStatus = "not-run"
+$script:managementGroupLogAnalyticsReaderStatus = "not-run"
+$script:visibleManagementGroups = @()
+$script:managementGroupDiscoveryStatus = "not-run"
+$script:managementGroupDiscoveryMessage = ""
 $script:reservationReaderStatus = "not-run"
 $script:reservationContributorStatus = "not-run"
 $script:savingsPlanReaderStatus = "not-run"
@@ -475,7 +496,7 @@ function Write-SubscriptionPimTroubleshootingHint {
 function Write-TenantWidePimTroubleshootingHint {
     param([string]$ScopeLabel)
 
-    Write-Warning-Custom "This step needs tenant-wide or provider-scope Azure access from the upfront checklist."
+    Write-Warning-Custom "This step needs Azure access at the listed tenant, management-group, or provider scope from the upfront checklist."
     if (-not [string]::IsNullOrWhiteSpace($ScopeLabel)) {
         Write-Info "Scope: $ScopeLabel"
     }
@@ -830,10 +851,41 @@ function Test-TenantRootRoleAssignmentAccess {
         return $true
     }
 
-    Write-Error-Custom "Cannot confirm role assignment access at tenant root scope (/)."
-    Write-Info "All-subscriptions onboarding needs Owner or User Access Administrator at tenant root scope (/)."
-    Write-PimTroubleshootingHint
+    Write-Warning-Custom "Cannot confirm role assignment access at tenant root scope (/)."
+    Write-Info "The wizard will try assigning Reader separately on each selected subscription."
     return $false
+}
+
+function Use-SubscriptionReaderFallback {
+    param(
+        [object[]]$Subscriptions,
+        [string]$Reason
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($Reason)) {
+        Write-Warning-Custom $Reason
+    }
+    Write-Info "Trying the same idempotent Reader setup one subscription at a time."
+
+    if (-not $Subscriptions -or $Subscriptions.Count -eq 0) {
+        Write-Error-Custom "No subscriptions are available for the Reader fallback."
+        return $false
+    }
+
+    if (-not (Test-SelectedSubscriptionAccess -Subscriptions $Subscriptions)) {
+        Write-Error-Custom "The subscription-by-subscription Reader fallback is not available with the current Azure session."
+        return $false
+    }
+
+    if (-not (Test-SelectedSubscriptionRoleAssignmentAccess -Subscriptions $Subscriptions)) {
+        Write-Error-Custom "The current Azure session cannot assign Reader on every selected subscription."
+        return $false
+    }
+
+    $script:useTenantRootReader = $false
+    $script:usedSubscriptionReaderFallback = $true
+    Write-Success "Validated subscription-by-subscription Reader assignment for all $($Subscriptions.Count) subscription(s)."
+    return $true
 }
 
 function Ensure-SubscriptionRoleAssignments {
@@ -898,7 +950,7 @@ function Ensure-TenantRootReaderAssignment {
         Write-Success "Assigned Reader role at tenant root scope (/)"
         return "created"
     } catch {
-        Write-Error-Custom "Failed to assign Reader role at tenant root scope (/): $_"
+        Write-Warning-Custom "Tenant-root Reader assignment was not available: $_"
 
         if ($_.Exception.Message -match "Forbidden|AuthorizationFailed|does not have authorization") {
             Write-Info "This requires Owner or User Access Administrator at tenant root scope (/)."
@@ -907,90 +959,243 @@ function Ensure-TenantRootReaderAssignment {
             Write-PimTroubleshootingHint
         }
 
-        Write-Info "If you cannot get root-scope access, rerun with Custom setup and choose specific subscriptions."
+        Write-Info "The wizard will try assigning Reader separately on each selected subscription."
         return "failed"
     }
 }
 
-function Resolve-RootManagementGroup {
-    param([string]$TenantId)
+function Test-TenantRootManagementGroup {
+    param(
+        [object]$ManagementGroup,
+        [string]$TenantId
+    )
 
-    if ($script:rootManagementGroup) {
-        return $script:rootManagementGroup
+    if (-not $ManagementGroup -or [string]::IsNullOrWhiteSpace($TenantId)) {
+        return $false
     }
 
-    $rootManagementGroup = $null
+    $normalizedTenantId = $TenantId.Trim()
+    $expectedRootScope = "/providers/Microsoft.Management/managementGroups/$normalizedTenantId"
+    $managementGroupName = ([string]$ManagementGroup.Name).Trim()
+    $managementGroupScope = ([string]$ManagementGroup.Id).TrimEnd("/")
 
-    try {
-        $rootManagementGroup = Get-AzManagementGroup -GroupName $TenantId -ErrorAction SilentlyContinue
-
-        if (-not $rootManagementGroup) {
-            $managementGroups = @(Get-AzManagementGroup -ErrorAction Stop)
-            $rootManagementGroup = $managementGroups |
-                Sort-Object @{ Expression = { if ($_.Name -eq $TenantId) { 0 } else { 1 } } } |
-                Where-Object { $_.Name -eq $TenantId -or [string]::IsNullOrWhiteSpace($_.ParentId) } |
-                Select-Object -First 1
-        }
-    } catch {
-        throw "Unable to query management groups for tenant $TenantId. $_"
+    if (-not [string]::IsNullOrWhiteSpace($managementGroupName)) {
+        return $managementGroupName -ieq $normalizedTenantId
     }
 
-    if (-not $rootManagementGroup) {
-        throw "Unable to resolve the root management group for tenant $TenantId."
-    }
-
-    $script:rootManagementGroup = $rootManagementGroup
-    return $rootManagementGroup
+    return $managementGroupScope -ieq $expectedRootScope
 }
 
-function Ensure-RootManagementGroupRoleAssignment {
+function Get-ManagementGroupScope {
+    param([object]$ManagementGroup)
+
+    if (-not $ManagementGroup -or [string]::IsNullOrWhiteSpace([string]$ManagementGroup.Name)) {
+        throw "Management group ID is missing."
+    }
+
+    $managementGroupName = ([string]$ManagementGroup.Name).Trim()
+    return "/providers/Microsoft.Management/managementGroups/$managementGroupName"
+}
+
+function Get-ManagementGroupDisplayLabel {
+    param(
+        [object]$ManagementGroup,
+        [string]$TenantId
+    )
+
+    $managementGroupName = ([string]$ManagementGroup.Name).Trim()
+    $displayName = ([string]$ManagementGroup.DisplayName).Trim()
+    if ([string]::IsNullOrWhiteSpace($displayName)) {
+        $displayName = $managementGroupName
+    }
+
+    if (Test-TenantRootManagementGroup -ManagementGroup $ManagementGroup -TenantId $TenantId) {
+        return "$displayName (tenant root: $managementGroupName)"
+    }
+
+    if ($displayName -ieq $managementGroupName) {
+        return $managementGroupName
+    }
+
+    return "$displayName ($managementGroupName)"
+}
+
+function Get-VisibleManagementGroupTargets {
+    param([string]$TenantId)
+
+    $script:managementGroupDiscoveryStatus = "unconfirmed"
+    $script:managementGroupDiscoveryMessage = ""
+    try {
+        $managementGroups = @(Get-AzManagementGroup -ErrorAction Stop)
+    } catch {
+        $script:managementGroupDiscoveryMessage = Get-SafeAzureAssessmentFailure -ErrorRecord $_
+        Write-Warning-Custom "Management groups visible to the current Azure session could not be listed: $_"
+        return @()
+    }
+
+    $script:managementGroupDiscoveryStatus = "ready"
+
+    $managementGroupsByName = @{}
+    foreach ($managementGroup in $managementGroups) {
+        $managementGroupName = ([string]$managementGroup.Name).Trim()
+        if ([string]::IsNullOrWhiteSpace($managementGroupName)) {
+            continue
+        }
+
+        $managementGroupTenantId = ([string]$managementGroup.TenantId).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($managementGroupTenantId) -and $managementGroupTenantId -ine $TenantId) {
+            continue
+        }
+
+        if (-not $managementGroupsByName.ContainsKey($managementGroupName)) {
+            $managementGroupsByName[$managementGroupName] = $managementGroup
+        }
+    }
+
+    $visibleManagementGroups = @($managementGroupsByName.Values |
+        Sort-Object `
+            @{ Expression = { if (Test-TenantRootManagementGroup -ManagementGroup $_ -TenantId $TenantId) { 0 } else { 1 } } }, `
+            @{ Expression = { [string]$_.DisplayName } }, `
+            @{ Expression = { [string]$_.Name } })
+
+    if ($visibleManagementGroups.Count -eq 0) {
+        $script:managementGroupDiscoveryMessage = "Azure returned no management groups visible to the signed-in account."
+        Write-Warning-Custom "No management groups are visible to the current Azure session."
+        return @()
+    }
+
+    $tenantRootManagementGroup = @($visibleManagementGroups |
+        Where-Object { Test-TenantRootManagementGroup -ManagementGroup $_ -TenantId $TenantId } |
+        Select-Object -First 1)
+
+    if ($tenantRootManagementGroup.Count -gt 0) {
+        $rootLabel = Get-ManagementGroupDisplayLabel -ManagementGroup $tenantRootManagementGroup[0] -TenantId $TenantId
+        Write-Success "Tenant root management group is visible: $rootLabel"
+    } else {
+        Write-Warning-Custom "The tenant root management group is not available to the current Azure session."
+        Write-Info "The wizard will use the $($visibleManagementGroups.Count) visible management group(s) instead."
+    }
+
+    $script:managementGroupDiscoveryMessage = "Azure returned $($visibleManagementGroups.Count) visible management group(s)."
+
+    return $visibleManagementGroups
+}
+
+function Ensure-ManagementGroupRoleAssignments {
     param(
         [string]$PrincipalId,
+        [object[]]$ManagementGroups,
+        [string]$TenantId,
         [string]$RoleDefinitionName,
         [string]$RoleLabel
     )
 
-    try {
-        $rootManagementGroup = Resolve-RootManagementGroup -TenantId $script:tenantId
-        $rootManagementGroupScope = if ($rootManagementGroup.Id) {
-            $rootManagementGroup.Id
-        } else {
-            "/providers/Microsoft.Management/managementGroups/$($rootManagementGroup.Name)"
+    $targets = @($ManagementGroups |
+        Sort-Object `
+            @{ Expression = { if (Test-TenantRootManagementGroup -ManagementGroup $_ -TenantId $TenantId) { 0 } else { 1 } } }, `
+            @{ Expression = { [string]$_.DisplayName } }, `
+            @{ Expression = { [string]$_.Name } })
+    if ($targets.Count -eq 0) {
+        Write-Warning-Custom "$RoleLabel was not assigned because no management groups are visible."
+        return [PSCustomObject]@{
+            Status              = "unavailable"
+            Created             = 0
+            Existing            = 0
+            Failed              = 0
+            Attempted           = 0
+            Visible             = 0
+            CoveredByTenantRoot = $false
         }
-        $rootManagementGroupName = if ($rootManagementGroup.DisplayName) {
-            $rootManagementGroup.DisplayName
-        } elseif ($rootManagementGroup.Name) {
-            $rootManagementGroup.Name
-        } else {
-            $script:tenantId
+    }
+
+    $createdCount = 0
+    $existingCount = 0
+    $failureCount = 0
+    $attemptedCount = 0
+    $coveredByTenantRoot = $false
+
+    foreach ($managementGroup in $targets) {
+        $attemptedCount++
+        $isTenantRoot = Test-TenantRootManagementGroup -ManagementGroup $managementGroup -TenantId $TenantId
+        $managementGroupLabel = Get-ManagementGroupDisplayLabel -ManagementGroup $managementGroup -TenantId $TenantId
+
+        try {
+            $managementGroupScope = Get-ManagementGroupScope -ManagementGroup $managementGroup
+            $existingAssignment = @(Get-AzRoleAssignment `
+                -ObjectId $PrincipalId `
+                -Scope $managementGroupScope `
+                -RoleDefinitionName $RoleDefinitionName `
+                -ErrorAction Stop)
+
+            if ($existingAssignment.Count -gt 0) {
+                Write-Info "$RoleLabel already assigned on: $managementGroupLabel"
+                $existingCount++
+            } else {
+                New-AzRoleAssignment `
+                    -ObjectId $PrincipalId `
+                    -RoleDefinitionName $RoleDefinitionName `
+                    -Scope $managementGroupScope `
+                    -ErrorAction Stop | Out-Null
+                Write-Success "Assigned $RoleLabel on: $managementGroupLabel"
+                $createdCount++
+            }
+
+            if ($isTenantRoot) {
+                $coveredByTenantRoot = $true
+                $remainingVisibleCount = $targets.Count - $attemptedCount
+                if ($remainingVisibleCount -gt 0) {
+                    Write-Info "$RoleLabel at tenant root covers the remaining $remainingVisibleCount visible management group(s)."
+                }
+                break
+            }
+        } catch {
+            $failureCount++
+            Write-Warning-Custom "Failed to assign $RoleLabel on ${managementGroupLabel}: $_"
+            if ($_.Exception.Message -match "Forbidden|AuthorizationFailed|does not have authorization") {
+                Write-TenantWidePimTroubleshootingHint -ScopeLabel $managementGroupLabel
+            }
         }
+    }
 
-        Write-Info "Attempting to assign $RoleLabel at the root management group..."
-        Write-Info "Resolved root management group: $rootManagementGroupName"
-        Write-Info "Management Group Scope: $rootManagementGroupScope"
+    $status = if ($failureCount -gt 0 -and ($createdCount + $existingCount) -gt 0) {
+        "partial"
+    } elseif ($failureCount -gt 0) {
+        "failed"
+    } elseif ($createdCount -gt 0 -and $existingCount -eq 0) {
+        "created"
+    } elseif ($createdCount -eq 0 -and $existingCount -gt 0) {
+        "existing"
+    } else {
+        "processed"
+    }
 
-        $existingAssignment = Get-AzRoleAssignment -ObjectId $PrincipalId -Scope $rootManagementGroupScope -RoleDefinitionName $RoleDefinitionName -ErrorAction SilentlyContinue
+    Write-Info "Management group summary for ${RoleLabel}: $createdCount new, $existingCount already existed, $failureCount failed"
+    return [PSCustomObject]@{
+        Status              = $status
+        Created             = $createdCount
+        Existing            = $existingCount
+        Failed              = $failureCount
+        Attempted           = $attemptedCount
+        Visible             = $targets.Count
+        CoveredByTenantRoot = $coveredByTenantRoot
+    }
+}
 
-        if ($existingAssignment) {
-            Write-Info "$RoleLabel already assigned"
-            return "existing"
-        }
+function Write-ManagementGroupRoleSummary {
+    param(
+        [string]$Status,
+        [string]$RoleLabel
+    )
 
-        New-AzRoleAssignment -ObjectId $PrincipalId -RoleDefinitionName $RoleDefinitionName -Scope $rootManagementGroupScope | Out-Null
-        Write-Success "Assigned $RoleLabel at the root management group"
-        return "created"
-    } catch {
-        Write-Error-Custom "Failed to assign ${RoleLabel}: $_"
-        Write-Info "This may occur if:"
-        Write-Info "  - You don't have sufficient permissions at the root management group"
-        Write-Info "  - Management Groups are not enabled in your tenant"
-        Write-Info "  - The root management group could not be resolved in the selected tenant"
-        Write-Info "  - You need to manually assign this at the root management group in Azure Portal > Management Groups"
-        if ($_.Exception.Message -match "Forbidden|AuthorizationFailed|does not have authorization") {
-            Write-PimTroubleshootingHint
-            Write-TenantWidePimTroubleshootingHint -ScopeLabel "Root management group"
-        }
-        return "failed"
+    switch ($Status) {
+        "created" { Write-Success "$RoleLabel assigned on visible management group scope(s)" }
+        "existing" { Write-Success "$RoleLabel already existed on visible management group scope(s)" }
+        "processed" { Write-Success "$RoleLabel processed on visible management group scope(s)" }
+        "partial" { Write-Warning-Custom "$RoleLabel was assigned on some visible management groups but failed on others" }
+        "failed" { Write-Error-Custom "$RoleLabel could not be assigned on visible management groups" }
+        "unavailable" { Write-Warning-Custom "$RoleLabel was not assigned because no management groups were visible" }
+        "skipped" { Write-Skipped "$RoleLabel skipped" }
+        default { Write-Skipped "$RoleLabel was not processed on management groups" }
     }
 }
 
@@ -1631,7 +1836,7 @@ function Select-BillingExportStorageAccount {
     }
 
     Write-SectionLabel "Billing export storage"
-    Write-OptionRow -Key "1" -Label "Create a new storage account" -Description "Recommended when no suitable export storage exists."
+    Write-OptionRow -Key "1" -Label "Create a new storage account" -Description "Create a dedicated destination for Cost Management exports."
     Write-OptionRow -Key "2" -Label "Use an existing storage account" -Description "The script will keep anonymous access off and grant Spotto blob read access."
 
     $selectedOptionIndex = Read-IndexedSelection -Prompt "Select storage option (1/2)" -MaxValue 2
@@ -1779,6 +1984,715 @@ function Get-AzRestCollection {
     }
 
     return @($items)
+}
+
+function New-PrerequisiteCheckResult {
+    param(
+        [string]$Name,
+        [ValidateSet("ready", "action", "pim", "unconfirmed", "manual", "info")]
+        [string]$Status,
+        [string]$Scope = "",
+        [string]$Detail = "",
+        [string]$Category = "General",
+        [bool]$Required = $true
+    )
+
+    return [pscustomobject]@{
+        Name = $Name
+        Status = $Status
+        Scope = $Scope
+        Detail = $Detail
+        Category = $Category
+        Required = $Required
+    }
+}
+
+function Get-SafeAzureAssessmentFailure {
+    param([object]$ErrorRecord)
+
+    $message = if ($ErrorRecord -and $ErrorRecord.Exception) { [string]$ErrorRecord.Exception.Message } else { [string]$ErrorRecord }
+    if ($message -match "AadPremiumLicenseRequired") {
+        return "Azure could not return PIM eligibility because the tenant license does not include this capability."
+    }
+    if ($message -match "Forbidden|AuthorizationFailed|does not have authorization|status code.? 403|Response status code does not indicate success: 403") {
+        return "Azure denied this read request."
+    }
+    if ($message -match "Unauthorized|status code.? 401|Response status code does not indicate success: 401") {
+        return "The Azure session was not authorized for this read request."
+    }
+    if ($message -match "NotFound|status code.? 404|Response status code does not indicate success: 404") {
+        return "Azure does not expose this check at the requested scope."
+    }
+
+    return "Azure did not return a usable result for this read request."
+}
+
+function Test-AzurePermissionSetGrantsAction {
+    param(
+        [object[]]$Permissions,
+        [string]$RequiredAction
+    )
+
+    foreach ($permission in @($Permissions)) {
+        $isAllowed = $false
+        foreach ($action in @($permission.actions)) {
+            if (Test-AzureActionMatchesPattern -RequiredAction $RequiredAction -ActionPattern $action) {
+                $isAllowed = $true
+                break
+            }
+        }
+
+        if (-not $isAllowed) {
+            continue
+        }
+
+        foreach ($notAction in @($permission.notActions)) {
+            if (Test-AzureActionMatchesPattern -RequiredAction $RequiredAction -ActionPattern $notAction) {
+                $isAllowed = $false
+                break
+            }
+        }
+
+        if ($isAllowed) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-AzurePermissionActionAssessmentAtScope {
+    param(
+        [string]$Scope,
+        [string]$RequiredAction
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Scope) -or [string]::IsNullOrWhiteSpace($RequiredAction)) {
+        return New-PrerequisiteCheckResult -Name "Azure permission" -Status "unconfirmed" -Scope $Scope -Detail "The scope or required action was missing."
+    }
+
+    $normalizedScope = $Scope.Trim().TrimEnd("/")
+    $permissionsPath = if ([string]::IsNullOrWhiteSpace($normalizedScope)) {
+        "/providers/Microsoft.Authorization/permissions?api-version=2022-04-01"
+    } else {
+        "$normalizedScope/providers/Microsoft.Authorization/permissions?api-version=2022-04-01"
+    }
+
+    try {
+        $permissionsResponse = Invoke-AzRestGetJson -Path $permissionsPath
+        if (-not $permissionsResponse -or -not $permissionsResponse.PSObject.Properties["value"]) {
+            return New-PrerequisiteCheckResult -Name "Azure permission" -Status "unconfirmed" -Scope $Scope -Detail "Azure returned no effective-permissions result."
+        }
+
+        if (Test-AzurePermissionSetGrantsAction -Permissions @($permissionsResponse.value) -RequiredAction $RequiredAction) {
+            return New-PrerequisiteCheckResult -Name "Azure permission" -Status "ready" -Scope $Scope -Detail "Active effective permission confirmed."
+        }
+
+        return New-PrerequisiteCheckResult -Name "Azure permission" -Status "action" -Scope $Scope -Detail "No active effective permission grants $RequiredAction."
+    } catch {
+        return New-PrerequisiteCheckResult `
+            -Name "Azure permission" `
+            -Status "unconfirmed" `
+            -Scope $Scope `
+            -Detail (Get-SafeAzureAssessmentFailure -ErrorRecord $_)
+    }
+}
+
+function Get-ExactScopeRoleAssignmentActionAssessment {
+    param(
+        [string]$Scope,
+        [string]$PrincipalObjectId,
+        [string]$RequiredAction
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Scope) -or [string]::IsNullOrWhiteSpace($PrincipalObjectId) -or [string]::IsNullOrWhiteSpace($RequiredAction)) {
+        return New-PrerequisiteCheckResult -Name "Azure role assignment" -Status "unconfirmed" -Scope $Scope -Detail "The signed-in principal or target scope could not be resolved."
+    }
+
+    $normalizedScope = if ($Scope.Trim() -eq "/") { "/" } else { $Scope.Trim().TrimEnd("/") }
+    $scopePrefix = if ($normalizedScope -eq "/") { "" } else { $normalizedScope }
+    $filter = [uri]::EscapeDataString("atScope() and assignedTo('$PrincipalObjectId')")
+    $assignmentPath = "$scopePrefix/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&`$filter=$filter"
+    $conditionalAssignmentFound = $false
+    $unresolvedRoleDefinitionFound = $false
+
+    try {
+        $assignments = @(Get-AzRestCollection -Path $assignmentPath -Quiet $true -ThrowOnError $true)
+        $roleDefinitions = @{}
+
+        foreach ($assignment in $assignments) {
+            if (-not $assignment.properties -or ([string]$assignment.properties.scope).TrimEnd("/") -ine $normalizedScope.TrimEnd("/")) {
+                continue
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace([string]$assignment.properties.condition)) {
+                $conditionalAssignmentFound = $true
+                continue
+            }
+
+            $roleDefinitionId = [string]$assignment.properties.roleDefinitionId
+            if ([string]::IsNullOrWhiteSpace($roleDefinitionId) -or $roleDefinitionId -notmatch "^/") {
+                $unresolvedRoleDefinitionFound = $true
+                continue
+            }
+
+            if (-not $roleDefinitions.ContainsKey($roleDefinitionId)) {
+                try {
+                    $roleDefinitions[$roleDefinitionId] = Invoke-AzRestGetJson -Path "${roleDefinitionId}?api-version=2022-04-01"
+                } catch {
+                    $roleDefinitions[$roleDefinitionId] = $null
+                }
+            }
+
+            $roleDefinition = $roleDefinitions[$roleDefinitionId]
+            if (-not $roleDefinition -or -not $roleDefinition.properties) {
+                $unresolvedRoleDefinitionFound = $true
+                continue
+            }
+
+            if (Test-AzurePermissionSetGrantsAction -Permissions @($roleDefinition.properties.permissions) -RequiredAction $RequiredAction) {
+                $roleName = [string]$roleDefinition.properties.roleName
+                $detail = if ([string]::IsNullOrWhiteSpace($roleName)) { "Active unrestricted role assignment confirmed." } else { "Active through $roleName." }
+                return New-PrerequisiteCheckResult -Name "Azure role assignment" -Status "ready" -Scope $Scope -Detail $detail
+            }
+        }
+
+        if ($conditionalAssignmentFound -or $unresolvedRoleDefinitionFound) {
+            return New-PrerequisiteCheckResult `
+                -Name "Azure role assignment" `
+                -Status "unconfirmed" `
+                -Scope $Scope `
+                -Detail "A conditional or unresolved role assignment exists, so effective assignment authority cannot be confirmed safely."
+        }
+
+        return New-PrerequisiteCheckResult -Name "Azure role assignment" -Status "action" -Scope $Scope -Detail "No active unrestricted role grants $RequiredAction at this exact scope."
+    } catch {
+        return New-PrerequisiteCheckResult `
+            -Name "Azure role assignment" `
+            -Status "unconfirmed" `
+            -Scope $Scope `
+            -Detail (Get-SafeAzureAssessmentFailure -ErrorRecord $_)
+    }
+}
+
+function Get-ProviderScopeRoleAssignmentAssessment {
+    param(
+        [string]$Scope,
+        [string]$PrincipalObjectId,
+        [string]$RequiredAction,
+        [object]$TenantRootAssessment
+    )
+
+    if ($TenantRootAssessment -and $TenantRootAssessment.Status -eq "ready") {
+        return New-PrerequisiteCheckResult -Name "Provider role assignment" -Status "ready" -Scope $Scope -Detail "Active authority is inherited from tenant root scope (/)."
+    }
+
+    $providerAssessment = Get-ExactScopeRoleAssignmentActionAssessment `
+        -Scope $Scope `
+        -PrincipalObjectId $PrincipalObjectId `
+        -RequiredAction $RequiredAction
+
+    if ($providerAssessment.Status -eq "ready") {
+        return $providerAssessment
+    }
+
+    if ($providerAssessment.Status -eq "unconfirmed" -or ($TenantRootAssessment -and $TenantRootAssessment.Status -eq "unconfirmed")) {
+        return New-PrerequisiteCheckResult -Name "Provider role assignment" -Status "unconfirmed" -Scope $Scope -Detail "Neither inherited tenant-root nor exact provider-scope authority could be fully confirmed."
+    }
+
+    return New-PrerequisiteCheckResult -Name "Provider role assignment" -Status "action" -Scope $Scope -Detail "No active tenant-root or exact provider-scope role can assign access here."
+}
+
+function ConvertTo-AzureDateTimeOrNull {
+    param([object]$Value)
+
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+        return $null
+    }
+
+    try {
+        return ([datetime]$Value).ToUniversalTime()
+    } catch {
+        return $null
+    }
+}
+
+function Get-AzureResourcePimEligibility {
+    param(
+        [string]$RequiredAction = "Microsoft.Authorization/roleAssignments/write",
+        [datetime]$ReferenceTime = (Get-Date)
+    )
+
+    $eligibilityPath = "/providers/Microsoft.Authorization/roleEligibilityScheduleInstances?api-version=2020-10-01&`$filter=asTarget()"
+    try {
+        $scheduleInstances = @(Get-AzRestCollection -Path $eligibilityPath -Quiet $true -ThrowOnError $true)
+    } catch {
+        return [pscustomobject]@{
+            QueryStatus = "unconfirmed"
+            QueryMessage = Get-SafeAzureAssessmentFailure -ErrorRecord $_
+            Items = @()
+        }
+    }
+
+    $roleDefinitions = @{}
+    $eligibilityItems = @()
+    $referenceUtc = $ReferenceTime.ToUniversalTime()
+    $inactiveStatuses = @("Denied", "Revoked", "Canceled", "Failed", "Invalid", "TimedOut", "AdminDenied")
+
+    foreach ($scheduleInstance in $scheduleInstances) {
+        if (-not $scheduleInstance.properties) {
+            continue
+        }
+
+        $status = [string]$scheduleInstance.properties.status
+        if ($status -in $inactiveStatuses) {
+            continue
+        }
+
+        $startDateTime = ConvertTo-AzureDateTimeOrNull -Value $scheduleInstance.properties.startDateTime
+        $endDateTime = ConvertTo-AzureDateTimeOrNull -Value $scheduleInstance.properties.endDateTime
+        if ($endDateTime -and $endDateTime -le $referenceUtc) {
+            continue
+        }
+
+        $roleDefinitionId = [string]$scheduleInstance.properties.roleDefinitionId
+        $roleName = [string]$scheduleInstance.properties.expandedProperties.roleDefinition.displayName
+        $roleDefinitionResolved = $false
+        $grantsRequiredAction = $false
+
+        if (-not [string]::IsNullOrWhiteSpace($roleDefinitionId) -and $roleDefinitionId -match "^/") {
+            if (-not $roleDefinitions.ContainsKey($roleDefinitionId)) {
+                try {
+                    $roleDefinitions[$roleDefinitionId] = Invoke-AzRestGetJson -Path "${roleDefinitionId}?api-version=2022-04-01"
+                } catch {
+                    $roleDefinitions[$roleDefinitionId] = $null
+                }
+            }
+
+            $roleDefinition = $roleDefinitions[$roleDefinitionId]
+            if ($roleDefinition -and $roleDefinition.properties) {
+                $roleDefinitionResolved = $true
+                if ([string]::IsNullOrWhiteSpace($roleName)) {
+                    $roleName = [string]$roleDefinition.properties.roleName
+                }
+                $grantsRequiredAction = Test-AzurePermissionSetGrantsAction `
+                    -Permissions @($roleDefinition.properties.permissions) `
+                    -RequiredAction $RequiredAction
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($roleName)) {
+            $roleName = if ([string]::IsNullOrWhiteSpace($roleDefinitionId)) { "Unknown Azure role" } else { $roleDefinitionId.Split("/")[-1] }
+        }
+
+        $condition = [string]$scheduleInstance.properties.condition
+        $permissionStatus = if (-not $roleDefinitionResolved) {
+            "unconfirmed"
+        } elseif ($grantsRequiredAction -and -not [string]::IsNullOrWhiteSpace($condition)) {
+            "conditional"
+        } elseif ($grantsRequiredAction) {
+            "action"
+        } else {
+            "not-relevant"
+        }
+
+        $currentlyActivatable = (-not $startDateTime -or $startDateTime -le $referenceUtc) -and (-not $endDateTime -or $endDateTime -gt $referenceUtc)
+        $eligibilityItems += [pscustomobject]@{
+            RoleName = $roleName
+            Scope = [string]$scheduleInstance.properties.scope
+            MemberType = [string]$scheduleInstance.properties.memberType
+            StartDateTime = $startDateTime
+            EndDateTime = $endDateTime
+            CurrentlyActivatable = $currentlyActivatable
+            PermissionStatus = $permissionStatus
+            Condition = $condition
+        }
+    }
+
+    return [pscustomobject]@{
+        QueryStatus = "ready"
+        QueryMessage = "Azure resource-role PIM eligibility query completed."
+        Items = @($eligibilityItems)
+    }
+}
+
+function Test-PimEligibilityCoversScope {
+    param(
+        [object]$Eligibility,
+        [string]$TargetScope,
+        [string]$TenantId
+    )
+
+    if (-not $Eligibility -or -not $Eligibility.CurrentlyActivatable -or $Eligibility.PermissionStatus -ne "action") {
+        return $false
+    }
+
+    $eligibilityScope = ([string]$Eligibility.Scope).Trim().TrimEnd("/")
+    $normalizedTargetScope = $TargetScope.Trim().TrimEnd("/")
+    if ([string]::IsNullOrWhiteSpace($eligibilityScope)) {
+        $eligibilityScope = "/"
+    }
+    if ([string]::IsNullOrWhiteSpace($normalizedTargetScope)) {
+        $normalizedTargetScope = "/"
+    }
+
+    if ($eligibilityScope -eq "/" -or $eligibilityScope -ieq $normalizedTargetScope) {
+        return $true
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($TenantId)) {
+        $tenantRootManagementGroupScope = "/providers/Microsoft.Management/managementGroups/$TenantId"
+        if ($eligibilityScope -ieq $tenantRootManagementGroupScope -and (
+            $normalizedTargetScope -match "^/subscriptions/" -or
+            $normalizedTargetScope -match "^/providers/Microsoft\.Management/managementGroups/"
+        )) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function ConvertTo-PrerequisiteResultWithPim {
+    param(
+        [object]$ActiveAssessment,
+        [object[]]$PimEligibilityItems,
+        [string]$Name,
+        [string]$Scope,
+        [string]$TenantId,
+        [string]$Category,
+        [bool]$Required = $true
+    )
+
+    if ($ActiveAssessment.Status -ne "action") {
+        return New-PrerequisiteCheckResult `
+            -Name $Name `
+            -Status $ActiveAssessment.Status `
+            -Scope $Scope `
+            -Detail $ActiveAssessment.Detail `
+            -Category $Category `
+            -Required $Required
+    }
+
+    $matchingPimRoles = @($PimEligibilityItems | Where-Object {
+        Test-PimEligibilityCoversScope -Eligibility $_ -TargetScope $Scope -TenantId $TenantId
+    })
+    if ($matchingPimRoles.Count -gt 0) {
+        $firstMatch = $matchingPimRoles[0]
+        $extraCount = $matchingPimRoles.Count - 1
+        $extraText = if ($extraCount -gt 0) { " and $extraCount other eligible role(s)" } else { "" }
+        return New-PrerequisiteCheckResult `
+            -Name $Name `
+            -Status "pim" `
+            -Scope $Scope `
+            -Detail "Activate $($firstMatch.RoleName) at $($firstMatch.Scope)$extraText, reconnect, and rerun this check." `
+            -Category $Category `
+            -Required $Required
+    }
+
+    return New-PrerequisiteCheckResult `
+        -Name $Name `
+        -Status "action" `
+        -Scope $Scope `
+        -Detail $ActiveAssessment.Detail `
+        -Category $Category `
+        -Required $Required
+}
+
+function Get-ReservationReadAssessment {
+    try {
+        $reservationOrders = @(Get-AzRestCollection `
+            -Path "/providers/Microsoft.Capacity/reservationOrders?api-version=2022-11-01" `
+            -Quiet $true `
+            -ThrowOnError $true)
+        return New-PrerequisiteCheckResult `
+            -Name "Operator reservation inventory" `
+            -Status "ready" `
+            -Scope "/providers/Microsoft.Capacity" `
+            -Detail "Reservation inventory read succeeded; $($reservationOrders.Count) accessible order(s) returned." `
+            -Category "ProviderRead" `
+            -Required $false
+    } catch {
+        $safeFailure = Get-SafeAzureAssessmentFailure -ErrorRecord $_
+        $status = if ($safeFailure -match "denied") { "info" } else { "unconfirmed" }
+        $operatorVisibilityDetail = if ($status -eq "info") {
+            "The signed-in operator cannot currently read reservation inventory."
+        } else {
+            $safeFailure
+        }
+        return New-PrerequisiteCheckResult `
+            -Name "Operator reservation inventory" `
+            -Status $status `
+            -Scope "/providers/Microsoft.Capacity" `
+            -Detail "$operatorVisibilityDetail This does not replace the separate check for authority to grant Spotto Reservations Reader." `
+            -Category "ProviderRead" `
+            -Required $false
+    }
+}
+
+function Write-PrerequisiteCheckResultLine {
+    param([object]$Result)
+
+    $message = $Result.Name
+    if (-not [string]::IsNullOrWhiteSpace([string]$Result.Scope)) {
+        $message += " - $($Result.Scope)"
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Result.Detail)) {
+        $message += ": $($Result.Detail)"
+    }
+
+    switch ($Result.Status) {
+        "ready" { Write-Success $message }
+        "pim" { Write-Warning-Custom "PIM eligible: $message" }
+        "action" { Write-Error-Custom "Action needed: $message" }
+        "unconfirmed" { Write-Warning-Custom "Unconfirmed: $message" }
+        "manual" { Write-Info "Manual check: $message" }
+        default { Write-Info $message }
+    }
+}
+
+function Write-PrerequisiteScopeCategory {
+    param(
+        [object[]]$Results,
+        [string]$Category,
+        [string]$ReadyLabel
+    )
+
+    $categoryResults = @($Results | Where-Object { $_.Category -eq $Category })
+    if ($categoryResults.Count -eq 0) {
+        return
+    }
+
+    $readyCount = @($categoryResults | Where-Object { $_.Status -eq "ready" }).Count
+    if ($readyCount -gt 0) {
+        Write-Success "${ReadyLabel}: $readyCount of $($categoryResults.Count) ready"
+    }
+
+    foreach ($result in @($categoryResults | Where-Object { $_.Status -ne "ready" })) {
+        Write-PrerequisiteCheckResultLine -Result $result
+    }
+}
+
+function Invoke-SpottoAzurePrerequisiteCheck {
+    param(
+        [string]$TenantId,
+        [object[]]$Subscriptions
+    )
+
+    Write-Header -Message "Azure Prerequisite Check" -Subtitle "Read-only assessment; no Azure resources or permissions are changed"
+
+    $results = @()
+    $originalContext = Get-AzContext -ErrorAction SilentlyContinue
+    $currentContext = $originalContext
+    $accountId = if ($currentContext -and $currentContext.Account) { [string]$currentContext.Account.Id } else { "Unknown account" }
+    Write-DetailRow -Label "Signed-in account" -Value $accountId
+    Write-DetailRow -Label "Tenant ID" -Value $TenantId
+    Write-DetailRow -Label "Subscriptions visible" -Value "$($Subscriptions.Count)"
+    Write-Host ""
+
+    $principalObjectId = Get-SignedInPrincipalObjectId
+    $pimEligibility = Get-AzureResourcePimEligibility
+    $pimItems = if ($pimEligibility.QueryStatus -eq "ready") { @($pimEligibility.Items) } else { @() }
+
+    $rootAssessment = if ([string]::IsNullOrWhiteSpace($principalObjectId)) {
+        New-PrerequisiteCheckResult -Name "Tenant-root role assignment" -Status "unconfirmed" -Scope "/" -Detail "The signed-in principal object ID could not be resolved."
+    } else {
+        Get-ExactScopeRoleAssignmentActionAssessment `
+            -Scope "/" `
+            -PrincipalObjectId $principalObjectId `
+            -RequiredAction "Microsoft.Authorization/roleAssignments/write"
+    }
+    $rootResult = ConvertTo-PrerequisiteResultWithPim `
+        -ActiveAssessment $rootAssessment `
+        -PimEligibilityItems $pimItems `
+        -Name "Tenant-root assignment fast path" `
+        -Scope "/" `
+        -TenantId $TenantId `
+        -Category "General" `
+        -Required $false
+    if ($rootResult.Status -eq "action") {
+        $rootResult.Status = "info"
+        $rootResult.Detail = "Not active; Recommended setup can still use the subscription-by-subscription fallback."
+    }
+    $results += $rootResult
+
+    foreach ($subscription in @($Subscriptions)) {
+        $scope = "/subscriptions/$($subscription.Id)"
+        try {
+            Set-AzContext -SubscriptionId $subscription.Id -TenantId $TenantId -ErrorAction Stop | Out-Null
+            $activeAssessment = Get-AzurePermissionActionAssessmentAtScope `
+                -Scope $scope `
+                -RequiredAction "Microsoft.Authorization/roleAssignments/write"
+        } catch {
+            $activeAssessment = New-PrerequisiteCheckResult `
+                -Name "Subscription role assignment" `
+                -Status "unconfirmed" `
+                -Scope $scope `
+                -Detail (Get-SafeAzureAssessmentFailure -ErrorRecord $_)
+        }
+
+        $results += ConvertTo-PrerequisiteResultWithPim `
+            -ActiveAssessment $activeAssessment `
+            -PimEligibilityItems $pimItems `
+            -Name "$($subscription.Name)" `
+            -Scope $scope `
+            -TenantId $TenantId `
+            -Category "Subscription"
+    }
+
+    $visibleManagementGroups = @(Get-VisibleManagementGroupTargets -TenantId $TenantId)
+    if ($visibleManagementGroups.Count -eq 0) {
+        $managementGroupDiscoveryResultStatus = if ($script:managementGroupDiscoveryStatus -eq "ready") { "action" } else { "unconfirmed" }
+        $managementGroupDiscoveryDetail = if ([string]::IsNullOrWhiteSpace($script:managementGroupDiscoveryMessage)) {
+            "Management-group visibility could not be determined."
+        } else {
+            $script:managementGroupDiscoveryMessage
+        }
+        $results += New-PrerequisiteCheckResult `
+            -Name "Management group discovery" `
+            -Status $managementGroupDiscoveryResultStatus `
+            -Detail $managementGroupDiscoveryDetail `
+            -Category "ManagementGroup"
+    } else {
+        foreach ($managementGroup in $visibleManagementGroups) {
+            $managementGroupScope = Get-ManagementGroupScope -ManagementGroup $managementGroup
+            $managementGroupLabel = Get-ManagementGroupDisplayLabel -ManagementGroup $managementGroup -TenantId $TenantId
+            $activeAssessment = Get-AzurePermissionActionAssessmentAtScope `
+                -Scope $managementGroupScope `
+                -RequiredAction "Microsoft.Authorization/roleAssignments/write"
+            $results += ConvertTo-PrerequisiteResultWithPim `
+                -ActiveAssessment $activeAssessment `
+                -PimEligibilityItems $pimItems `
+                -Name $managementGroupLabel `
+                -Scope $managementGroupScope `
+                -TenantId $TenantId `
+                -Category "ManagementGroup"
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($principalObjectId)) {
+        foreach ($providerScope in @("/providers/Microsoft.Capacity", "/providers/Microsoft.BillingBenefits")) {
+            $results += New-PrerequisiteCheckResult `
+                -Name "Provider role assignment" `
+                -Status "unconfirmed" `
+                -Scope $providerScope `
+                -Detail "The signed-in principal object ID could not be resolved." `
+                -Category "Provider"
+        }
+    } else {
+        $reservationProviderAssessment = Get-ProviderScopeRoleAssignmentAssessment `
+            -Scope "/providers/Microsoft.Capacity" `
+            -PrincipalObjectId $principalObjectId `
+            -RequiredAction "Microsoft.Authorization/roleAssignments/write" `
+            -TenantRootAssessment $rootAssessment
+        $results += ConvertTo-PrerequisiteResultWithPim `
+            -ActiveAssessment $reservationProviderAssessment `
+            -PimEligibilityItems $pimItems `
+            -Name "Grant Reservations Reader" `
+            -Scope "/providers/Microsoft.Capacity" `
+            -TenantId $TenantId `
+            -Category "Provider"
+
+        $savingsPlanProviderAssessment = Get-ProviderScopeRoleAssignmentAssessment `
+            -Scope "/providers/Microsoft.BillingBenefits" `
+            -PrincipalObjectId $principalObjectId `
+            -RequiredAction "Microsoft.Authorization/roleAssignments/write" `
+            -TenantRootAssessment $rootAssessment
+        $results += ConvertTo-PrerequisiteResultWithPim `
+            -ActiveAssessment $savingsPlanProviderAssessment `
+            -PimEligibilityItems $pimItems `
+            -Name "Grant Savings plan Reader" `
+            -Scope "/providers/Microsoft.BillingBenefits" `
+            -TenantId $TenantId `
+            -Category "Provider"
+    }
+
+    $results += Get-ReservationReadAssessment
+    $results += New-PrerequisiteCheckResult `
+        -Name "Entra app registration and Microsoft Graph admin consent" `
+        -Status "manual" `
+        -Detail "Confirm an active app-management role and a role allowed to grant Graph application admin consent. This check does not request extra Graph access to inspect Entra roles or Entra PIM." `
+        -Category "Manual" `
+        -Required $false
+
+    if ($originalContext) {
+        try {
+            Set-AzContext -Context $originalContext -ErrorAction Stop | Out-Null
+        } catch {
+            Write-Info "The original local Azure context could not be restored automatically."
+        }
+    }
+
+    Write-SectionLabel "Assessment results"
+    Write-PrerequisiteScopeCategory -Results $results -Category "Subscription" -ReadyLabel "Subscription role-assignment authority"
+    Write-PrerequisiteScopeCategory -Results $results -Category "ManagementGroup" -ReadyLabel "Management-group role-assignment authority"
+    foreach ($result in @($results | Where-Object { $_.Category -notin @("Subscription", "ManagementGroup") })) {
+        Write-PrerequisiteCheckResultLine -Result $result
+    }
+
+    Write-Host ""
+    Write-SectionLabel "Azure resource PIM"
+    if ($pimEligibility.QueryStatus -ne "ready") {
+        Write-Warning-Custom "PIM eligibility unconfirmed: $($pimEligibility.QueryMessage)"
+        Write-Info "This does not prove that PIM is disabled or that the signed-in account has no eligible roles."
+    } elseif ($pimItems.Count -eq 0) {
+        Write-Info "Azure returned no current or upcoming eligible resource roles for the signed-in account."
+        Write-Info "This does not prove that PIM is disabled; it only describes this account's returned eligibility."
+    } else {
+        Write-Info "Azure returned $($pimItems.Count) current or upcoming eligible resource role(s). Eligible does not mean active."
+        foreach ($pimItem in ($pimItems | Select-Object -First 10)) {
+            $availability = if (-not $pimItem.CurrentlyActivatable) {
+                "not active yet"
+            } elseif ($pimItem.PermissionStatus -eq "action") {
+                "can provide role-assignment authority after activation"
+            } elseif ($pimItem.PermissionStatus -eq "conditional") {
+                "conditional; authority is unconfirmed"
+            } else {
+                "does not provide the required role-assignment action"
+            }
+            $membership = if ([string]::IsNullOrWhiteSpace($pimItem.MemberType)) { "unknown membership" } else { "$($pimItem.MemberType.ToLowerInvariant()) membership" }
+            Write-Info "$($pimItem.RoleName) at $($pimItem.Scope) - $availability; $membership"
+        }
+        if ($pimItems.Count -gt 10) {
+            Write-Info "Showing 10 of $($pimItems.Count) eligible roles; the transcript contains the same concise assessment output."
+        }
+    }
+
+    $requiredResults = @($results | Where-Object { $_.Required })
+    $actionCount = @($requiredResults | Where-Object { $_.Status -eq "action" }).Count
+    $pimCount = @($requiredResults | Where-Object { $_.Status -eq "pim" }).Count
+    $unconfirmedCount = @($requiredResults | Where-Object { $_.Status -eq "unconfirmed" }).Count
+    $readyCount = @($requiredResults | Where-Object { $_.Status -eq "ready" }).Count
+
+    Write-Host ""
+    Write-SectionLabel "Prerequisite summary"
+    Write-DetailRow -Label "Ready" -Value "$readyCount"
+    Write-DetailRow -Label "PIM activation needed" -Value "$pimCount"
+    Write-DetailRow -Label "Action needed" -Value "$actionCount"
+    Write-DetailRow -Label "Unconfirmed" -Value "$unconfirmedCount"
+
+    $outcome = if ($actionCount -gt 0) {
+        Write-Error-Custom "Azure RBAC prerequisites are not ready. Resolve the action-needed items, reconnect, and rerun this check."
+        "action"
+    } elseif ($pimCount -gt 0) {
+        Write-Warning-Custom "Eligible PIM access was found but is not active. Activate it, reconnect, and rerun this check."
+        "pim"
+    } elseif ($unconfirmedCount -gt 0) {
+        Write-Warning-Custom "No confirmed Azure RBAC blocker was found, but some required checks could not be confirmed."
+        "unconfirmed"
+    } else {
+        Write-Success "Active Azure RBAC prerequisites are ready for Recommended read-only setup."
+        "ready"
+    }
+
+    Write-Info "No Azure resources, applications, secrets, permissions, role assignments, exports, storage, or provider registrations were changed."
+    Write-Info "Local PowerShell modules may have been installed, and the local Azure session/context was used for these read-only checks."
+
+    return [pscustomobject]@{
+        Outcome = $outcome
+        Results = @($results)
+        PimEligibility = $pimEligibility
+    }
 }
 
 function Test-BillingCostExportScope {
@@ -2907,7 +3821,9 @@ function Ensure-RecurringAndBackfillExports {
 # MAIN SCRIPT
 # ============================================================================
 
-Write-Header -Message "Spotto Azure Setup" -Subtitle "Creates or repairs your Spotto connection"
+$mainHeaderMessage = if ($script:usePrerequisiteCheck) { "Spotto Azure Prerequisite Check" } else { "Spotto Azure Setup" }
+$mainHeaderSubtitle = if ($script:usePrerequisiteCheck) { "Checks operator access without changing Azure" } else { "Creates or repairs your Spotto connection" }
+Write-Header -Message $mainHeaderMessage -Subtitle $mainHeaderSubtitle
 
 Write-Host "This wizard is safe to rerun. It reuses existing resources where possible and"
 Write-Host "adds any missing access."
@@ -2919,21 +3835,34 @@ if ($script:useRecommendedReadOnlySetup) {
     Write-DetailRow -Label "Scope" -Value "All subscriptions"
     Write-DetailRow -Label "Includes" -Value "Spotto reader permissions"
     Write-DetailRow -Label "Excludes" -Value "Billing exports and optional write access"
+} elseif ($script:usePrerequisiteCheck) {
+    Write-DetailRow -Label "Selected" -Value "Check prerequisites"
+    Write-DetailRow -Label "Scope" -Value "All subscriptions and visible management groups"
+    Write-DetailRow -Label "Includes" -Value "Active Azure RBAC, Reservations, Savings Plans, and Azure resource PIM checks"
+    Write-DetailRow -Label "Azure changes" -Value "None"
 } else {
     Write-DetailRow -Label "Selected" -Value "Custom setup"
     Write-DetailRow -Label "Choices" -Value "The wizard asks which read and optional write capabilities to add"
 }
 Write-Host ""
 
-Write-Info "Next, choose the Azure account, tenant, and subscriptions to connect."
-Write-Info "If you use PIM, activate the required admin roles before continuing."
+if ($script:usePrerequisiteCheck) {
+    Write-Info "Next, choose the Azure account and tenant to assess. All visible subscriptions are checked."
+} else {
+    Write-Info "Next, choose the Azure account, tenant, and subscriptions to connect."
+}
+if ($script:usePrerequisiteCheck) {
+    Write-Info "The check distinguishes active access from eligible Azure resource PIM roles."
+} else {
+    Write-Info "If you use PIM, activate the required admin roles before continuing."
+}
 Write-Info "Detailed requirements: https://docs.spotto.ai/portal/cloud-account-azure/powershell"
 
 # ============================================================================
 # Step 1: Connect to Azure
 # ============================================================================
 
-Write-Header -Message "Step 1 of 13: Connect to Azure"
+Write-Header -Message ("Step 1 of {0}: Connect to Azure" -f $script:totalWizardSteps)
 
 try {
     $currentContext = Get-AzContext
@@ -2957,7 +3886,7 @@ try {
 # Step 2: Select Tenant
 # ============================================================================
 
-Write-Header -Message "Step 2 of 13: Select Tenant"
+Write-Header -Message ("Step 2 of {0}: Select Tenant" -f $script:totalWizardSteps)
 
 try {
     # Get all tenants the user has access to
@@ -3009,21 +3938,25 @@ try {
     exit 1
 }
 
-Write-SectionLabel "Azure session refresh"
-Write-Info "If you activated temporary access after this PowerShell session signed in, Azure may still be using old tokens."
-$refreshPimSession = Read-Host "Have you just activated temporary Azure access and want the script to reconnect now? (yes/no, default no)"
-if (Test-YesResponse -Value $refreshPimSession -DefaultYes $false) {
-    try {
-        Invoke-PimAzReconnect `
-            -TenantId $script:tenantId `
-            -Reason "Refreshing the Azure session after temporary access activation." |
-            Out-Null
-        Set-AzContext -TenantId $script:tenantId | Out-Null
-        Write-Success "Azure session refreshed for tenant $script:tenantId"
-    } catch {
-        Write-Error-Custom "Failed to refresh Azure session after temporary access activation: $_"
-        Write-PimTroubleshootingHint
-        exit 1
+if ($script:usePrerequisiteCheck) {
+    Write-Info "The prerequisite check uses the current Azure session so it can show which PIM access is eligible but not active."
+} else {
+    Write-SectionLabel "Azure session refresh"
+    Write-Info "If you activated temporary access after this PowerShell session signed in, Azure may still be using old tokens."
+    $refreshPimSession = Read-Host "Have you just activated temporary Azure access and want the script to reconnect now? (yes/no, default no)"
+    if (Test-YesResponse -Value $refreshPimSession -DefaultYes $false) {
+        try {
+            Invoke-PimAzReconnect `
+                -TenantId $script:tenantId `
+                -Reason "Refreshing the Azure session after temporary access activation." |
+                Out-Null
+            Set-AzContext -TenantId $script:tenantId | Out-Null
+            Write-Success "Azure session refreshed for tenant $script:tenantId"
+        } catch {
+            Write-Error-Custom "Failed to refresh Azure session after temporary access activation: $_"
+            Write-PimTroubleshootingHint
+            exit 1
+        }
     }
 }
 
@@ -3031,7 +3964,7 @@ if (Test-YesResponse -Value $refreshPimSession -DefaultYes $false) {
 # Step 3: Select Subscriptions
 # ============================================================================
 
-Write-Header -Message "Step 3 of 13: Select Subscriptions"
+Write-Header -Message ("Step 3 of {0}: Select Subscriptions" -f $script:totalWizardSteps)
 
 try {
     $subscriptions = @(Get-AzSubscription -TenantId $script:tenantId -WarningAction SilentlyContinue -ErrorAction Stop)
@@ -3060,8 +3993,10 @@ Write-Host ""
 Write-SectionLabel "Onboarding scope"
 if ($script:useRecommendedReadOnlySetup) {
     Write-DetailRow -Label "Selected" -Value "All subscriptions"
+} elseif ($script:usePrerequisiteCheck) {
+    Write-DetailRow -Label "Selected" -Value "Check all visible subscriptions"
 } else {
-    Write-OptionRow -Key "1" -Label "All subscriptions (default)" -Description "Assign Reader once at tenant root scope (/)."
+    Write-OptionRow -Key "1" -Label "All subscriptions (default)" -Description "Try tenant-root Reader, then fall back to each subscription if needed."
     Write-OptionRow -Key "2" -Label "Specific subscriptions" -Description "Choose one or more subscriptions by number."
 }
 
@@ -3075,11 +4010,17 @@ while (-not $scopeSelected) {
     if ($normalizedSelection -in @("1", "a", "all")) {
         $selectedSubscriptions = $subscriptions
         $script:useTenantRootReader = $true
+        $script:selectedAllSubscriptions = $true
         $scopeSelected = $true
         Write-Success "Selected all $($selectedSubscriptions.Count) subscriptions"
-        Write-Info "Reader access will be assigned once at tenant root scope (/)."
+        if ($script:usePrerequisiteCheck) {
+            Write-Info "The script will only read current access; it will not assign Reader or any other role."
+        } else {
+            Write-Info "Reader access will first be attempted once at tenant root scope (/)."
+        }
     } elseif ($normalizedSelection -in @("2", "s", "specific")) {
         $script:useTenantRootReader = $false
+        $script:selectedAllSubscriptions = $false
 
         Write-Host ""
         Write-SectionLabel "Available subscriptions"
@@ -3115,9 +4056,31 @@ while (-not $scopeSelected) {
     }
 }
 
+if ($script:usePrerequisiteCheck) {
+    $prerequisiteCheckResult = Invoke-SpottoAzurePrerequisiteCheck `
+        -TenantId $script:tenantId `
+        -Subscriptions $selectedSubscriptions
+
+    Write-Host ""
+    Write-Info "Stopping transcript. Prerequisite result: $($prerequisiteCheckResult.Outcome)."
+    try {
+        Stop-Transcript | Out-Null
+    } catch {
+        Write-Info "The PowerShell transcript was already stopped."
+    }
+    Write-Host "Prerequisite check complete. Review the results above or in $logPath." -ForegroundColor Cyan
+    Read-Host "Press Enter to exit"
+    exit 0
+}
+
 if ($script:useTenantRootReader) {
     if (-not (Test-TenantRootRoleAssignmentAccess)) {
-        exit 1
+        if (-not (Use-SubscriptionReaderFallback `
+            -Subscriptions $selectedSubscriptions `
+            -Reason "Tenant-root role assignment is unavailable. Falling back automatically.")) {
+            Write-Error-Custom "Reader access requires tenant-root authority or role-assignment authority on every selected subscription."
+            exit 1
+        }
     }
 } else {
     if (-not (Test-SelectedSubscriptionAccess -Subscriptions $selectedSubscriptions)) {
@@ -3271,11 +4234,17 @@ if ($script:useTenantRootReader) {
     Write-Info "All subscriptions were selected, so Reader will be assigned at tenant root scope (/)."
     $script:rootReaderAssignmentStatus = Ensure-TenantRootReaderAssignment -PrincipalId $sp.Id
     if ($script:rootReaderAssignmentStatus -eq "failed") {
-        Write-Error-Custom "Reader access is required. Activate the required role from the upfront checklist and rerun this script."
-        Write-PimTroubleshootingHint
-        exit 1
+        if (-not (Use-SubscriptionReaderFallback `
+            -Subscriptions $selectedSubscriptions `
+            -Reason "The tenant-root Reader assignment failed. Falling back automatically.")) {
+            Write-Error-Custom "Reader access requires tenant-root authority or role-assignment authority on every selected subscription."
+            Write-PimTroubleshootingHint
+            exit 1
+        }
     }
-} else {
+}
+
+if (-not $script:useTenantRootReader) {
     $readerAssignmentsSucceeded = Ensure-SubscriptionRoleAssignments -PrincipalId $sp.Id -Subscriptions $selectedSubscriptions -RoleDefinitionName "Reader" -RoleLabel "Reader role"
     if (-not $readerAssignmentsSucceeded) {
         Write-Error-Custom "Reader access is required for every selected subscription. Activate the required role from the upfront checklist and rerun this script."
@@ -3293,62 +4262,103 @@ Write-SectionLabel "Recommended read permissions"
 Write-DetailRow -Label "Monitoring Reader" -Value "Application Insights query access on selected subscriptions."
 Write-DetailRow -Label "Log Analytics Reader" -Value "Workspace log access for current and future analysis scenarios."
 Write-DetailRow -Label "Security Reader" -Value "Defender for Cloud assessments, secure score, and security posture on selected subscriptions."
-Write-DetailRow -Label "All subscriptions" -Value "Log Analytics Reader is assigned once at the root management group."
-Write-DetailRow -Label "Specific subscriptions" -Value "Log Analytics Reader is assigned on each selected subscription."
+Write-DetailRow -Label "Subscription coverage" -Value "All three roles are checked on every selected subscription."
+Write-DetailRow -Label "All subscriptions" -Value "Monitoring Reader and Log Analytics Reader are also checked on visible management groups."
 Write-Host ""
 $grantMonitoringReadPerms = Get-SetupCapabilityResponse `
     -Capability "Monitoring Reader, Log Analytics Reader, and Security Reader" `
     -Prompt "Do you want to grant these recommended monitoring and security roles?" `
     -RecommendedReadOnlyValue $true
 
+$monitoringReadRolesEnabled = $false
 if ([string]::IsNullOrWhiteSpace($grantMonitoringReadPerms) -or $grantMonitoringReadPerms -match "^(?i:yes)$") {
-    Ensure-SubscriptionRoleAssignments -PrincipalId $sp.Id -Subscriptions $selectedSubscriptions -RoleDefinitionName "Monitoring Reader" -RoleLabel "Monitoring Reader role"
-    Ensure-SubscriptionRoleAssignments -PrincipalId $sp.Id -Subscriptions $selectedSubscriptions -RoleDefinitionName "Security Reader" -RoleLabel "Security Reader role"
-
-    if ($script:useTenantRootReader) {
-        $script:logAnalyticsReaderStatus = Ensure-RootManagementGroupRoleAssignment -PrincipalId $sp.Id -RoleDefinitionName "Log Analytics Reader" -RoleLabel "Log Analytics Reader role"
-    } else {
-        Ensure-SubscriptionRoleAssignments -PrincipalId $sp.Id -Subscriptions $selectedSubscriptions -RoleDefinitionName "Log Analytics Reader" -RoleLabel "Log Analytics Reader role"
-        $script:logAnalyticsReaderStatus = "processed"
-    }
+    $monitoringReadRolesEnabled = $true
+    $monitoringReaderAssignmentsSucceeded = Ensure-SubscriptionRoleAssignments -PrincipalId $sp.Id -Subscriptions $selectedSubscriptions -RoleDefinitionName "Monitoring Reader" -RoleLabel "Monitoring Reader role"
+    $securityReaderAssignmentsSucceeded = Ensure-SubscriptionRoleAssignments -PrincipalId $sp.Id -Subscriptions $selectedSubscriptions -RoleDefinitionName "Security Reader" -RoleLabel "Security Reader role"
+    $logAnalyticsReaderAssignmentsSucceeded = Ensure-SubscriptionRoleAssignments -PrincipalId $sp.Id -Subscriptions $selectedSubscriptions -RoleDefinitionName "Log Analytics Reader" -RoleLabel "Log Analytics Reader role"
+    $script:subscriptionMonitoringReaderStatus = if ($monitoringReaderAssignmentsSucceeded) { "processed" } else { "failed" }
+    $script:subscriptionSecurityReaderStatus = if ($securityReaderAssignmentsSucceeded) { "processed" } else { "failed" }
+    $script:subscriptionLogAnalyticsReaderStatus = if ($logAnalyticsReaderAssignmentsSucceeded) { "processed" } else { "failed" }
 } elseif ($grantMonitoringReadPerms -match "^(?i:no)$") {
     Write-Info "Skipping recommended monitoring and security roles"
-    $script:logAnalyticsReaderStatus = "skipped"
+    $script:subscriptionMonitoringReaderStatus = "skipped"
+    $script:subscriptionSecurityReaderStatus = "skipped"
+    $script:subscriptionLogAnalyticsReaderStatus = "skipped"
 } else {
     Write-Info "Unrecognized response. Defaulting to no for the optional recommended monitoring roles."
-    $script:logAnalyticsReaderStatus = "skipped"
+    $script:subscriptionMonitoringReaderStatus = "skipped"
+    $script:subscriptionSecurityReaderStatus = "skipped"
+    $script:subscriptionLogAnalyticsReaderStatus = "skipped"
 }
 
 # ============================================================================
-# Step 8: Assign Root Management Group Governance Reader Roles
+# Step 8: Assign Visible Management Group Reader Roles
 # ============================================================================
 
-Write-Header -Message "Step 8 of 13: Assign Governance Reader Roles"
+Write-Header -Message "Step 8 of 13: Assign Management Group Reader Roles"
 
-Write-SectionLabel "Tenant governance permissions"
-Write-DetailRow -Label "Scope" -Value "Root management group."
-Write-DetailRow -Label "Roles" -Value "Reader and Management Group Reader."
-Write-DetailRow -Label "Requires" -Value "Owner, User Access Administrator, or Role Based Access Control Administrator at the root management group. Management Group Contributor alone cannot assign Azure RBAC roles."
+Write-SectionLabel "Visible management group permissions"
+Write-DetailRow -Label "Scope" -Value "Tenant root when available; otherwise every management group visible to this Azure session."
+Write-DetailRow -Label "Governance" -Value "Reader and Management Group Reader."
+Write-DetailRow -Label "Monitoring" -Value "Monitoring Reader and Log Analytics Reader in the all-subscriptions setup."
+Write-DetailRow -Label "Requires" -Value "Role-assignment authority at each management group. A failed scope does not stop the remaining groups."
 Write-Host ""
 $grantGovernanceReaderRoles = Get-SetupCapabilityResponse `
-    -Capability "root management group Reader and Management Group Reader" `
-    -Prompt "Do you want to grant root management group governance reader roles now?" `
-    -RecommendedReadOnlyValue $true
+    -Capability "visible management group Reader and Management Group Reader" `
+    -Prompt "Do you want to grant governance reader roles on every visible management group now?" `
+    -RecommendedReadOnlyValue $true `
+    -CustomDefaultYes $script:selectedAllSubscriptions
 
-if (Test-YesResponse -Value $grantGovernanceReaderRoles) {
-    try {
-        $script:rootManagementGroupReaderStatus = Ensure-RootManagementGroupRoleAssignment -PrincipalId $sp.Id -RoleDefinitionName "Reader" -RoleLabel "Reader role (root management group)"
-        $script:managementGroupReaderStatus = Ensure-RootManagementGroupRoleAssignment -PrincipalId $sp.Id -RoleDefinitionName "Management Group Reader" -RoleLabel "Management Group Reader role"
-    } catch {
-        $script:rootManagementGroupReaderStatus = "failed"
-        $script:managementGroupReaderStatus = "failed"
-        Write-Error-Custom "Failed to assign root management group governance reader roles: $_"
-        Write-TenantWidePimTroubleshootingHint -ScopeLabel "Root management group"
-    }
+$governanceReaderRolesEnabled = Test-YesResponse -Value $grantGovernanceReaderRoles
+$managementGroupMonitoringRolesEnabled = $monitoringReadRolesEnabled -and $script:selectedAllSubscriptions
+if ($governanceReaderRolesEnabled -or $managementGroupMonitoringRolesEnabled) {
+    $script:visibleManagementGroups = @(Get-VisibleManagementGroupTargets -TenantId $script:tenantId)
+}
+
+if ($governanceReaderRolesEnabled) {
+    $managementGroupAzureReaderResult = Ensure-ManagementGroupRoleAssignments `
+        -PrincipalId $sp.Id `
+        -ManagementGroups $script:visibleManagementGroups `
+        -TenantId $script:tenantId `
+        -RoleDefinitionName "Reader" `
+        -RoleLabel "Reader role"
+    $script:managementGroupAzureReaderStatus = $managementGroupAzureReaderResult.Status
+
+    $managementGroupReaderResult = Ensure-ManagementGroupRoleAssignments `
+        -PrincipalId $sp.Id `
+        -ManagementGroups $script:visibleManagementGroups `
+        -TenantId $script:tenantId `
+        -RoleDefinitionName "Management Group Reader" `
+        -RoleLabel "Management Group Reader role"
+    $script:managementGroupReaderStatus = $managementGroupReaderResult.Status
 } else {
-    $script:rootManagementGroupReaderStatus = "skipped"
+    $script:managementGroupAzureReaderStatus = "skipped"
     $script:managementGroupReaderStatus = "skipped"
-    Write-Info "Skipping root management group governance reader roles. Tenant hierarchy and management group governance analysis may be limited."
+    Write-Info "Skipping management group governance reader roles. Tenant hierarchy and management group governance analysis may be limited."
+}
+
+if ($managementGroupMonitoringRolesEnabled) {
+    $managementGroupMonitoringReaderResult = Ensure-ManagementGroupRoleAssignments `
+        -PrincipalId $sp.Id `
+        -ManagementGroups $script:visibleManagementGroups `
+        -TenantId $script:tenantId `
+        -RoleDefinitionName "Monitoring Reader" `
+        -RoleLabel "Monitoring Reader role"
+    $script:managementGroupMonitoringReaderStatus = $managementGroupMonitoringReaderResult.Status
+
+    $managementGroupLogAnalyticsReaderResult = Ensure-ManagementGroupRoleAssignments `
+        -PrincipalId $sp.Id `
+        -ManagementGroups $script:visibleManagementGroups `
+        -TenantId $script:tenantId `
+        -RoleDefinitionName "Log Analytics Reader" `
+        -RoleLabel "Log Analytics Reader role"
+    $script:managementGroupLogAnalyticsReaderStatus = $managementGroupLogAnalyticsReaderResult.Status
+} else {
+    $script:managementGroupMonitoringReaderStatus = "skipped"
+    $script:managementGroupLogAnalyticsReaderStatus = "skipped"
+    if ($monitoringReadRolesEnabled -and -not $script:selectedAllSubscriptions) {
+        Write-Info "Management-group monitoring roles were not added because Custom setup is limited to specific subscriptions."
+    }
 }
 
 # ============================================================================
@@ -3614,8 +4624,9 @@ if ($script:useRecommendedReadOnlySetup) {
 
 $configureBillingExports = Get-SetupCapabilityResponse `
     -Capability "Cost Management billing exports and export storage" `
-    -Prompt "Set up Cost Management exports for Spotto?" `
-    -RecommendedReadOnlyValue $false
+    -Prompt "Set up optional Cost Management exports and export storage for Spotto?" `
+    -RecommendedReadOnlyValue $false `
+    -CustomDefaultYes $false
 
 if (Test-YesResponse -Value $configureBillingExports) {
     $script:billingExportSetupStatus = "processed"
@@ -3857,7 +4868,7 @@ if (Test-YesResponse -Value $configureBillingExports) {
     }
 } else {
     $script:billingExportSetupStatus = "skipped"
-    Write-Info "Skipping Cost Management billing export setup"
+    Write-Info "Optional Cost Management billing export and storage setup skipped."
 }
 
 # ============================================================================
@@ -4273,7 +5284,9 @@ if ($grantPolicyExemptionPerms -eq "yes") {
 Write-Header -Message "Setup Complete" -Subtitle "Review the results, then copy the credentials into Spotto"
 
 Write-Success "Service Principal: $script:appDisplayName ($script:clientId)"
-if ($script:useTenantRootReader) {
+if ($script:usedSubscriptionReaderFallback) {
+    Write-Success "Reader role processed separately on all $($selectedSubscriptions.Count) subscription(s) after tenant-root fallback"
+} elseif ($script:useTenantRootReader) {
     switch ($script:rootReaderAssignmentStatus) {
         "created" { Write-Success "Reader role assigned at tenant root scope (/), covering all subscriptions" }
         "existing" { Write-Success "Reader role already existed at tenant root scope (/), covering all subscriptions" }
@@ -4283,33 +5296,28 @@ if ($script:useTenantRootReader) {
 } else {
     Write-Success "Reader role processed on $($selectedSubscriptions.Count) selected subscription(s)"
 }
-if ([string]::IsNullOrWhiteSpace($grantMonitoringReadPerms) -or $grantMonitoringReadPerms -match "^(?i:yes)$") {
-    Write-Success "Monitoring Reader processed on selected subscription(s)"
-} else {
-    Write-Skipped "Monitoring Reader skipped (optional)"
+switch ($script:subscriptionMonitoringReaderStatus) {
+    "processed" { Write-Success "Monitoring Reader processed on selected subscription(s)" }
+    "failed" { Write-Error-Custom "Monitoring Reader was not assigned on every selected subscription" }
+    "skipped" { Write-Skipped "Monitoring Reader skipped (optional)" }
+    default { Write-Skipped "Monitoring Reader was not processed on selected subscriptions" }
 }
-switch ($script:logAnalyticsReaderStatus) {
-    "created" { Write-Success "Log Analytics Reader assigned at the root management group" }
-    "existing" { Write-Success "Log Analytics Reader already existed at the root management group" }
+switch ($script:subscriptionSecurityReaderStatus) {
+    "processed" { Write-Success "Security Reader processed on selected subscription(s)" }
+    "failed" { Write-Error-Custom "Security Reader was not assigned on every selected subscription" }
+    "skipped" { Write-Skipped "Security Reader skipped (optional)" }
+    default { Write-Skipped "Security Reader was not processed on selected subscriptions" }
+}
+switch ($script:subscriptionLogAnalyticsReaderStatus) {
     "processed" { Write-Success "Log Analytics Reader processed on selected subscription(s)" }
-    "failed" { Write-Error-Custom "Log Analytics Reader was not assigned" }
+    "failed" { Write-Error-Custom "Log Analytics Reader was not assigned on every selected subscription" }
     "skipped" { Write-Skipped "Log Analytics Reader skipped (optional)" }
-    default { Write-Skipped "Log Analytics Reader was not processed" }
+    default { Write-Skipped "Log Analytics Reader was not processed on selected subscriptions" }
 }
-switch ($script:rootManagementGroupReaderStatus) {
-    "created" { Write-Success "Reader assigned at the root management group for tenant governance hierarchy access" }
-    "existing" { Write-Success "Reader already existed at the root management group for tenant governance hierarchy access" }
-    "failed" { Write-Error-Custom "Reader was not assigned at the root management group" }
-    "skipped" { Write-Skipped "Reader at the root management group skipped" }
-    default { Write-Skipped "Reader at the root management group was not processed" }
-}
-switch ($script:managementGroupReaderStatus) {
-    "created" { Write-Success "Management Group Reader assigned at the root management group" }
-    "existing" { Write-Success "Management Group Reader already existed at the root management group" }
-    "failed" { Write-Error-Custom "Management Group Reader was not assigned at the root management group" }
-    "skipped" { Write-Skipped "Management Group Reader skipped" }
-    default { Write-Skipped "Management Group Reader was not processed" }
-}
+Write-ManagementGroupRoleSummary -Status $script:managementGroupAzureReaderStatus -RoleLabel "Reader on management groups"
+Write-ManagementGroupRoleSummary -Status $script:managementGroupReaderStatus -RoleLabel "Management Group Reader"
+Write-ManagementGroupRoleSummary -Status $script:managementGroupMonitoringReaderStatus -RoleLabel "Monitoring Reader on management groups"
+Write-ManagementGroupRoleSummary -Status $script:managementGroupLogAnalyticsReaderStatus -RoleLabel "Log Analytics Reader on management groups"
 switch ($script:reservationReaderStatus) {
     "created" { Write-Success "Reservations Reader assigned at /providers/Microsoft.Capacity" }
     "existing" { Write-Success "Reservations Reader already existed at /providers/Microsoft.Capacity" }
