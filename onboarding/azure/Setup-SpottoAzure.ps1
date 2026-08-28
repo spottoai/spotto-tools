@@ -18,6 +18,9 @@
       (includes workspace query access plus broader monitoring read access)
     - Reader, Management Group Reader, Monitoring Reader, and Log Analytics Reader
       on visible management groups (tenant root is recognized only by its tenant ID)
+    - Key Vault Reader for secret, key, and certificate expiry metadata without
+      secret values or private key material. All-subscription setup prefers the
+      tenant-root management group and falls back to selected subscriptions.
     - Reservations Reader at /providers/Microsoft.Capacity
     - Custom setup only: Reservations Contributor at /providers/Microsoft.Capacity
       (calculate reservation refund quotes and support reservation management workflows)
@@ -68,6 +71,7 @@ $LEGACY_APP_NAMES = @("Spotto AI")
 $APP_LOOKUP_NAMES = @($APP_NAME) + $LEGACY_APP_NAMES
 $CUSTOM_ROLE_NAME = "Spotto Access"
 $POLICY_EXEMPTION_ROLE_NAME = "Spotto Policy Exemptions"
+$KEY_VAULT_READER_ROLE_NAME = "Key Vault Reader"
 $BILLING_EXPORT_CONTAINER_NAME = "spotto-cost-exports"
 $BILLING_EXPORT_ROOT_PATH = "spotto"
 $BILLING_EXPORT_DEFAULT_LOCATION = "australiaeast"
@@ -293,6 +297,9 @@ $script:managementGroupAzureReaderStatus = "not-run"
 $script:managementGroupReaderStatus = "not-run"
 $script:managementGroupMonitoringReaderStatus = "not-run"
 $script:managementGroupLogAnalyticsReaderStatus = "not-run"
+$script:keyVaultReaderStatus = "not-run"
+$script:keyVaultReaderScope = "not-run"
+$script:usedSubscriptionKeyVaultReaderFallback = $false
 $script:visibleManagementGroups = @()
 $script:managementGroupDiscoveryStatus = "not-run"
 $script:managementGroupDiscoveryMessage = ""
@@ -1178,6 +1185,57 @@ function Ensure-ManagementGroupRoleAssignments {
         Attempted           = $attemptedCount
         Visible             = $targets.Count
         CoveredByTenantRoot = $coveredByTenantRoot
+    }
+}
+
+function Ensure-KeyVaultReaderAssignments {
+    param(
+        [string]$PrincipalId,
+        [object[]]$Subscriptions,
+        [string]$TenantId,
+        [object[]]$ManagementGroups,
+        [bool]$PreferTenantRootManagementGroup
+    )
+
+    if ($PreferTenantRootManagementGroup) {
+        $tenantRootManagementGroup = @($ManagementGroups |
+            Where-Object { Test-TenantRootManagementGroup -ManagementGroup $_ -TenantId $TenantId } |
+            Select-Object -First 1)
+
+        if ($tenantRootManagementGroup.Count -gt 0) {
+            $managementGroupResult = Ensure-ManagementGroupRoleAssignments `
+                -PrincipalId $PrincipalId `
+                -ManagementGroups $tenantRootManagementGroup `
+                -TenantId $TenantId `
+                -RoleDefinitionName $KEY_VAULT_READER_ROLE_NAME `
+                -RoleLabel "Key Vault Reader role"
+
+            if ($managementGroupResult.CoveredByTenantRoot) {
+                return [PSCustomObject]@{
+                    Status       = $managementGroupResult.Status
+                    Scope        = "tenant-root-management-group"
+                    UsedFallback = $false
+                }
+            }
+
+            Write-Warning-Custom "Key Vault Reader could not be confirmed at the tenant-root management group."
+        } else {
+            Write-Warning-Custom "The tenant-root management group is not visible, so Key Vault Reader cannot be assigned there."
+        }
+
+        Write-Info "Falling back to Key Vault Reader assignments on every selected subscription."
+    }
+
+    $subscriptionAssignmentsSucceeded = Ensure-SubscriptionRoleAssignments `
+        -PrincipalId $PrincipalId `
+        -Subscriptions $Subscriptions `
+        -RoleDefinitionName $KEY_VAULT_READER_ROLE_NAME `
+        -RoleLabel "Key Vault Reader role"
+
+    return [PSCustomObject]@{
+        Status       = if ($subscriptionAssignmentsSucceeded) { "processed" } else { "failed" }
+        Scope        = "subscriptions"
+        UsedFallback = $PreferTenantRootManagementGroup
     }
 }
 
@@ -4292,15 +4350,18 @@ if ([string]::IsNullOrWhiteSpace($grantMonitoringReadPerms) -or $grantMonitoring
 }
 
 # ============================================================================
-# Step 8: Assign Visible Management Group Reader Roles
+# Step 8: Assign Management Group and Key Vault Reader Roles
 # ============================================================================
 
-Write-Header -Message "Step 8 of 13: Assign Management Group Reader Roles"
+Write-Header -Message "Step 8 of 13: Assign Management Group and Key Vault Reader Roles"
 
 Write-SectionLabel "Visible management group permissions"
 Write-DetailRow -Label "Scope" -Value "Tenant root when available; otherwise every management group visible to this Azure session."
 Write-DetailRow -Label "Governance" -Value "Reader and Management Group Reader."
 Write-DetailRow -Label "Monitoring" -Value "Monitoring Reader and Log Analytics Reader in the all-subscriptions setup."
+Write-DetailRow -Label "Key Vault metadata" -Value "Key Vault Reader lists expiry metadata but cannot read secret values or private key material."
+Write-DetailRow -Label "Key Vault scope" -Value "Tenant-root management group for all subscriptions when available; otherwise selected subscriptions."
+Write-DetailRow -Label "Vault model" -Value "Inherited access applies to vaults using Azure RBAC; legacy access-policy vaults require per-vault policies."
 Write-DetailRow -Label "Requires" -Value "Role-assignment authority at each management group. A failed scope does not stop the remaining groups."
 Write-Host ""
 $grantGovernanceReaderRoles = Get-SetupCapabilityResponse `
@@ -4311,8 +4372,23 @@ $grantGovernanceReaderRoles = Get-SetupCapabilityResponse `
 
 $governanceReaderRolesEnabled = Test-YesResponse -Value $grantGovernanceReaderRoles
 $managementGroupMonitoringRolesEnabled = $monitoringReadRolesEnabled -and $script:selectedAllSubscriptions
-if ($governanceReaderRolesEnabled -or $managementGroupMonitoringRolesEnabled) {
+if ($governanceReaderRolesEnabled -or $managementGroupMonitoringRolesEnabled -or $script:selectedAllSubscriptions) {
     $script:visibleManagementGroups = @(Get-VisibleManagementGroupTargets -TenantId $script:tenantId)
+}
+
+$keyVaultReaderResult = Ensure-KeyVaultReaderAssignments `
+    -PrincipalId $sp.Id `
+    -Subscriptions $selectedSubscriptions `
+    -TenantId $script:tenantId `
+    -ManagementGroups $script:visibleManagementGroups `
+    -PreferTenantRootManagementGroup $script:selectedAllSubscriptions
+$script:keyVaultReaderStatus = $keyVaultReaderResult.Status
+$script:keyVaultReaderScope = $keyVaultReaderResult.Scope
+$script:usedSubscriptionKeyVaultReaderFallback = $keyVaultReaderResult.UsedFallback
+
+if ($script:keyVaultReaderStatus -eq "failed") {
+    Write-Warning-Custom "Key Vault Reader access could not be assigned across every selected scope. The remaining onboarding permissions will still be attempted."
+    Write-PimTroubleshootingHint
 }
 
 if ($governanceReaderRolesEnabled) {
@@ -4531,43 +4607,61 @@ if (Test-YesResponse -Value $grantGraphPermission) {
                 }
             }
 
-            $missingGraphAppRoles = @($GRAPH_GOVERNANCE_PERMISSION_VALUES | Where-Object { -not $graphAppRolesByValue.ContainsKey($_) })
-            if ($missingGraphAppRoles.Count -gt 0) {
-                $script:graphPermissionStatus = "failed"
-                Write-Error-Custom "Could not find Microsoft Graph application permission(s): $($missingGraphAppRoles -join ', ')"
-            } else {
-                $existingAssignments = @(Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -All |
-                    Where-Object { $_.ResourceId -eq $graphSp.Id })
-                $existingAppRoleIds = @{}
-                foreach ($existingAssignment in $existingAssignments) {
-                    $existingAppRoleIds[[string]$existingAssignment.AppRoleId] = $true
+            $existingAssignments = @(Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -All |
+                Where-Object { $_.ResourceId -eq $graphSp.Id })
+            $existingAppRoleIds = @{}
+            foreach ($existingAssignment in $existingAssignments) {
+                $existingAppRoleIds[[string]$existingAssignment.AppRoleId] = $true
+            }
+
+            $createdPermissionCount = 0
+            $existingPermissionCount = 0
+            $failedGraphPermissions = @()
+
+            foreach ($permissionValue in $GRAPH_GOVERNANCE_PERMISSION_VALUES) {
+                if (-not $graphAppRolesByValue.ContainsKey($permissionValue)) {
+                    $failedGraphPermissions += $permissionValue
+                    Write-Warning-Custom "Microsoft Graph application permission '$permissionValue' was not available and could not be granted."
+                    continue
                 }
 
-                $createdPermissionCount = 0
-                $existingPermissionCount = 0
+                $graphAppRole = $graphAppRolesByValue[$permissionValue]
+                if ($existingAppRoleIds.ContainsKey([string]$graphAppRole.Id)) {
+                    Write-Info "$permissionValue already granted"
+                    $existingPermissionCount++
+                    continue
+                }
 
-                foreach ($permissionValue in $GRAPH_GOVERNANCE_PERMISSION_VALUES) {
-                    $graphAppRole = $graphAppRolesByValue[$permissionValue]
-                    if ($existingAppRoleIds.ContainsKey([string]$graphAppRole.Id)) {
-                        Write-Info "$permissionValue already granted"
-                        $existingPermissionCount++
-                        continue
-                    }
-
+                try {
                     New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -PrincipalId $sp.Id -ResourceId $graphSp.Id -AppRoleId $graphAppRole.Id | Out-Null
                     Write-Success "Granted $permissionValue"
                     $createdPermissionCount++
+                } catch {
+                    $failedGraphPermissions += $permissionValue
+                    Write-Warning-Custom "Could not grant Microsoft Graph application permission '$permissionValue': $_"
                 }
+            }
 
-                $script:graphPermissionSummary = "$createdPermissionCount granted, $existingPermissionCount already existed"
-                if ($createdPermissionCount -gt 0 -and $existingPermissionCount -gt 0) {
-                    $script:graphPermissionStatus = "processed"
-                } elseif ($createdPermissionCount -gt 0) {
-                    $script:graphPermissionStatus = "created"
+            $failedPermissionCount = $failedGraphPermissions.Count
+            $script:graphPermissionSummary = "$createdPermissionCount granted, $existingPermissionCount already existed, $failedPermissionCount could not be granted"
+            if ($failedPermissionCount -gt 0) {
+                if (($createdPermissionCount + $existingPermissionCount) -gt 0) {
+                    $script:graphPermissionStatus = "partial"
                 } else {
-                    $script:graphPermissionStatus = "existing"
+                    $script:graphPermissionStatus = "failed"
                 }
+                Write-Warning-Custom "Microsoft Graph permissions needing administrator follow-up: $($failedGraphPermissions -join ', ')"
+            } elseif ($createdPermissionCount -gt 0 -and $existingPermissionCount -gt 0) {
+                $script:graphPermissionStatus = "processed"
+            } elseif ($createdPermissionCount -gt 0) {
+                $script:graphPermissionStatus = "created"
+            } else {
+                $script:graphPermissionStatus = "existing"
+            }
 
+            if ($script:graphPermissionStatus -eq "partial") {
+                Write-Warning-Custom "Microsoft Graph governance permissions were partially processed: $script:graphPermissionSummary"
+            } else {
                 Write-Success "Microsoft Graph governance permissions processed: $script:graphPermissionSummary"
             }
 
@@ -5318,6 +5412,15 @@ Write-ManagementGroupRoleSummary -Status $script:managementGroupAzureReaderStatu
 Write-ManagementGroupRoleSummary -Status $script:managementGroupReaderStatus -RoleLabel "Management Group Reader"
 Write-ManagementGroupRoleSummary -Status $script:managementGroupMonitoringReaderStatus -RoleLabel "Monitoring Reader on management groups"
 Write-ManagementGroupRoleSummary -Status $script:managementGroupLogAnalyticsReaderStatus -RoleLabel "Log Analytics Reader on management groups"
+if ($script:keyVaultReaderScope -eq "tenant-root-management-group") {
+    Write-Success "Key Vault Reader processed at the tenant-root management group, covering current and future child subscriptions"
+} elseif ($script:usedSubscriptionKeyVaultReaderFallback) {
+    Write-Success "Key Vault Reader processed on all $($selectedSubscriptions.Count) subscription(s) after management-group fallback"
+} elseif ($script:keyVaultReaderStatus -eq "processed") {
+    Write-Success "Key Vault Reader processed on $($selectedSubscriptions.Count) selected subscription(s)"
+} else {
+    Write-Error-Custom "Key Vault Reader was not processed across the selected scope"
+}
 switch ($script:reservationReaderStatus) {
     "created" { Write-Success "Reservations Reader assigned at /providers/Microsoft.Capacity" }
     "existing" { Write-Success "Reservations Reader already existed at /providers/Microsoft.Capacity" }
@@ -5343,6 +5446,7 @@ switch ($script:graphPermissionStatus) {
     "created" { Write-Success "Microsoft Graph governance permissions granted for tenant policy, licensing, Global Admin/PIM, audit, and posture visibility ($script:graphPermissionSummary)" }
     "existing" { Write-Success "Microsoft Graph governance permissions already existed for tenant policy, licensing, Global Admin/PIM, audit, and posture visibility ($script:graphPermissionSummary)" }
     "processed" { Write-Success "Microsoft Graph governance permissions processed for tenant policy, licensing, Global Admin/PIM, audit, and posture visibility ($script:graphPermissionSummary)" }
+    "partial" { Write-Warning-Custom "Microsoft Graph governance permissions were only partially granted ($script:graphPermissionSummary)" }
     "failed" { Write-Error-Custom "Microsoft Graph governance permissions were not fully granted" }
     "skipped" { Write-Skipped "Microsoft Graph governance permissions skipped" }
     default { Write-Skipped "Microsoft Graph governance permissions were not processed" }
@@ -5405,7 +5509,7 @@ switch ($script:policyAssignmentExemptRoleResult.Status) {
 }
 Write-Host ""
 Write-Host "Propagation note:" -ForegroundColor Yellow
-if ($script:graphPermissionStatus -in @("created", "existing", "processed")) {
+if ($script:graphPermissionStatus -in @("created", "existing", "processed", "partial")) {
     Write-Host "  Azure RBAC changes and Microsoft Graph admin consent can take 5-15 minutes to apply." -ForegroundColor Yellow
     Write-Host "  During that time, Spotto may validate the account or list subscriptions while Global Admin/PIM, audit, or governance data still shows access denied." -ForegroundColor Yellow
     Write-Host "  If that happens, wait a few minutes and rerun validation or retry the tenant sync." -ForegroundColor Yellow
