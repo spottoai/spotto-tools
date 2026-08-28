@@ -4,28 +4,29 @@
 
 .DESCRIPTION
     This script creates a service principal, assigns the governance and billing permissions Spotto
-    uses to analyze your Azure environment, recommends billing exports to reduce billing API calls,
-    and optionally grants recommended monitoring roles and specific write permissions.
+    uses to analyze your Azure environment, can configure billing exports in Custom setup,
+    and offers recommended read-only or custom setup profiles.
     
     Permissions granted:
     - Reader role at tenant root scope when all subscriptions are selected
       (inherits to all current and future subscriptions in the tenant)
     - Reader role on selected subscriptions when specific subscriptions are chosen
-    - Optional: Monitoring Reader role on selected subscriptions (includes Microsoft.Insights/Components/Query/Read)
-    - Optional: Log Analytics Reader role
+    - Monitoring Reader role on selected subscriptions (includes Microsoft.Insights/Components/Query/Read)
+    - Security Reader role on selected subscriptions for Defender for Cloud posture
+    - Log Analytics Reader role
       (assigned at the root management group when all subscriptions are selected,
        otherwise on selected subscriptions)
       (includes workspace query access plus broader monitoring read access)
     - Management Group Reader at the root management group
       (read management group hierarchy plus management-group policy and RBAC metadata)
     - Reservations Reader at /providers/Microsoft.Capacity
-    - Recommended: Reservations Contributor at /providers/Microsoft.Capacity
+    - Custom setup only: Reservations Contributor at /providers/Microsoft.Capacity
       (calculate reservation refund quotes and support reservation management workflows)
     - Savings plan Reader at /providers/Microsoft.BillingBenefits
-    - Optional prompt: Microsoft Graph application permissions with admin consent
+    - Microsoft Graph application permissions with admin consent
       (read applications, service principals, directory roles, Global Admin/PIM state,
        group membership, users, and audit logs for governance visibility)
-    - Highly recommended: Cost Management exports to customer-owned Azure Storage
+    - Custom setup: Cost Management exports to customer-owned Azure Storage
       (daily actual/amortized exports plus one-time historical backfill where supported)
       Existing billing-scope exports can be reused when the operator has access to the
       billing scope; billing-scope reader access for the Spotto service principal must
@@ -81,7 +82,9 @@ $GRAPH_GOVERNANCE_PERMISSION_VALUES = @(
     "RoleManagement.Read.Directory",
     "GroupMember.Read.All",
     "User.Read.All",
-    "AuditLog.Read.All"
+    "AuditLog.Read.All",
+    "Policy.Read.All",
+    "LicenseAssignment.Read.All"
 )
 $script:ConsolePanelWidth = 80
 
@@ -116,6 +119,50 @@ function Show-StartupSplash {
 
 Show-StartupSplash -TranscriptPath $logPath
 
+function Select-SetupMode {
+    Write-Host "Choose a setup mode:" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  [1] Recommended read-only access (default)" -ForegroundColor White
+    Write-Host "      Automatically adds the read access Spotto needs across all subscriptions." -ForegroundColor DarkGray
+    Write-Host "  [2] Custom setup" -ForegroundColor White
+    Write-Host "      Choose permissions individually, including optional write access." -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "Safe to rerun: existing Spotto resources are reused and missing access is added." -ForegroundColor Green
+    Write-Host "The wizard does not remove access that is already assigned." -ForegroundColor DarkGray
+
+    while ($true) {
+        $setupModeSelection = Read-Host "Select setup mode (1/2, default 1)"
+        if ([string]::IsNullOrWhiteSpace($setupModeSelection) -or $setupModeSelection.Trim() -in @("1", "r", "read-only", "recommended")) {
+            Write-Host "`n✓ Recommended read-only access selected" -ForegroundColor Green
+            return "recommended-read-only"
+        }
+
+        if ($setupModeSelection.Trim() -in @("2", "c", "custom")) {
+            Write-Host "`n✓ Custom setup selected" -ForegroundColor Green
+            return "custom"
+        }
+
+        Write-Host "Invalid option. Enter 1 for recommended read-only access or 2 for custom setup." -ForegroundColor Red
+    }
+}
+
+$script:setupMode = Select-SetupMode
+$script:useRecommendedReadOnlySetup = $script:setupMode -eq "recommended-read-only"
+
+function Get-OnboardingScopeSelection {
+    if ($script:useRecommendedReadOnlySetup) {
+        Write-Info "Recommended read-only access: selecting all subscriptions."
+        return "1"
+    }
+
+    $selection = Read-Host "`nSelect onboarding scope (1/2, default 1)"
+    if ([string]::IsNullOrWhiteSpace($selection)) {
+        return "1"
+    }
+
+    return $selection.Trim()
+}
+
 # ============================================================================
 # CHECK AND INSTALL REQUIRED MODULES
 # ============================================================================
@@ -125,7 +172,8 @@ function Ensure-PowerShellModules {
         [object[]]$Modules,
         [string]$ModuleSetName,
         [string[]]$ManualInstallCommands,
-        [bool]$Required = $true
+        [bool]$Required = $true,
+        [bool]$InstallMissingByDefault = $false
     )
 
     Write-Host "Checking $ModuleSetName PowerShell modules..." -ForegroundColor Cyan
@@ -149,7 +197,12 @@ function Ensure-PowerShellModules {
             Write-Host "  - $module" -ForegroundColor Yellow
         }
 
-        $install = Read-Host "`nWould you like to install missing $ModuleSetName modules now? (yes/no, default no)"
+        if ($InstallMissingByDefault) {
+            $install = "yes"
+            Write-Host "`nRecommended read-only access requires these modules; installing them automatically." -ForegroundColor Cyan
+        } else {
+            $install = Read-Host "`nWould you like to install missing $ModuleSetName modules now? (yes/no, default no)"
+        }
 
         if ($install -eq "yes") {
             Write-Host "`nInstalling modules... This may take a few minutes." -ForegroundColor Cyan
@@ -207,7 +260,7 @@ $graphRequiredModules = @(
 
 Ensure-PowerShellModules -Modules $requiredModules -ModuleSetName "Azure" -ManualInstallCommands @(
     "Install-Module -Name Az -Scope CurrentUser -Force"
-) -Required $true | Out-Null
+) -Required $true -InstallMissingByDefault $script:useRecommendedReadOnlySetup | Out-Null
 
 # Global variables to track credentials
 $script:clientId = $null
@@ -357,15 +410,23 @@ function Write-Skipped {
 }
 
 function Show-Credentials {
-    Write-PanelTitle -Title "SPOTTO CREDENTIALS" -Subtitle "Copy these values into the Spotto Portal" -Color Yellow
+    $subtitle = if ($script:isNewSecret) { "Copy each value into the matching Spotto field" } else { "No new Client Secret Value was created" }
+    Write-PanelTitle -Title "SPOTTO PORTAL VALUES" -Subtitle $subtitle -Color Yellow
     Write-Host ""
-    Write-DetailRow -Label "Application (Client) ID" -Value $script:clientId -ValueColor Green
-    Write-DetailRow -Label "Directory (Tenant) ID" -Value $script:tenantId -ValueColor Green
-    Write-DetailRow -Label "Client Secret" -Value $script:clientSecret -ValueColor Green
-    Write-DetailRow -Label "Secret Expiry Date" -Value $script:secretExpiry -ValueColor Green
+    Write-DetailRow -Label "Tenant ID" -Value $script:tenantId -ValueColor Green
+    Write-DetailRow -Label "Client ID" -Value $script:clientId -ValueColor Green
+    if ($script:isNewSecret) {
+        Write-DetailRow -Label "Client Secret Value" -Value $script:clientSecret -ValueColor Green
+    } else {
+        Write-DetailRow -Label "Client Secret Value" -Value "Existing value cannot be shown" -ValueColor Green
+    }
+    Write-DetailRow -Label "Secret Expires At" -Value $script:secretExpiry -ValueColor Green
     Write-Host ""
     if ($script:isNewSecret) {
-        Write-Host "Note: This new client secret is shown only for this run. You can rerun the script later to create a replacement." -ForegroundColor Cyan
+        Write-Host "Copy the Client Secret Value now. Azure only shows it once." -ForegroundColor Cyan
+    } else {
+        Write-Host "Keep using the Client Secret Value already saved in Spotto." -ForegroundColor Cyan
+        Write-Host "If it is not saved, rerun with Custom setup and create a new value." -ForegroundColor DarkGray
     }
     Write-Divider -Color Yellow
     Write-Host ""
@@ -374,11 +435,18 @@ function Show-Credentials {
 function Show-NextSteps {
     Write-PanelTitle -Title "NEXT STEPS" -Subtitle "Finish the connection in Spotto" -Color Cyan
     Write-Host ""
-    Write-NumberedStep -Number 1 -Message "Copy the credentials shown above."
-    Write-NumberedStep -Number 2 -Message "Go to the Spotto Portal: https://portal.spotto.ai"
-    Write-NumberedStep -Number 3 -Message "Navigate to: Connectors > Cloud Accounts"
-    Write-NumberedStep -Number 4 -Message "Add a cloud account and paste the credentials into the form."
-    Write-NumberedStep -Number 5 -Message "Click 'Validate Credentials', then click 'Create'."
+    if ($script:isNewSecret) {
+        Write-NumberedStep -Number 1 -Message "Go to the Spotto Portal: https://portal.spotto.ai"
+        Write-NumberedStep -Number 2 -Message "Navigate to: Connectors > Cloud Accounts"
+        Write-NumberedStep -Number 3 -Message "Add or update the Azure cloud account."
+        Write-NumberedStep -Number 4 -Message "Copy each value above into the field with the same label."
+        Write-NumberedStep -Number 5 -Message "Validate the credentials, then save the cloud account."
+    } else {
+        Write-NumberedStep -Number 1 -Message "Keep using the existing secret already stored in Spotto."
+        Write-NumberedStep -Number 2 -Message "Go to the Spotto Portal: https://portal.spotto.ai"
+        Write-NumberedStep -Number 3 -Message "Open the Azure cloud account and run validation or sync again."
+        Write-Info "If Spotto does not already have the secret, rerun with Custom setup and create a new one."
+    }
     Write-Host ""
     Write-Info "It is safe to rerun this script later if validation needs more time or access changes."
     Write-Host ""
@@ -655,10 +723,109 @@ function Test-SelectedSubscriptionRoleAssignmentAccess {
     return $false
 }
 
+function Get-SignedInPrincipalObjectId {
+    try {
+        $context = Get-AzContext
+        if ($context -and $context.Account -and $context.Account.Type -eq "ServicePrincipal") {
+            $servicePrincipal = Get-AzADServicePrincipal -ApplicationId $context.Account.Id -ErrorAction Stop
+            if ($servicePrincipal) {
+                return $servicePrincipal.Id
+            }
+        }
+
+        $signedInUser = Get-AzADUser -SignedIn -ErrorAction Stop
+        if ($signedInUser) {
+            return $signedInUser.Id
+        }
+    } catch {
+        Write-Info "Unable to resolve the signed-in principal object ID. $_"
+    }
+
+    return $null
+}
+
+function Test-RootScopeRoleAssignmentGrantsAction {
+    param(
+        [string]$PrincipalObjectId,
+        [string]$RequiredAction
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PrincipalObjectId) -or [string]::IsNullOrWhiteSpace($RequiredAction)) {
+        return $false
+    }
+
+    try {
+        # assignedTo() includes transitive group-based assignments for users.
+        $filter = [uri]::EscapeDataString("atScope() and assignedTo('$PrincipalObjectId')")
+        $assignmentPath = "/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&`$filter=$filter"
+        $assignments = @(Get-AzRestCollection -Path $assignmentPath)
+        $roleDefinitions = @{}
+
+        foreach ($assignment in $assignments) {
+            if (-not $assignment.properties -or $assignment.properties.scope -ne "/") {
+                continue
+            }
+
+            # Azure RBAC conditions can constrain which roles or principal types may be assigned.
+            # Evaluating arbitrary ABAC expressions locally would be unsafe, so fail closed.
+            if (-not [string]::IsNullOrWhiteSpace($assignment.properties.condition)) {
+                Write-Info "Ignoring a conditional tenant-root role assignment because its effective role-assignment access cannot be confirmed safely."
+                continue
+            }
+
+            $roleDefinitionId = $assignment.properties.roleDefinitionId
+            if ([string]::IsNullOrWhiteSpace($roleDefinitionId)) {
+                continue
+            }
+
+            if (-not $roleDefinitions.ContainsKey($roleDefinitionId)) {
+                $roleDefinitions[$roleDefinitionId] = Invoke-AzRestGetJson -Path "${roleDefinitionId}?api-version=2022-04-01"
+            }
+
+            $roleDefinition = $roleDefinitions[$roleDefinitionId]
+            if (-not $roleDefinition -or -not $roleDefinition.properties) {
+                continue
+            }
+
+            foreach ($permission in @($roleDefinition.properties.permissions)) {
+                $isAllowed = $false
+                foreach ($action in @($permission.actions)) {
+                    if (Test-AzureActionMatchesPattern -RequiredAction $RequiredAction -ActionPattern $action) {
+                        $isAllowed = $true
+                        break
+                    }
+                }
+
+                if (-not $isAllowed) {
+                    continue
+                }
+
+                foreach ($notAction in @($permission.notActions)) {
+                    if (Test-AzureActionMatchesPattern -RequiredAction $RequiredAction -ActionPattern $notAction) {
+                        $isAllowed = $false
+                        break
+                    }
+                }
+
+                if ($isAllowed) {
+                    return $true
+                }
+            }
+        }
+    } catch {
+        Write-Info "Unable to confirm '$RequiredAction' at tenant root scope (/). $_"
+    }
+
+    return $false
+}
+
 function Test-TenantRootRoleAssignmentAccess {
     Write-SectionLabel "Validating tenant root role-assignment access"
 
-    if (Test-AzurePermissionActionAtScope -Scope "/" -RequiredAction "Microsoft.Authorization/roleAssignments/write") {
+    # Microsoft.Authorization/permissions is not available at tenant root scope (/).
+    # Inspect the signed-in principal's unrestricted root role assignments instead.
+    $principalObjectId = Get-SignedInPrincipalObjectId
+    if (Test-RootScopeRoleAssignmentGrantsAction -PrincipalObjectId $principalObjectId -RequiredAction "Microsoft.Authorization/roleAssignments/write") {
         Write-Success "Validated role assignment access at tenant root scope (/)"
         return $true
     }
@@ -740,7 +907,7 @@ function Ensure-TenantRootReaderAssignment {
             Write-PimTroubleshootingHint
         }
 
-        Write-Info "If you cannot get root-scope access, rerun the script and choose specific subscriptions to use per-subscription Reader assignments."
+        Write-Info "If you cannot get root-scope access, rerun with Custom setup and choose specific subscriptions."
         return "failed"
     }
 }
@@ -833,6 +1000,11 @@ function Get-DefaultedInput {
         [string]$DefaultValue
     )
 
+    if ($script:useRecommendedReadOnlySetup) {
+        Write-Info "Recommended read-only access: using $Prompt '$DefaultValue'."
+        return $DefaultValue
+    }
+
     $value = Read-Host "$Prompt [$DefaultValue]"
     if ([string]::IsNullOrWhiteSpace($value)) {
         return $DefaultValue
@@ -854,12 +1026,192 @@ function Test-YesResponse {
     return $Value -match "^(?i:y|yes)$"
 }
 
+function Get-ClientSecretPlan {
+    param(
+        [object[]]$Credentials,
+        [datetime]$ReferenceTime = (Get-Date),
+        [int]$MinimumRemainingMonths = 3
+    )
+
+    if ($MinimumRemainingMonths -lt 0) {
+        throw "Minimum remaining client-secret months cannot be negative."
+    }
+
+    $validCredentials = @(
+        $Credentials |
+            Where-Object {
+                if ($null -eq $_ -or $null -eq $_.EndDateTime) {
+                    return $false
+                }
+
+                $startDateProperty = $_.PSObject.Properties["StartDateTime"]
+                $isActive = $null -eq $startDateProperty -or
+                    $null -eq $startDateProperty.Value -or
+                    ([datetime]$startDateProperty.Value) -le $ReferenceTime
+
+                return $isActive -and ([datetime]$_.EndDateTime) -gt $ReferenceTime
+            } |
+            Sort-Object -Property EndDateTime -Descending
+    )
+    $latestCredential = $validCredentials | Select-Object -First 1
+    $rotationThreshold = $ReferenceTime.AddMonths($MinimumRemainingMonths)
+    $action = if (
+        $null -eq $latestCredential -or
+        ([datetime]$latestCredential.EndDateTime) -lt $rotationThreshold
+    ) {
+        "create"
+    } else {
+        "reuse"
+    }
+
+    return [pscustomobject]@{
+        Action = $action
+        ValidCredentials = @($validCredentials)
+        LatestCredential = $latestCredential
+        RotationThreshold = $rotationThreshold
+    }
+}
+
+function Get-ApplicationPasswordCredentials {
+    param([object[]]$Credentials)
+
+    return @(
+        $Credentials | Where-Object {
+            $null -ne $_ -and
+            @($_.PSObject.TypeNames | Where-Object { $_ -match "PasswordCredential" }).Count -gt 0
+        }
+    )
+}
+
+function Get-SetupCapabilityResponse {
+    param(
+        [string]$Capability,
+        [string]$Prompt,
+        [bool]$RecommendedReadOnlyValue,
+        [bool]$CustomDefaultYes = $true
+    )
+
+    if ($script:useRecommendedReadOnlySetup) {
+        if ($RecommendedReadOnlyValue) {
+            Write-Info "Recommended read-only access: including $Capability."
+            return "yes"
+        }
+
+        Write-Info "Recommended read-only access: skipping $Capability because it grants write access or exceeds the selected-subscription scope."
+        return "no"
+    }
+
+    $defaultLabel = if ($CustomDefaultYes) { "yes" } else { "no" }
+    $response = Read-Host "$Prompt (yes/no, default $defaultLabel)"
+    if (Test-YesResponse -Value $response -DefaultYes $CustomDefaultYes) {
+        return "yes"
+    }
+
+    return "no"
+}
+
+function Resolve-IndexedSelectionToken {
+    param(
+        [string]$Token,
+        [int]$MaxValue,
+        [bool]$AllowAll = $true
+    )
+
+    $result = [pscustomobject]@{
+        IsIndexToken = $false
+        IsValid = $false
+        Indexes = @()
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Token)) {
+        return $result
+    }
+
+    $trimmedToken = $Token.Trim()
+    if ($trimmedToken -match "^(?i:all)$") {
+        $result.IsIndexToken = $true
+        if ($AllowAll -and $MaxValue -ge 1) {
+            $result.IsValid = $true
+            $result.Indexes = @(1..$MaxValue)
+        }
+
+        return $result
+    }
+
+    if ($trimmedToken -match "^(\d+)\s*-\s*(\d+)$") {
+        $result.IsIndexToken = $true
+        $rangeStart = 0
+        $rangeEnd = 0
+        if (-not [int]::TryParse($Matches[1], [ref]$rangeStart) -or -not [int]::TryParse($Matches[2], [ref]$rangeEnd)) {
+            return $result
+        }
+
+        if ($rangeStart -lt 1 -or $rangeEnd -gt $MaxValue -or $rangeStart -gt $rangeEnd) {
+            return $result
+        }
+
+        $result.IsValid = $true
+        $result.Indexes = @($rangeStart..$rangeEnd)
+        return $result
+    }
+
+    if ($trimmedToken -match "^\d+$") {
+        $result.IsIndexToken = $true
+        $selectedIndex = 0
+        if ([int]::TryParse($trimmedToken, [ref]$selectedIndex) -and $selectedIndex -ge 1 -and $selectedIndex -le $MaxValue) {
+            $result.IsValid = $true
+            $result.Indexes = @($selectedIndex)
+        }
+
+        return $result
+    }
+
+    return $result
+}
+
+function ConvertFrom-IndexedSelection {
+    param(
+        [string]$Selection,
+        [int]$MaxValue,
+        [bool]$AllowAll = $true
+    )
+
+    $indexes = @()
+    $invalidTokens = @()
+    foreach ($entry in ($Selection -split ",")) {
+        $resolvedToken = Resolve-IndexedSelectionToken -Token $entry -MaxValue $MaxValue -AllowAll $AllowAll
+        if (-not $resolvedToken.IsIndexToken -or -not $resolvedToken.IsValid) {
+            $invalidTokens += $entry.Trim()
+            continue
+        }
+
+        $indexes += @($resolvedToken.Indexes)
+    }
+
+    $uniqueIndexes = @($indexes | Sort-Object -Unique)
+    return [pscustomobject]@{
+        IsValid = $invalidTokens.Count -eq 0 -and $uniqueIndexes.Count -gt 0
+        Indexes = $uniqueIndexes
+        InvalidTokens = @($invalidTokens)
+    }
+}
+
 function Read-IndexedSelection {
     param(
         [string]$Prompt,
         [int]$MaxValue,
-        [bool]$AllowEmpty = $false
+        [bool]$AllowEmpty = $false,
+        [int]$DefaultIndex = 0
     )
+
+    if ($script:useRecommendedReadOnlySetup) {
+        if ($DefaultIndex -lt 0 -or $DefaultIndex -ge $MaxValue) {
+            throw "Default selection index $DefaultIndex is outside the available range."
+        }
+
+        Write-Info "Recommended read-only access: using option $($DefaultIndex + 1) for '$Prompt'."
+        return $DefaultIndex
+    }
 
     while ($true) {
         $selection = Read-Host $Prompt
@@ -1080,6 +1432,10 @@ function Wait-StorageAccountReady {
 function New-BillingExportStorageAccount {
     param([object[]]$Subscriptions)
 
+    if ($script:useRecommendedReadOnlySetup) {
+        throw "Recommended read-only access does not create billing export storage. Rerun with Custom setup to enable it."
+    }
+
     Write-SectionLabel "Storage account subscription"
     for ($i = 0; $i -lt $Subscriptions.Count; $i++) {
         Write-Host ("  [{0,2}] {1} ({2})" -f ($i + 1), $Subscriptions[$i].Name, $Subscriptions[$i].Id)
@@ -1270,6 +1626,10 @@ function Select-ExistingBillingStorageAccount {
 function Select-BillingExportStorageAccount {
     param([object[]]$Subscriptions)
 
+    if ($script:useRecommendedReadOnlySetup) {
+        throw "Recommended read-only access does not select or create billing export storage. Rerun with Custom setup to enable it."
+    }
+
     Write-SectionLabel "Billing export storage"
     Write-OptionRow -Key "1" -Label "Create a new storage account" -Description "Recommended when no suitable export storage exists."
     Write-OptionRow -Key "2" -Label "Use an existing storage account" -Description "The script will keep anonymous access off and grant Spotto blob read access."
@@ -1392,7 +1752,8 @@ function Invoke-AzRestGetJson {
 function Get-AzRestCollection {
     param(
         [string]$Path,
-        [bool]$Quiet = $false
+        [bool]$Quiet = $false,
+        [bool]$ThrowOnError = $false
     )
 
     $items = @()
@@ -1408,6 +1769,10 @@ function Get-AzRestCollection {
             $nextPath = if ($result -and $result.nextLink) { $result.nextLink } else { "" }
         }
     } catch {
+        if ($ThrowOnError) {
+            throw
+        }
+
         if (-not $Quiet) {
             Write-Info "Unable to query Azure Resource Manager path '$Path'. $_"
         }
@@ -1592,46 +1957,62 @@ function Get-AccessibleBillingCostScopes {
     return @($scopes)
 }
 
-function Select-BillingCostExportScopes {
-    $checkBillingScopes = Read-Host "Check for existing billing-scope exports that may cover multiple subscriptions? (yes/no, default yes)"
-    if (-not (Test-YesResponse -Value $checkBillingScopes)) {
-        $script:billingScopeExportStatus = "skipped"
-        return @()
-    }
+function Write-BillingCostScopeDiscoverySummary {
+    param([object[]]$Scopes)
 
-    $accessibleScopes = @(Get-AccessibleBillingCostScopes)
-    $selectedScopes = @()
+    Write-Host ""
+    Write-SectionLabel "Billing scope discovery"
+    Write-DetailRow -Label "Discovered" -Value "$($Scopes.Count) accessible billing scope(s)"
 
-    if ($accessibleScopes.Count -gt 0) {
-        Write-Host ""
-        Write-SectionLabel "Accessible billing scopes"
-        for ($i = 0; $i -lt $accessibleScopes.Count; $i++) {
-            $scope = $accessibleScopes[$i]
-            Write-Host ("  [{0,2}] {1} ({2})" -f ($i + 1), $scope.Label, $scope.Type)
-            Write-DetailRow -Label "Scope" -Value $scope.Scope
+    $scopeTypeSummary = @(
+        $Scopes |
+            Group-Object -Property Type |
+            Sort-Object -Property Name |
+            ForEach-Object { "$($_.Count) $($_.Name)" }
+    ) -join ", "
+    Write-DetailRow -Label "Breakdown" -Value $scopeTypeSummary
+    Write-Info "Scanning these scopes only reads export definitions. Nothing is changed unless you later accept a compatible export."
+}
+
+function Write-BillingCostScopeSelectionList {
+    param([object[]]$Scopes)
+
+    Write-Host ""
+    Write-SectionLabel "Accessible billing scopes"
+    for ($i = 0; $i -lt $Scopes.Count; $i++) {
+        $scope = $Scopes[$i]
+        $scopeIdentifier = ($scope.Scope.TrimEnd("/") -split "/")[-1]
+        if ($scopeIdentifier.Length -gt 36) {
+            $scopeIdentifier = "{0}...{1}" -f $scopeIdentifier.Substring(0, 16), $scopeIdentifier.Substring($scopeIdentifier.Length - 16)
         }
-        Write-Host ""
-        $selection = Read-Host "Enter billing scope numbers to check, paste scope IDs, or press Enter to skip"
-    } else {
-        Write-Info "No billing scopes were automatically discovered for this signed-in user."
-        Write-Info "If you already know the billing scope, paste it in the format /providers/Microsoft.Billing/billingAccounts/..."
-        $selection = Read-Host "Paste billing scope IDs to check, comma-separated, or press Enter to skip"
-    }
 
-    if ([string]::IsNullOrWhiteSpace($selection)) {
-        $script:billingScopeExportStatus = "skipped"
-        return @()
+        Write-Host ("  [{0,2}] {1}: {2} [{3}]" -f ($i + 1), $scope.Type, $scope.Label, $scopeIdentifier)
     }
+}
 
-    foreach ($entry in ($selection -split ",")) {
+function ConvertFrom-BillingCostScopeSelection {
+    param(
+        [object[]]$AccessibleScopes,
+        [string]$Selection
+    )
+
+    $selectedScopes = @()
+    foreach ($entry in ($Selection -split ",")) {
         $trimmedEntry = $entry.Trim()
         if ([string]::IsNullOrWhiteSpace($trimmedEntry)) {
             continue
         }
 
-        $selectedIndex = 0
-        if ([int]::TryParse($trimmedEntry, [ref]$selectedIndex) -and $selectedIndex -ge 1 -and $selectedIndex -le $accessibleScopes.Count) {
-            $selectedScopes += $accessibleScopes[$selectedIndex - 1]
+        $resolvedToken = Resolve-IndexedSelectionToken -Token $trimmedEntry -MaxValue $AccessibleScopes.Count
+        if ($resolvedToken.IsIndexToken) {
+            if (-not $resolvedToken.IsValid) {
+                Write-Warning-Custom "Ignoring selection '$trimmedEntry' because it is outside 1-$($AccessibleScopes.Count)."
+                continue
+            }
+
+            foreach ($selectedIndex in @($resolvedToken.Indexes)) {
+                $selectedScopes += $AccessibleScopes[$selectedIndex - 1]
+            }
             continue
         }
 
@@ -1648,14 +2029,67 @@ function Select-BillingCostExportScopes {
         Write-Warning-Custom "Ignoring invalid billing scope '$trimmedEntry'."
     }
 
-    $uniqueScopes = @($selectedScopes | Where-Object { $_ } | Sort-Object -Property Scope -Unique)
-    if ($uniqueScopes.Count -gt 0) {
+    return @($selectedScopes | Where-Object { $_ } | Sort-Object -Property Scope -Unique)
+}
+
+function Select-BillingCostExportScopes {
+    if ($script:useRecommendedReadOnlySetup) {
+        $script:billingScopeExportStatus = "skipped"
+        Write-Info "Recommended read-only access: billing exports are disabled."
+        return @()
+    }
+
+    $checkBillingScopes = Read-Host "Check for existing billing-scope exports that may cover multiple subscriptions? (yes/no, default yes)"
+    if (-not (Test-YesResponse -Value $checkBillingScopes)) {
+        $script:billingScopeExportStatus = "skipped"
+        return @()
+    }
+
+    $accessibleScopes = @(Get-AccessibleBillingCostScopes)
+    $selectedScopes = @()
+
+    if ($accessibleScopes.Count -gt 0) {
+        Write-BillingCostScopeDiscoverySummary -Scopes $accessibleScopes
+        Write-Host ""
+
+        $selection = Read-Host "Press Enter to scan all $($accessibleScopes.Count) scopes, type 'list' to choose, paste scope IDs, or type 'skip'"
+        $normalizedSelection = if ($null -eq $selection) { "" } else { $selection.Trim() }
+
+        if ($normalizedSelection -ieq "list" -or $normalizedSelection -ieq "l") {
+            Write-BillingCostScopeSelectionList -Scopes $accessibleScopes
+            Write-Host ""
+            $selection = Read-Host "Enter scope numbers or ranges (for example 1,3,5-9), or paste scope IDs; press Enter to scan all"
+            $normalizedSelection = if ($null -eq $selection) { "" } else { $selection.Trim() }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($normalizedSelection) -or $normalizedSelection -ieq "all" -or $normalizedSelection -ieq "a") {
+            $selectedScopes = @($accessibleScopes)
+            Write-Info "Scanning all $($accessibleScopes.Count) discovered billing scopes for compatible exports."
+        } elseif ($normalizedSelection -ieq "skip" -or $normalizedSelection -ieq "s") {
+            $script:billingScopeExportStatus = "skipped"
+            return @()
+        } else {
+            $selectedScopes = @(ConvertFrom-BillingCostScopeSelection -AccessibleScopes $accessibleScopes -Selection $selection)
+        }
+    } else {
+        Write-Info "No billing scopes were automatically discovered for this signed-in user."
+        Write-Info "If you already know the billing scope, paste it in the format /providers/Microsoft.Billing/billingAccounts/..."
+        $selection = Read-Host "Paste billing scope IDs to check, comma-separated, or press Enter to skip"
+        if ([string]::IsNullOrWhiteSpace($selection)) {
+            $script:billingScopeExportStatus = "skipped"
+            return @()
+        }
+
+        $selectedScopes = @(ConvertFrom-BillingCostScopeSelection -AccessibleScopes $accessibleScopes -Selection $selection)
+    }
+
+    if ($selectedScopes.Count -gt 0) {
         $script:billingScopeExportStatus = "processed"
     } else {
         $script:billingScopeExportStatus = "skipped"
     }
 
-    return $uniqueScopes
+    return $selectedScopes
 }
 
 function Write-BillingScopeReaderGuidance {
@@ -1672,7 +2106,7 @@ function Write-BillingScopeReaderGuidance {
     Write-Info "For Enterprise Agreement scopes, assign the equivalent EA read role to the Spotto service principal with the Azure Billing role assignment API."
 }
 
-function Get-CostExportsForScope {
+function Get-CostExportsForScopeResult {
     param([string]$Scope)
 
     $normalizedScope = Normalize-CostExportScope -Scope $Scope
@@ -1683,16 +2117,28 @@ function Get-CostExportsForScope {
             Set-AzContext -SubscriptionId $subscriptionId -TenantId $script:tenantId | Out-Null
         }
 
-        if ((Test-SubscriptionCostExportScope -Scope $normalizedScope) -or (Test-BillingCostExportScope -Scope $normalizedScope)) {
-            return @(Get-AzRestCollection -Path "$normalizedScope/providers/Microsoft.CostManagement/exports?api-version=$COST_EXPORT_API_VERSION")
+        if (-not ((Test-SubscriptionCostExportScope -Scope $normalizedScope) -or (Test-BillingCostExportScope -Scope $normalizedScope))) {
+            throw "Cost export scope is not supported: $Scope"
         }
 
-        throw "Cost export scope is not supported: $Scope"
-    } catch {
-        Write-Info "Unable to list Cost Management exports at $normalizedScope. $_"
-    }
+        $exports = @(Invoke-WithCostManagementThrottleRetry -OperationLabel "export discovery at '$normalizedScope'" -Operation {
+            Get-AzRestCollection `
+                -Path "$normalizedScope/providers/Microsoft.CostManagement/exports?api-version=$COST_EXPORT_API_VERSION" `
+                -ThrowOnError $true
+        })
 
-    return @()
+        return [pscustomobject]@{
+            Succeeded = $true
+            Exports = @($exports)
+            ErrorMessage = ""
+        }
+    } catch {
+        return [pscustomobject]@{
+            Succeeded = $false
+            Exports = @()
+            ErrorMessage = $_.Exception.Message
+        }
+    }
 }
 
 function Get-CostExport {
@@ -1889,34 +2335,78 @@ function Get-SpottoRecurringExportName {
     throw "Unsupported dataset type for Spotto recurring export: $DatasetType"
 }
 
-function Find-ExistingRecurringBillingExports {
-    param(
-        [object]$Subscription,
-        [string]$DatasetType
-    )
-
-    $scope = "/subscriptions/$($Subscription.Id)"
-    return @(Find-ExistingRecurringBillingExportsAtScope -Scope $scope -DatasetType $DatasetType)
-}
-
 function Find-ExistingRecurringBillingExportsAtScope {
     param(
         [string]$Scope,
-        [string]$DatasetType
+        [string]$DatasetType,
+        [object[]]$Exports
     )
 
     $scope = Normalize-CostExportScope -Scope $Scope
-    $exports = @()
+    if (-not $PSBoundParameters.ContainsKey("Exports")) {
+        $discoveryResult = Get-CostExportsForScopeResult -Scope $scope
+        if (-not $discoveryResult.Succeeded) {
+            Write-Info "Unable to find recurring Cost Management exports at $scope. $($discoveryResult.ErrorMessage)"
+            return @()
+        }
 
-    $spottoExportName = Get-SpottoRecurringExportName -DatasetType $DatasetType
-    $spottoExport = Get-CostExport -Scope $scope -ExportName $spottoExportName
-    if ($spottoExport) {
-        $exports += $spottoExport
+        $Exports = @($discoveryResult.Exports)
     }
 
-    $exports += @(Get-CostExportsForScope -Scope $scope)
-    $uniqueExports = @($exports | Where-Object { $_ } | Sort-Object -Property ResourceId, Id, Name -Unique)
+    $uniqueExports = @($Exports | Where-Object { $_ } | Sort-Object -Property ResourceId, Id, Name -Unique)
     return @($uniqueExports | Where-Object { Test-RecurringCostExportMeetsRequirements -Export $_ -DatasetType $DatasetType })
+}
+
+function Get-RecurringCostExportDiscoveryForScope {
+    param(
+        [string]$Scope,
+        [string[]]$DatasetTypes = @("ActualCost", "AmortizedCost")
+    )
+
+    $normalizedScope = Normalize-CostExportScope -Scope $Scope
+    $listResult = Get-CostExportsForScopeResult -Scope $normalizedScope
+    $matchesByDataset = @{}
+
+    foreach ($datasetType in $DatasetTypes) {
+        $matchesByDataset[$datasetType] = @()
+    }
+
+    if ($listResult.Succeeded) {
+        foreach ($datasetType in $DatasetTypes) {
+            $matchesByDataset[$datasetType] = @(
+                Find-ExistingRecurringBillingExportsAtScope `
+                    -Scope $normalizedScope `
+                    -DatasetType $datasetType `
+                    -Exports $listResult.Exports
+            )
+        }
+    }
+
+    return [pscustomobject]@{
+        Succeeded = $listResult.Succeeded
+        Scope = $normalizedScope
+        MatchesByDataset = $matchesByDataset
+        ErrorMessage = $listResult.ErrorMessage
+    }
+}
+
+function Get-RecurringCostExportDiscoveries {
+    param([object[]]$Targets)
+
+    $results = @()
+    foreach ($target in $Targets) {
+        $discovery = Get-RecurringCostExportDiscoveryForScope -Scope $target.Scope
+        $results += [pscustomobject]@{
+            Target = $target
+            Discovery = $discovery
+        }
+
+        if (-not $discovery.Succeeded) {
+            break
+        }
+    }
+
+    return @($results)
 }
 
 function Get-ExportDestinationInfo {
@@ -2022,6 +2512,141 @@ function New-CostExportBody {
     return $body
 }
 
+function Test-CostManagementThrottleError {
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+    if (-not $ErrorRecord -or -not $ErrorRecord.Exception) {
+        return $false
+    }
+
+    try {
+        $statusCode = $ErrorRecord.Exception.Response.StatusCode
+        $numericStatusCode = 0
+        if ($statusCode -and $statusCode.PSObject.Properties["value__"]) {
+            $numericStatusCode = [int]$statusCode.value__
+        } elseif ($null -ne $statusCode) {
+            [void][int]::TryParse("$statusCode", [ref]$numericStatusCode)
+        }
+
+        if ($numericStatusCode -eq 429) {
+            return $true
+        }
+    } catch {
+        # Azure cmdlet exception types vary; fall back to the service error text below.
+    }
+
+    $message = $ErrorRecord.Exception.Message
+    return -not [string]::IsNullOrWhiteSpace($message) -and
+        $message -match "(?i)too\s*many\s*requests|TooManyRequests|\b429\b"
+}
+
+function Get-AzureResponseHeaderValue {
+    param(
+        [System.Management.Automation.ErrorRecord]$ErrorRecord,
+        [string[]]$HeaderNames
+    )
+
+    if (-not $ErrorRecord -or -not $ErrorRecord.Exception -or -not $ErrorRecord.Exception.Response) {
+        return $null
+    }
+
+    $headers = $ErrorRecord.Exception.Response.Headers
+    if (-not $headers) {
+        return $null
+    }
+
+    foreach ($headerName in $HeaderNames) {
+        try {
+            $directValue = $headers[$headerName]
+            if ($null -ne $directValue -and @($directValue).Count -gt 0) {
+                return "$( @($directValue)[0] )".Trim()
+            }
+        } catch {
+            # Some HttpResponseHeaders implementations do not expose an indexer to PowerShell.
+        }
+
+        try {
+            if ($headers.PSObject.Methods["GetValues"]) {
+                $values = @($headers.GetValues($headerName))
+                if ($values.Count -gt 0) {
+                    return "$($values[0])".Trim()
+                }
+            }
+        } catch {
+            # GetValues throws when the requested header is absent.
+        }
+
+        $matchingProperty = $headers.PSObject.Properties |
+            Where-Object { $_.Name -ieq $headerName } |
+            Select-Object -First 1
+        if ($matchingProperty -and $null -ne $matchingProperty.Value) {
+            return "$( @($matchingProperty.Value)[0] )".Trim()
+        }
+    }
+
+    return $null
+}
+
+function Get-CostManagementRetryDelaySeconds {
+    param(
+        [System.Management.Automation.ErrorRecord]$ErrorRecord,
+        [int]$DefaultSeconds = 60,
+        [int]$MaximumSeconds = 300
+    )
+
+    $headerValue = Get-AzureResponseHeaderValue -ErrorRecord $ErrorRecord -HeaderNames @(
+        "x-ms-ratelimit-microsoft.consumption-retry-after",
+        "Retry-After"
+    )
+
+    $delaySeconds = 0
+    if (-not [string]::IsNullOrWhiteSpace($headerValue) -and [int]::TryParse($headerValue, [ref]$delaySeconds)) {
+        return [Math]::Min([Math]::Max($delaySeconds, 1), $MaximumSeconds)
+    }
+
+    $message = if ($ErrorRecord -and $ErrorRecord.Exception) { $ErrorRecord.Exception.Message } else { "" }
+    if ($message -match "(?i)retry(?:\s*|-)after\s+(\d+)\s*(?:seconds?|s)\b") {
+        $messageDelay = 0
+        if ([int]::TryParse($Matches[1], [ref]$messageDelay)) {
+            return [Math]::Min([Math]::Max($messageDelay, 1), $MaximumSeconds)
+        }
+    }
+
+    return [Math]::Min([Math]::Max($DefaultSeconds, 1), $MaximumSeconds)
+}
+
+function Invoke-WithCostManagementThrottleRetry {
+    param(
+        [scriptblock]$Operation,
+        [string]$OperationLabel,
+        [int]$MaxRetries = 5
+    )
+
+    $retryCount = 0
+    while ($true) {
+        try {
+            return & $Operation
+        } catch {
+            if (-not (Test-CostManagementThrottleError -ErrorRecord $_) -or $retryCount -ge $MaxRetries) {
+                throw
+            }
+
+            $retryCount++
+            $delaySeconds = Get-CostManagementRetryDelaySeconds -ErrorRecord $_
+            Write-Info "Azure rate-limited $OperationLabel. Waiting $delaySeconds seconds before retry $retryCount of $MaxRetries."
+            Start-Sleep -Seconds $delaySeconds
+        }
+    }
+}
+
+function Test-PartitionDataUnsupportedMessage {
+    param([string]$Message)
+
+    return -not [string]::IsNullOrWhiteSpace($Message) -and
+        $Message -match "(?i)partitionData" -and
+        $Message -match "(?i)not\s+supported|unsupported|invalid(?:\s+request|\s+input|\s+property)?|unknown\s+property|unrecognized|could\s+not\s+find\s+member"
+}
+
 function Ensure-CostExport {
     param(
         [string]$Scope,
@@ -2039,12 +2664,14 @@ function Ensure-CostExport {
     $registrationRetryCount = 0
     while ($true) {
         try {
-            New-AzResource -ResourceId $resourceId -ApiVersion $COST_EXPORT_API_VERSION -Properties $Body.properties -Force -ErrorAction Stop | Out-Null
+            Invoke-WithCostManagementThrottleRetry -OperationLabel "export definition '$ExportName'" -Operation {
+                New-AzResource -ResourceId $resourceId -ApiVersion $COST_EXPORT_API_VERSION -Properties $Body.properties -Force -ErrorAction Stop | Out-Null
+            }
             break
         } catch {
             $message = $_.Exception.Message
 
-            if ($Body.properties.ContainsKey("partitionData")) {
+            if ($Body.properties.ContainsKey("partitionData") -and (Test-PartitionDataUnsupportedMessage -Message $message)) {
                 Write-Info "Retrying export '$ExportName' without explicit partitionData because this scope may not support that property."
                 $Body.properties.Remove("partitionData")
                 continue
@@ -2076,10 +2703,12 @@ function Invoke-CostExportRun {
     )
 
     $resourceId = Get-CostExportResourceId -Scope $Scope -ExportName $ExportName
-    if ($TimePeriod) {
-        Invoke-AzResourceAction -ResourceId $resourceId -Action "run" -ApiVersion $COST_EXPORT_API_VERSION -Parameters @{ timePeriod = $TimePeriod } -Force -ErrorAction Stop | Out-Null
-    } else {
-        Invoke-AzResourceAction -ResourceId $resourceId -Action "run" -ApiVersion $COST_EXPORT_API_VERSION -Force -ErrorAction Stop | Out-Null
+    Invoke-WithCostManagementThrottleRetry -OperationLabel "export run '$ExportName'" -Operation {
+        if ($TimePeriod) {
+            Invoke-AzResourceAction -ResourceId $resourceId -Action "run" -ApiVersion $COST_EXPORT_API_VERSION -Parameters @{ timePeriod = $TimePeriod } -Force -ErrorAction Stop | Out-Null
+        } else {
+            Invoke-AzResourceAction -ResourceId $resourceId -Action "run" -ApiVersion $COST_EXPORT_API_VERSION -Force -ErrorAction Stop | Out-Null
+        }
     }
 }
 
@@ -2278,54 +2907,27 @@ function Ensure-RecurringAndBackfillExports {
 # MAIN SCRIPT
 # ============================================================================
 
-Write-Header -Message "Spotto AI Azure Setup" -Subtitle "Creates the service principal and assigns required Azure access"
+Write-Header -Message "Spotto Azure Setup" -Subtitle "Creates or repairs your Spotto connection"
 
-Write-Host "You can run this script more than once. It checks for existing Spotto resources"
-Write-Host "and reuses them where possible, so rerunning is the normal way to retry or update access."
+Write-Host "This wizard is safe to rerun. It reuses existing resources where possible and"
+Write-Host "adds any missing access."
 Write-Host ""
 
-Write-SectionLabel "Required access"
-Write-DetailRow -Label "Service principal" -Value "Create '$APP_NAME' or reuse '$APP_NAME' / '$($LEGACY_APP_NAMES[0])'."
-Write-DetailRow -Label "Client secret" -Value "Create the longest allowed secret (24, then 12, then 6 months) or use an existing credential."
-Write-DetailRow -Label "Azure RBAC" -Value "Owner is simplest. Without Owner, activate both User Access Administrator and Contributor on selected subscriptions."
-Write-DetailRow -Label "Governance" -Value "Assign Reader and Management Group Reader at the root management group."
-Write-DetailRow -Label "Billing" -Value "Assign Reservations Reader and Savings plan Reader provider-scope access."
-Write-DetailRow -Label "Billing-scope exports" -Value "Can reuse existing billing-level exports; billing-scope reader access may need manual assignment."
-Write-Host ""
-
-Write-SectionLabel "Recommended and optional prompts"
-Write-DetailRow -Label "Reservations" -Value "Recommended Reservations Contributor for refund quotes and reservation management."
-Write-DetailRow -Label "Microsoft Graph" -Value "Admin consent for app, Global Admin/PIM, group, user, and audit visibility."
-Write-DetailRow -Label "Monitoring" -Value "Monitoring Reader and Log Analytics Reader for richer telemetry analysis."
-Write-DetailRow -Label "Billing exports" -Value "Highly recommended daily exports plus 13-month backfill to reduce billing API calls."
-Write-DetailRow -Label "Write permissions" -Value "Custom role for Advisor dismissals and Storage Inventory reports."
-Write-Host ""
-
-Write-SectionLabel "Using Privileged Identity Management (PIM)?"
-Write-Host "  Activate the required eligible roles in Azure Portal before continuing:" -ForegroundColor Yellow
-Write-Host "  1. Microsoft Entra: Application Administrator or Cloud Application Administrator for app setup." -ForegroundColor Yellow
-Write-Host "  2. Graph consent: Privileged Role Administrator or Global Administrator for Global Admin/PIM and audit visibility permissions." -ForegroundColor Yellow
-Write-Host "  3. Subscriptions: Owner, or Contributor plus User Access Administrator, on every selected subscription." -ForegroundColor Yellow
-Write-Host "  4. All subscriptions mode: the same Azure RBAC access at tenant root scope (/)." -ForegroundColor Yellow
-Write-Host "  5. Optional governance: management-group read access, plus Owner, User Access Administrator, or Role Based Access Control Administrator at the root management group for RBAC assignments." -ForegroundColor Yellow
-Write-Host "  6. Optional savings: role-assignment access at /providers/Microsoft.Capacity and /providers/Microsoft.BillingBenefits." -ForegroundColor Yellow
-Write-Host "  Wait until Azure shows the roles as Active. If activation happened after sign-in, use the session refresh prompt below." -ForegroundColor Yellow
-Write-Host ""
-
-Write-SectionLabel "Important for all subscriptions"
-Write-Host "  - Reader is assigned once at tenant root scope (/)." -ForegroundColor Yellow
-Write-Host "  - Full automation needs Owner at root scope, or User Access Administrator plus Contributor." -ForegroundColor Yellow
-Write-Host "  - User Access Administrator alone can assign RBAC but cannot create billing exports or storage." -ForegroundColor Yellow
-Write-Host "  - Global Administrators usually need to enable Microsoft Entra ID > Properties >" -ForegroundColor Yellow
-Write-Host "    Access management for Azure resources, then sign out and sign back in." -ForegroundColor Yellow
-Write-Host "  - Microsoft Graph governance permissions require tenant admin consent if granted." -ForegroundColor Yellow
-Write-Host ""
-
-$confirmation = Read-Host "Do you want to continue? (yes/no, default yes)"
-if (-not (Test-YesResponse -Value $confirmation)) {
-    Write-Info "Setup cancelled by user."
-    exit
+Write-SectionLabel "Setup mode"
+if ($script:useRecommendedReadOnlySetup) {
+    Write-DetailRow -Label "Selected" -Value "Recommended read-only access"
+    Write-DetailRow -Label "Scope" -Value "All subscriptions"
+    Write-DetailRow -Label "Includes" -Value "Spotto reader permissions"
+    Write-DetailRow -Label "Excludes" -Value "Billing exports and optional write access"
+} else {
+    Write-DetailRow -Label "Selected" -Value "Custom setup"
+    Write-DetailRow -Label "Choices" -Value "The wizard asks which read and optional write capabilities to add"
 }
+Write-Host ""
+
+Write-Info "Next, choose the Azure account, tenant, and subscriptions to connect."
+Write-Info "If you use PIM, activate the required admin roles before continuing."
+Write-Info "Detailed requirements: https://docs.spotto.ai/portal/cloud-account-azure/powershell"
 
 # ============================================================================
 # Step 1: Connect to Azure
@@ -2456,14 +3058,18 @@ if ($subscriptions.Count -eq 0) {
 
 Write-Host ""
 Write-SectionLabel "Onboarding scope"
-Write-OptionRow -Key "1" -Label "All subscriptions" -Description "Assign Reader once at tenant root scope (/)."
-Write-OptionRow -Key "2" -Label "Specific subscriptions" -Description "Choose one or more subscriptions by number."
+if ($script:useRecommendedReadOnlySetup) {
+    Write-DetailRow -Label "Selected" -Value "All subscriptions"
+} else {
+    Write-OptionRow -Key "1" -Label "All subscriptions (default)" -Description "Assign Reader once at tenant root scope (/)."
+    Write-OptionRow -Key "2" -Label "Specific subscriptions" -Description "Choose one or more subscriptions by number."
+}
 
 $selectedSubscriptions = @()
 $scopeSelected = $false
 
 while (-not $scopeSelected) {
-    $selection = Read-Host "`nSelect onboarding scope (1/2)"
+    $selection = Get-OnboardingScopeSelection
     $normalizedSelection = $selection.Trim().ToLowerInvariant()
 
     if ($normalizedSelection -in @("1", "a", "all")) {
@@ -2483,20 +3089,12 @@ while (-not $scopeSelected) {
         Write-Host ""
 
         while ($selectedSubscriptions.Count -eq 0) {
-            $subscriptionSelection = Read-Host "Enter subscription numbers (comma-separated, e.g., 1,3,5)"
-            $invalidSelections = @()
+            $subscriptionSelection = Read-Host "Enter subscription numbers or ranges (for example 1,3,5-9 or 'all')"
             $selectedSubscriptions = @()
             $seenSubscriptionIds = @{}
+            $resolvedSelection = ConvertFrom-IndexedSelection -Selection $subscriptionSelection -MaxValue $subscriptions.Count
 
-            foreach ($entry in ($subscriptionSelection -split ",")) {
-                $subscriptionNumber = 0
-                $trimmedEntry = $entry.Trim()
-
-                if (-not [int]::TryParse($trimmedEntry, [ref]$subscriptionNumber) -or $subscriptionNumber -lt 1 -or $subscriptionNumber -gt $subscriptions.Count) {
-                    $invalidSelections += $trimmedEntry
-                    continue
-                }
-
+            foreach ($subscriptionNumber in @($resolvedSelection.Indexes)) {
                 $subscription = $subscriptions[$subscriptionNumber - 1]
                 if (-not $seenSubscriptionIds.ContainsKey($subscription.Id)) {
                     $selectedSubscriptions += $subscription
@@ -2504,8 +3102,8 @@ while (-not $scopeSelected) {
                 }
             }
 
-            if ($invalidSelections.Count -gt 0 -or $selectedSubscriptions.Count -eq 0) {
-                Write-Error-Custom "Invalid subscription selection. Enter numbers between 1 and $($subscriptions.Count)."
+            if (-not $resolvedSelection.IsValid -or $selectedSubscriptions.Count -eq 0) {
+                Write-Error-Custom "Invalid subscription selection. Enter numbers or ranges between 1 and $($subscriptions.Count), or 'all'."
                 $selectedSubscriptions = @()
             }
         }
@@ -2570,7 +3168,7 @@ try {
     }
     
     $script:clientId = $app.AppId
-    Write-Success "Application (Client) ID: $script:clientId"
+    Write-Success "Client ID: $script:clientId"
     Write-Info "Object ID: $($sp.Id)"
     
 } catch {
@@ -2579,15 +3177,21 @@ try {
 }
 
 # ============================================================================
-# Step 5: Create Client Secret
+# Step 5: Check Client Secret
 # ============================================================================
 
-Write-Header -Message "Step 5 of 13: Create Client Secret"
+Write-Header -Message "Step 5 of 13: Check Client Secret"
 
 try {
-    # Check for existing secrets
-    $existingCredentials = Get-AzADAppCredential -ApplicationId $app.AppId
-    $validCredentials = @($existingCredentials | Where-Object { $_.EndDateTime -gt (Get-Date) })
+    $credentialReferenceTime = Get-Date
+    $applicationCredentials = @(Get-AzADAppCredential -ApplicationId $app.AppId)
+    $existingCredentials = @(Get-ApplicationPasswordCredentials -Credentials $applicationCredentials)
+    $clientSecretPlan = Get-ClientSecretPlan `
+        -Credentials @($existingCredentials) `
+        -ReferenceTime $credentialReferenceTime
+    $validCredentials = @($clientSecretPlan.ValidCredentials)
+    $latestCredential = $clientSecretPlan.LatestCredential
+    $createNewSecret = $clientSecretPlan.Action -eq "create"
     
     if ($validCredentials.Count -gt 0) {
         Write-Info "Found $($validCredentials.Count) existing valid credential(s)."
@@ -2595,25 +3199,27 @@ try {
         foreach ($cred in $validCredentials) {
             Write-Host "  - $($cred.EndDateTime.ToString('yyyy-MM-dd HH:mm:ss UTC'))"
         }
-        
-        $createNew = Read-Host "`nDo you want to create a new secret? (yes/no, default no)"
-        
-        if ($createNew -ne "yes") {
-            Write-Info "Using existing credentials. You'll need to provide the secret value manually."
-            $script:clientSecret = "<USE_EXISTING_SECRET>"
-            
-            # Use the latest expiring secret for the expiry date
-            $latestCred = $validCredentials | Sort-Object EndDateTime -Descending | Select-Object -First 1
-            $script:secretExpiry = $latestCred.EndDateTime.ToString("yyyy-MM-dd")
-            $script:isNewSecret = $false
+
+        if ($script:useRecommendedReadOnlySetup) {
+            if ($createNewSecret) {
+                Write-Info "The latest credential expires in less than three months. A replacement secret will be created."
+            } else {
+                Write-Info "The latest credential has at least three months remaining. No new secret is needed."
+            }
         } else {
-            $createNew = "yes"
+            $defaultCreateNew = $createNewSecret
+            $defaultLabel = if ($defaultCreateNew) { "yes" } else { "no" }
+            $createNewResponse = Read-Host "`nDo you want to create a new secret? (yes/no, default $defaultLabel)"
+            $createNewSecret = Test-YesResponse -Value $createNewResponse -DefaultYes $defaultCreateNew
         }
-    } else {
-        $createNew = "yes"
     }
-    
-    if ($createNew -eq "yes") {
+
+    if (-not $createNewSecret) {
+        Write-Info "Reusing the existing credential. Its secret value cannot be retrieved from Azure."
+        $script:clientSecret = "<USE_EXISTING_SECRET>"
+        $script:secretExpiry = $latestCredential.EndDateTime.ToString("yyyy-MM-dd")
+        $script:isNewSecret = $false
+    } else {
         $secretDurationMonthsToTry = @(24, 12, 6)
         $credential = $null
         $lastSecretError = $null
@@ -2631,7 +3237,7 @@ try {
                 $script:isNewSecret = $true
 
                 Write-Success "Created new $durationMonths-month client secret"
-                Write-Info "Secret expires on: $script:secretExpiry"
+                Write-Info "Secret Expires At: $script:secretExpiry"
                 break
             } catch {
                 $lastSecretError = $_
@@ -2678,23 +3284,26 @@ if ($script:useTenantRootReader) {
 }
 
 # ============================================================================
-# Step 7: Optional Recommended Monitoring Roles
+# Step 7: Recommended Monitoring and Security Roles
 # ============================================================================
 
-Write-Header -Message "Step 7 of 13: Recommended Monitoring Roles"
+Write-Header -Message "Step 7 of 13: Recommended Monitoring and Security Roles"
 
 Write-SectionLabel "Recommended read permissions"
 Write-DetailRow -Label "Monitoring Reader" -Value "Application Insights query access on selected subscriptions."
 Write-DetailRow -Label "Log Analytics Reader" -Value "Workspace log access for current and future analysis scenarios."
+Write-DetailRow -Label "Security Reader" -Value "Defender for Cloud assessments, secure score, and security posture on selected subscriptions."
 Write-DetailRow -Label "All subscriptions" -Value "Log Analytics Reader is assigned once at the root management group."
 Write-DetailRow -Label "Specific subscriptions" -Value "Log Analytics Reader is assigned on each selected subscription."
 Write-Host ""
-Write-Info "Press Enter to accept the default answer of yes."
-
-$grantMonitoringReadPerms = Read-Host "Do you want to grant these optional recommended monitoring roles? (yes/no, default yes)"
+$grantMonitoringReadPerms = Get-SetupCapabilityResponse `
+    -Capability "Monitoring Reader, Log Analytics Reader, and Security Reader" `
+    -Prompt "Do you want to grant these recommended monitoring and security roles?" `
+    -RecommendedReadOnlyValue $true
 
 if ([string]::IsNullOrWhiteSpace($grantMonitoringReadPerms) -or $grantMonitoringReadPerms -match "^(?i:yes)$") {
     Ensure-SubscriptionRoleAssignments -PrincipalId $sp.Id -Subscriptions $selectedSubscriptions -RoleDefinitionName "Monitoring Reader" -RoleLabel "Monitoring Reader role"
+    Ensure-SubscriptionRoleAssignments -PrincipalId $sp.Id -Subscriptions $selectedSubscriptions -RoleDefinitionName "Security Reader" -RoleLabel "Security Reader role"
 
     if ($script:useTenantRootReader) {
         $script:logAnalyticsReaderStatus = Ensure-RootManagementGroupRoleAssignment -PrincipalId $sp.Id -RoleDefinitionName "Log Analytics Reader" -RoleLabel "Log Analytics Reader role"
@@ -2703,7 +3312,7 @@ if ([string]::IsNullOrWhiteSpace($grantMonitoringReadPerms) -or $grantMonitoring
         $script:logAnalyticsReaderStatus = "processed"
     }
 } elseif ($grantMonitoringReadPerms -match "^(?i:no)$") {
-    Write-Info "Skipping optional recommended monitoring roles"
+    Write-Info "Skipping recommended monitoring and security roles"
     $script:logAnalyticsReaderStatus = "skipped"
 } else {
     Write-Info "Unrecognized response. Defaulting to no for the optional recommended monitoring roles."
@@ -2721,7 +3330,10 @@ Write-DetailRow -Label "Scope" -Value "Root management group."
 Write-DetailRow -Label "Roles" -Value "Reader and Management Group Reader."
 Write-DetailRow -Label "Requires" -Value "Owner, User Access Administrator, or Role Based Access Control Administrator at the root management group. Management Group Contributor alone cannot assign Azure RBAC roles."
 Write-Host ""
-$grantGovernanceReaderRoles = Read-Host "Do you want to grant root management group governance reader roles now? (yes/no, default yes)"
+$grantGovernanceReaderRoles = Get-SetupCapabilityResponse `
+    -Capability "root management group Reader and Management Group Reader" `
+    -Prompt "Do you want to grant root management group governance reader roles now?" `
+    -RecommendedReadOnlyValue $true
 
 if (Test-YesResponse -Value $grantGovernanceReaderRoles) {
     try {
@@ -2751,7 +3363,10 @@ Write-DetailRow -Label "Reader role" -Value "Read reservation benefits for savin
 Write-DetailRow -Label "Recommended contributor" -Value "Calculate reservation refund quotes and support future reservation management workflows."
 Write-DetailRow -Label "Requires" -Value "Permission to assign roles at the Microsoft.Capacity provider scope."
 Write-Host ""
-$grantReservationRoles = Read-Host "Do you want to grant reservation roles now? (yes/no, default yes)"
+$grantReservationRoles = Get-SetupCapabilityResponse `
+    -Capability "Reservations Reader" `
+    -Prompt "Do you want to grant reservation roles now?" `
+    -RecommendedReadOnlyValue $true
 
 if (Test-YesResponse -Value $grantReservationRoles) {
     try {
@@ -2791,7 +3406,10 @@ if (Test-YesResponse -Value $grantReservationRoles) {
             Write-Info "Reservations Contributor role already assigned"
             $script:reservationContributorStatus = "existing"
         } else {
-            $grantReservationsContributor = Read-Host "Do you want to grant recommended Reservations Contributor? (yes/no, default yes)"
+            $grantReservationsContributor = Get-SetupCapabilityResponse `
+                -Capability "Reservations Contributor" `
+                -Prompt "Do you want to grant recommended Reservations Contributor?" `
+                -RecommendedReadOnlyValue $false
         }
 
         if (-not $existingReservationContributor -and (Test-YesResponse -Value $grantReservationsContributor)) {
@@ -2830,7 +3448,10 @@ Write-DetailRow -Label "Scope" -Value "/providers/Microsoft.BillingBenefits."
 Write-DetailRow -Label "Role" -Value "Savings plan Reader."
 Write-DetailRow -Label "Requires" -Value "Permission to assign roles at the Microsoft.BillingBenefits provider scope."
 Write-Host ""
-$grantSavingsPlanReader = Read-Host "Do you want to grant Savings plan Reader now? (yes/no, default yes)"
+$grantSavingsPlanReader = Get-SetupCapabilityResponse `
+    -Capability "Savings plan Reader" `
+    -Prompt "Do you want to grant Savings plan Reader now?" `
+    -RecommendedReadOnlyValue $true
 
 if (Test-YesResponse -Value $grantSavingsPlanReader) {
     try {
@@ -2865,7 +3486,7 @@ Write-Header -Message "Step 11 of 13: Grant Microsoft Graph Governance Permissio
 
 Write-SectionLabel "Microsoft Graph governance permission"
 Write-DetailRow -Label "Permissions" -Value "$($GRAPH_GOVERNANCE_PERMISSION_VALUES.Count) Microsoft Graph application permissions with admin consent."
-Write-DetailRow -Label "Purpose" -Value "Read app posture, Global Admin/PIM schedules, groups, users, and audit logs."
+Write-DetailRow -Label "Purpose" -Value "Read app posture, tenant policies, subscribed licensing, Global Admin/PIM schedules, groups, users, and audit logs."
 Write-DetailRow -Label "Requires" -Value "Tenant admin consent and Microsoft Graph authentication."
 Write-DetailRow -Label "Admin sign-in scopes" -Value "Application.ReadWrite.All and AppRoleAssignment.ReadWrite.All."
 Write-Host ""
@@ -2874,14 +3495,15 @@ foreach ($permissionValue in $GRAPH_GOVERNANCE_PERMISSION_VALUES) {
     Write-Host "  - $permissionValue" -ForegroundColor White
 }
 Write-Host ""
-Write-Info "Press Enter to accept the default answer of yes."
-
-$grantGraphPermission = Read-Host "Do you want to connect to Microsoft Graph and grant these governance permissions? (yes/no, default yes)"
+$grantGraphPermission = Get-SetupCapabilityResponse `
+    -Capability "the complete Microsoft Graph governance reader permission set" `
+    -Prompt "Do you want to connect to Microsoft Graph and grant these governance permissions?" `
+    -RecommendedReadOnlyValue $true
 
 if (Test-YesResponse -Value $grantGraphPermission) {
     if (Ensure-PowerShellModules -Modules $graphRequiredModules -ModuleSetName "Microsoft Graph" -ManualInstallCommands @(
         "Install-Module -Name Microsoft.Graph -Scope CurrentUser -Force"
-    ) -Required $false) {
+    ) -Required $false -InstallMissingByDefault $script:useRecommendedReadOnlySetup) {
         $graphConnected = $false
 
         try {
@@ -2964,28 +3586,36 @@ if (Test-YesResponse -Value $grantGraphPermission) {
 }
 
 # ============================================================================
-# Step 12: Highly Recommended Cost Management Billing Exports
+# Step 12: Optional Cost Management Billing Exports
 # ============================================================================
 
 Write-Header -Message "Step 12 of 13: Cost Management Billing Exports"
 
-Write-SectionLabel "Highly recommended billing export setup"
-Write-NumberedStep -Number 1 -Message "Detect existing daily actual and amortized Cost Management exports at billing or subscription scope."
-Write-NumberedStep -Number 2 -Message "Grant the Spotto service principal Storage Blob Data Reader on export containers."
-Write-NumberedStep -Number 3 -Message "Create missing subscription-level daily exports and queue one-time exports for the previous 13 closed months where needed."
-Write-Host ""
-Write-Info "Exports are written to customer-owned Azure Storage. Spotto cloud-engine reads them later."
-Write-Info "This is highly recommended because it reduces Cost Management API calls and Azure rate limiting."
-Write-Info "The script keeps anonymous blob access disabled and containers private."
-Write-Info "Spotto still needs the storage account public network endpoint reachable; RBAC alone cannot bypass a disabled public endpoint or blocking firewall."
-Write-Info "Creating or updating exports and storage needs Owner, or Contributor plus User Access Administrator, on the selected subscription/storage scope."
-Write-Info "User Access Administrator alone can grant RBAC roles but cannot create Cost Management exports, resource groups, storage accounts, or containers."
-Write-Info "New daily recurring exports are run immediately when Azure accepts the run request."
-Write-Info "Historical backfill exports are queued once and marked so reruns can recover interrupted backfills without repeated queueing."
-Write-Info "When a billing-scope export is reused, assign Spotto read access at that billing scope so it can discover the export later."
-Write-Host ""
+if ($script:useRecommendedReadOnlySetup) {
+    Write-Info "Recommended read-only access does not create or modify billing exports or storage."
+    Write-Info "Rerun with Custom setup if you want Spotto to configure Cost Management exports."
+} else {
+    Write-SectionLabel "Optional billing export setup"
+    Write-NumberedStep -Number 1 -Message "Detect existing daily actual and amortized Cost Management exports at billing or subscription scope."
+    Write-NumberedStep -Number 2 -Message "Grant the Spotto service principal Storage Blob Data Reader on export containers."
+    Write-NumberedStep -Number 3 -Message "Create missing subscription-level daily exports and queue one-time exports for the previous 13 closed months where needed."
+    Write-Host ""
+    Write-Info "Exports are written to customer-owned Azure Storage. Spotto cloud-engine reads them later."
+    Write-Info "Exports reduce Cost Management API calls and Azure rate limiting."
+    Write-Info "The script keeps anonymous blob access disabled and containers private."
+    Write-Info "Spotto still needs the storage account public network endpoint reachable; RBAC alone cannot bypass a disabled public endpoint or blocking firewall."
+    Write-Info "Creating or updating exports and storage needs Owner, or Contributor plus User Access Administrator, on the selected subscription/storage scope."
+    Write-Info "User Access Administrator alone can grant RBAC roles but cannot create Cost Management exports, resource groups, storage accounts, or containers."
+    Write-Info "New daily recurring exports are run immediately when Azure accepts the run request."
+    Write-Info "Historical backfill exports are queued once and marked so reruns can recover interrupted backfills without repeated queueing."
+    Write-Info "When a billing-scope export is reused, assign Spotto read access at that billing scope so it can discover the export later."
+    Write-Host ""
+}
 
-$configureBillingExports = Read-Host "Set up highly recommended Cost Management exports for Spotto? (yes/no, default yes)"
+$configureBillingExports = Get-SetupCapabilityResponse `
+    -Capability "Cost Management billing exports and export storage" `
+    -Prompt "Set up Cost Management exports for Spotto?" `
+    -RecommendedReadOnlyValue $false
 
 if (Test-YesResponse -Value $configureBillingExports) {
     $script:billingExportSetupStatus = "processed"
@@ -3008,42 +3638,54 @@ if (Test-YesResponse -Value $configureBillingExports) {
     }
 
     if ($script:billingExportSetupStatus -ne "unavailable") {
-        if ($selectedBillingScopes.Count -gt 0) {
-            Write-Info "Checking for existing daily Cost Management exports on selected billing scopes..."
-            foreach ($billingScope in $selectedBillingScopes) {
-                foreach ($datasetType in @("ActualCost", "AmortizedCost")) {
-                    $matches = @(Find-ExistingRecurringBillingExportsAtScope -Scope $billingScope.Scope -DatasetType $datasetType)
-                    if ($matches.Count -gt 0) {
-                        $export = $matches | Select-Object -First 1
-                        $destination = Get-ExportDestinationInfo -Export $export
-                        $detectedExistingExports += [pscustomobject]@{
-                            Scope = $billingScope.Scope
-                            ScopeLabel = $billingScope.Label
-                            ScopeType = $billingScope.Type
-                            IsBillingScope = $true
-                            Subscription = $null
-                            DatasetType = $datasetType
-                            Export = $export
-                            Destination = $destination
-                        }
-                    }
-                }
+        $exportDiscoveryTargets = @()
+        foreach ($billingScope in $selectedBillingScopes) {
+            $exportDiscoveryTargets += [pscustomobject]@{
+                Scope = $billingScope.Scope
+                ScopeLabel = $billingScope.Label
+                ScopeType = $billingScope.Type
+                IsBillingScope = $true
+                Subscription = $null
             }
         }
 
-        Write-Info "Checking for existing daily Cost Management exports on available subscriptions..."
         foreach ($sub in $billingExportSubscriptions) {
+            $exportDiscoveryTargets += [pscustomobject]@{
+                Scope = "/subscriptions/$($sub.Id)"
+                ScopeLabel = $sub.Name
+                ScopeType = "Subscription"
+                IsBillingScope = $false
+                Subscription = $sub
+            }
+        }
+
+        if ($exportDiscoveryTargets.Count -gt 0) {
+            Write-Info "Checking each selected billing and subscription scope once for existing daily Cost Management exports..."
+        }
+
+        $exportDiscoveries = @(Get-RecurringCostExportDiscoveries -Targets $exportDiscoveryTargets)
+        foreach ($exportDiscovery in $exportDiscoveries) {
+            $discoveryTarget = $exportDiscovery.Target
+            $discovery = $exportDiscovery.Discovery
+            if (-not $discovery.Succeeded) {
+                $script:billingExportSetupStatus = "failed"
+                Write-Error-Custom "Could not complete Cost Management export discovery at $($discoveryTarget.ScopeLabel) ($($discoveryTarget.Scope))."
+                Write-Info "Azure response: $($discovery.ErrorMessage)"
+                Write-Info "No export or storage changes will be made because an incomplete discovery result could hide an existing export. Rerun the wizard after Azure access or throttling recovers."
+                break
+            }
+
             foreach ($datasetType in @("ActualCost", "AmortizedCost")) {
-                $matches = @(Find-ExistingRecurringBillingExports -Subscription $sub -DatasetType $datasetType)
+                $matches = @($discovery.MatchesByDataset[$datasetType])
                 if ($matches.Count -gt 0) {
                     $export = $matches | Select-Object -First 1
                     $destination = Get-ExportDestinationInfo -Export $export
                     $detectedExistingExports += [pscustomobject]@{
-                        Scope = "/subscriptions/$($sub.Id)"
-                        ScopeLabel = $sub.Name
-                        ScopeType = "Subscription"
-                        IsBillingScope = $false
-                        Subscription = $sub
+                        Scope = $discoveryTarget.Scope
+                        ScopeLabel = $discoveryTarget.ScopeLabel
+                        ScopeType = $discoveryTarget.ScopeType
+                        IsBillingScope = $discoveryTarget.IsBillingScope
+                        Subscription = $discoveryTarget.Subscription
                         DatasetType = $datasetType
                         Export = $export
                         Destination = $destination
@@ -3051,7 +3693,9 @@ if (Test-YesResponse -Value $configureBillingExports) {
                 }
             }
         }
+    }
 
+    if ($script:billingExportSetupStatus -notin @("failed", "unavailable")) {
         if ($detectedExistingExports.Count -gt 0) {
             Write-Host ""
             Write-SectionLabel "Detected compatible recurring exports"
@@ -3069,7 +3713,10 @@ if (Test-YesResponse -Value $configureBillingExports) {
             Write-Info "If accepted, subscription-scope export storage may be updated to keep the public endpoint enabled with anonymous blob access disabled."
             Write-Info "Billing-scope export storage is not changed; the script only grants Spotto blob read access on the existing container."
             Write-Info "If billing-scope export storage has public network access disabled or a blocking firewall, Spotto cannot read it over the internet even with Storage Blob Data Reader."
-            $useExistingExports = Read-Host "Use compatible existing recurring exports where found? (yes/no, default yes)"
+            $useExistingExports = Get-SetupCapabilityResponse `
+                -Capability "compatible existing recurring exports" `
+                -Prompt "Use compatible existing recurring exports where found?" `
+                -RecommendedReadOnlyValue $true
             if (Test-YesResponse -Value $useExistingExports) {
                 foreach ($detected in $detectedExistingExports) {
                     try {
@@ -3125,7 +3772,11 @@ if (Test-YesResponse -Value $configureBillingExports) {
         if ($acceptedBillingScopeExports.Count -gt 0) {
             Write-Info "Billing-scope export(s) were accepted."
             Write-Info "Per-subscription exports can still be created as a fallback when the billing-scope export does not cover every selected subscription or dataset."
-            $skipSubscriptionExports = Read-Host "Skip subscription-level exports because the accepted billing-scope export covers all selected subscriptions and datasets? (yes/no, default no)"
+            $skipSubscriptionExports = Get-SetupCapabilityResponse `
+                -Capability "skipping subscription-level export fallback" `
+                -Prompt "Skip subscription-level exports because the accepted billing-scope export covers all selected subscriptions and datasets?" `
+                -RecommendedReadOnlyValue $false `
+                -CustomDefaultYes $false
             $skipSubscriptionLevelExports = Test-YesResponse -Value $skipSubscriptionExports -DefaultYes $false
             if ($skipSubscriptionLevelExports) {
                 Write-Info "Skipping subscription-level export creation because you confirmed the billing-scope export is sufficient."
@@ -3145,7 +3796,10 @@ if (Test-YesResponse -Value $configureBillingExports) {
         } elseif (-not $skipSubscriptionLevelExports -and $existingRecurringExports.Count -gt 0) {
             $firstExistingExport = $existingRecurringExports.Values | Select-Object -First 1
             $firstDestination = Get-ExportDestinationInfo -Export $firstExistingExport
-            $useExistingStorageForNewExports = Read-Host "Use the first existing export storage account for backfill and missing exports? (yes/no, default yes)"
+            $useExistingStorageForNewExports = Get-SetupCapabilityResponse `
+                -Capability "the first compatible existing export storage account" `
+                -Prompt "Use the first existing export storage account for backfill and missing exports?" `
+                -RecommendedReadOnlyValue $true
 
             if (Test-YesResponse -Value $useExistingStorageForNewExports) {
                 try {
@@ -3203,7 +3857,7 @@ if (Test-YesResponse -Value $configureBillingExports) {
     }
 } else {
     $script:billingExportSetupStatus = "skipped"
-    Write-Info "Skipping highly recommended Cost Management billing export setup"
+    Write-Info "Skipping Cost Management billing export setup"
 }
 
 # ============================================================================
@@ -3441,28 +4095,20 @@ function Select-PolicyAssignmentManagementGroupScopes {
     }
 
     while ($true) {
-        $selection = Read-Host "Enter management group numbers, comma-separated, or press Enter for none"
+        $selection = Read-Host "Enter management group numbers or ranges (for example 1,3,5-9), or press Enter for none"
         if ([string]::IsNullOrWhiteSpace($selection)) {
             return @()
         }
 
-        $indexes = @()
-        $valid = $true
-        foreach ($entry in ($selection -split ',')) {
-            $selectedNumber = 0
-            if (-not [int]::TryParse($entry.Trim(), [ref]$selectedNumber) -or $selectedNumber -lt 1 -or $selectedNumber -gt $managementGroups.Count) {
-                $valid = $false
-                break
-            }
-            $indexes += ($selectedNumber - 1)
-        }
-        if (-not $valid) {
-            Write-Error-Custom "Invalid selection. Enter numbers between 1 and $($managementGroups.Count)."
+        # Selecting every policy-assignment scope must remain an explicit, deliberate choice.
+        $resolvedSelection = ConvertFrom-IndexedSelection -Selection $selection -MaxValue $managementGroups.Count -AllowAll $false
+        if (-not $resolvedSelection.IsValid) {
+            Write-Error-Custom "Invalid selection. Enter numbers or ranges between 1 and $($managementGroups.Count); 'all' is not accepted here."
             continue
         }
 
-        return @($indexes | Sort-Object -Unique | ForEach-Object {
-            $group = $managementGroups[$_]
+        return @($resolvedSelection.Indexes | ForEach-Object {
+            $group = $managementGroups[$_ - 1]
             if ($group.Id -match '^/providers/Microsoft.Management/managementGroups/[^/]+$') {
                 $group.Id
             } else {
@@ -3479,7 +4125,11 @@ Write-NumberedStep -Number 1 -Message "Dismiss Azure Advisor recommendations."
 Write-NumberedStep -Number 2 -Message "Enable Storage Inventory reports."
 Write-Host ""
 
-$grantWritePerms = Read-Host "Do you want to grant these optional write permissions? (yes/no, default no)"
+$grantWritePerms = Get-SetupCapabilityResponse `
+    -Capability "Advisor and Storage Inventory write permissions" `
+    -Prompt "Do you want to grant these optional write permissions?" `
+    -RecommendedReadOnlyValue $false `
+    -CustomDefaultYes $false
 
 if ($grantWritePerms -eq "yes") {
     $subscriptionWriteScopes = @($selectedSubscriptions | ForEach-Object { "/subscriptions/$($_.Id)" })
@@ -3518,7 +4168,11 @@ Write-SectionLabel "Azure Policy exemption capability (separate consent)"
 Write-DetailRow -Label "Target action" -Value "Microsoft.Authorization/policyExemptions/write at selected subscriptions/resources."
 Write-DetailRow -Label "Assignment action" -Value "Microsoft.Authorization/policyAssignments/exempt/action at the policy assignment scope."
 Write-Info "This does not grant policy assignment, definition, remediation, or exemption-delete permissions."
-$grantPolicyExemptionPerms = Read-Host "Do you want to grant subscription policy exemption permissions? (yes/no, default no)"
+$grantPolicyExemptionPerms = Get-SetupCapabilityResponse `
+    -Capability "Azure Policy exemption write permissions" `
+    -Prompt "Do you want to grant subscription policy exemption permissions?" `
+    -RecommendedReadOnlyValue $false `
+    -CustomDefaultYes $false
 $script:policyExemptionRoleResult = [PSCustomObject]@{ Status = "skipped"; Created = 0; Existing = 0; Failed = 0 }
 $script:policyAssignmentExemptRoleResult = [PSCustomObject]@{ Status = "skipped"; Created = 0; Existing = 0; Failed = 0 }
 
@@ -3556,7 +4210,11 @@ if ($grantPolicyExemptionPerms -eq "yes") {
 
     Write-Host ""
     Write-Info "Initiatives inherited from a management group need the assignment action at that exact management-group scope."
-    $grantInheritedPolicyExemptions = Read-Host "Do you want to select management-group assignment scopes now? (yes/no, default no)"
+    $grantInheritedPolicyExemptions = Get-SetupCapabilityResponse `
+        -Capability "inherited Azure Policy assignment write scopes" `
+        -Prompt "Do you want to select management-group assignment scopes now?" `
+        -RecommendedReadOnlyValue $false `
+        -CustomDefaultYes $false
     if ($grantInheritedPolicyExemptions -eq "yes") {
         $managementGroupScopes = @(Select-PolicyAssignmentManagementGroupScopes)
         if ($managementGroupScopes.Count -gt 0) {
@@ -3565,7 +4223,11 @@ if ($grantPolicyExemptionPerms -eq "yes") {
                 Write-DetailRow -Label "Scope" -Value $scope
             }
             Write-DetailRow -Label "Only action" -Value "Microsoft.Authorization/policyAssignments/exempt/action"
-            $confirmManagementGroupScopes = Read-Host "Grant this action at the listed scopes? (yes/no, default no)"
+            $confirmManagementGroupScopes = Get-SetupCapabilityResponse `
+                -Capability "the selected management-group policy assignment action" `
+                -Prompt "Grant this action at the listed scopes?" `
+                -RecommendedReadOnlyValue $false `
+                -CustomDefaultYes $false
             if ($confirmManagementGroupScopes -eq "yes") {
                 $managementGroupRoleResults = foreach ($scope in $managementGroupScopes) {
                     # Azure allows only one management group in a custom role's assignable scopes.
@@ -3670,9 +4332,9 @@ switch ($script:savingsPlanReaderStatus) {
     default { Write-Skipped "Savings plan Reader was not processed" }
 }
 switch ($script:graphPermissionStatus) {
-    "created" { Write-Success "Microsoft Graph governance permissions granted for Global Admin/PIM, audit, and posture visibility ($script:graphPermissionSummary)" }
-    "existing" { Write-Success "Microsoft Graph governance permissions already existed for Global Admin/PIM, audit, and posture visibility ($script:graphPermissionSummary)" }
-    "processed" { Write-Success "Microsoft Graph governance permissions processed for Global Admin/PIM, audit, and posture visibility ($script:graphPermissionSummary)" }
+    "created" { Write-Success "Microsoft Graph governance permissions granted for tenant policy, licensing, Global Admin/PIM, audit, and posture visibility ($script:graphPermissionSummary)" }
+    "existing" { Write-Success "Microsoft Graph governance permissions already existed for tenant policy, licensing, Global Admin/PIM, audit, and posture visibility ($script:graphPermissionSummary)" }
+    "processed" { Write-Success "Microsoft Graph governance permissions processed for tenant policy, licensing, Global Admin/PIM, audit, and posture visibility ($script:graphPermissionSummary)" }
     "failed" { Write-Error-Custom "Microsoft Graph governance permissions were not fully granted" }
     "skipped" { Write-Skipped "Microsoft Graph governance permissions skipped" }
     default { Write-Skipped "Microsoft Graph governance permissions were not processed" }
@@ -3681,7 +4343,7 @@ switch ($script:billingExportSetupStatus) {
     "processed" { Write-Success "Cost Management billing exports processed" }
     "failed" { Write-Error-Custom "Cost Management billing export setup failed before export creation completed" }
     "unavailable" { Write-Warning-Custom "Cost Management billing exports were not available for the selected subscription(s) or billing scope(s)" }
-    "skipped" { Write-Skipped "Cost Management billing export setup skipped (highly recommended)" }
+    "skipped" { Write-Skipped "Cost Management billing export setup skipped (use Custom setup to enable)" }
     default { Write-Skipped "Cost Management billing export setup was not processed" }
 }
 switch ($script:billingScopeExportStatus) {
@@ -3741,7 +4403,7 @@ if ($script:graphPermissionStatus -in @("created", "existing", "processed")) {
     Write-Host "  If that happens, wait a few minutes and rerun validation or retry the tenant sync." -ForegroundColor Yellow
 } else {
     Write-Host "  Azure RBAC changes can take 5-15 minutes to apply." -ForegroundColor Yellow
-    Write-Host "  Microsoft Graph governance permissions were not granted, so Global Admin/PIM, audit, group, user, and posture data may show access denied." -ForegroundColor Yellow
+    Write-Host "  Microsoft Graph governance permissions were not granted, so tenant policy, licensing, Global Admin/PIM, audit, group, user, and posture data may show access denied." -ForegroundColor Yellow
     Write-Host "  You can grant Graph consent manually or rerun this script and choose yes for Step 11." -ForegroundColor Yellow
 }
 
