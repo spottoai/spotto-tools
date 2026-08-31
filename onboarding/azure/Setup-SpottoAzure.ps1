@@ -1110,6 +1110,59 @@ function Get-PreferredManagementGroupExportTargets {
         Sort-Object -Property @{ Expression = { [string]$_.Name } })
 }
 
+function Get-ManagementGroupExportDiscoveryTargets {
+    param(
+        [object[]]$ManagementGroups,
+        [string]$TenantId
+    )
+
+    $visibleGroups = @($ManagementGroups | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Name) })
+    $tenantRoot = @($visibleGroups |
+        Where-Object { Test-TenantRootManagementGroup -ManagementGroup $_ -TenantId $TenantId } |
+        Select-Object -First 1)
+    $nonRootGroups = @($visibleGroups |
+        Where-Object { -not (Test-TenantRootManagementGroup -ManagementGroup $_ -TenantId $TenantId) })
+
+    $targets = @()
+    if ($tenantRoot.Count -gt 0) {
+        $targets += $tenantRoot[0]
+    }
+    $targets += @(Get-PreferredManagementGroupExportTargets `
+        -ManagementGroups $nonRootGroups `
+        -TenantId $TenantId)
+
+    $seenScopes = @{}
+    return @($targets | Where-Object {
+        $scope = Get-ManagementGroupScope -ManagementGroup $_
+        $key = $scope.ToLowerInvariant()
+        if ($seenScopes.ContainsKey($key)) {
+            return $false
+        }
+
+        $seenScopes[$key] = $true
+        return $true
+    })
+}
+
+function Get-ExistingManagementGroupExportTargets {
+    param(
+        [object[]]$DiscoveryResults,
+        [string]$TenantId
+    )
+
+    $existingTargets = @($DiscoveryResults | Where-Object {
+        $_ -and $_.Discovery -and @($_.Discovery.MatchesByDataset["Usage"]).Count -gt 0
+    })
+    $existingTenantRoot = @($existingTargets |
+        Where-Object { Test-TenantRootManagementGroup -ManagementGroup $_.ManagementGroup -TenantId $TenantId } |
+        Select-Object -First 1)
+    if ($existingTenantRoot.Count -gt 0) {
+        return @($existingTenantRoot[0])
+    }
+
+    return @($existingTargets)
+}
+
 function Get-VisibleManagementGroupTargets {
     param([string]$TenantId)
 
@@ -1931,10 +1984,14 @@ function Find-BillingExportStorageAccountByName {
     )
 
     Set-AzContext -SubscriptionId $SubscriptionId -TenantId $script:tenantId | Out-Null
-    $resource = @(Get-AzResource `
-        -ResourceType "Microsoft.Storage/storageAccounts" `
-        -Name $Name `
-        -ErrorAction SilentlyContinue) | Where-Object { $_.Name -ieq $Name } | Select-Object -First 1
+    try {
+        $resource = @(Get-AzResource `
+            -ResourceType "Microsoft.Storage/storageAccounts" `
+            -Name $Name `
+            -ErrorAction Stop) | Where-Object { $_.Name -ieq $Name } | Select-Object -First 1
+    } catch {
+        throw "Unable to determine whether storage account '$Name' exists in subscription '$SubscriptionId'. No replacement account will be selected from an incomplete lookup. $_"
+    }
     if (-not $resource) {
         return $null
     }
@@ -1946,6 +2003,39 @@ function Find-BillingExportStorageAccountByName {
         Name = $resource.Name
         Tags = $resource.Tags
     }
+}
+
+function Find-PreferredBillingExportStorageAccount {
+    param(
+        [object[]]$Subscriptions,
+        [string]$TenantId
+    )
+
+    $eligibleSubscriptions = @($Subscriptions |
+        Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) } |
+        Sort-Object -Property Id -Unique)
+    if ($eligibleSubscriptions.Count -eq 0) {
+        return $null
+    }
+
+    $preferredName = @(Get-BillingStorageAccountNameCandidates `
+        -TenantId $TenantId `
+        -SubscriptionId $eligibleSubscriptions[0].Id)[0]
+    $matches = @()
+    foreach ($subscription in $eligibleSubscriptions) {
+        $match = Find-BillingExportStorageAccountByName `
+            -SubscriptionId $subscription.Id `
+            -Name $preferredName
+        if ($match) {
+            $matches += $match
+        }
+    }
+
+    if ($matches.Count -gt 1) {
+        throw "Multiple selected subscriptions reported the globally unique storage account name '$preferredName'. Resolve the Azure inventory inconsistency before continuing."
+    }
+
+    return $matches | Select-Object -First 1
 }
 
 function Test-SpottoBillingStorageAccountOwnership {
@@ -1968,8 +2058,78 @@ function Confirm-BillingStorageAccountReuse {
 
     Write-Warning-Custom "A storage account named '$($StorageAccount.Name)' already exists in the selected subscription, but it is not tagged as Spotto billing export storage for this tenant."
     Write-Info "The script will change billing export storage settings only if you explicitly approve reusing this account."
+    if (Test-BillingStorageAccountHasConflictingOwnership -StorageAccount $StorageAccount) {
+        Write-Info "Existing conflicting Spotto ownership tags will not be overwritten."
+    } else {
+        Write-Info "If approved, canonical Spotto billing-export ownership tags will be added for safer future reruns."
+    }
     $reuseResponse = Read-Host "Reuse this existing storage account? (yes/no, default no)"
     return Test-YesResponse -Value $reuseResponse -DefaultYes $false
+}
+
+function Test-BillingStorageAccountHasConflictingOwnership {
+    param([object]$StorageAccount)
+
+    if (-not $StorageAccount -or -not $StorageAccount.Tags) {
+        return $false
+    }
+
+    $purpose = [string]$StorageAccount.Tags[$BILLING_EXPORT_STORAGE_PURPOSE_TAG]
+    $tenantId = [string]$StorageAccount.Tags[$BILLING_EXPORT_STORAGE_TENANT_TAG]
+    return (-not [string]::IsNullOrWhiteSpace($purpose) -and $purpose -ne $BILLING_EXPORT_STORAGE_PURPOSE_VALUE) -or
+        (-not [string]::IsNullOrWhiteSpace($tenantId) -and $tenantId -ne $script:tenantId)
+}
+
+function Add-SpottoBillingStorageAccountOwnershipTags {
+    param([object]$StorageAccount)
+
+    if (Test-BillingStorageAccountHasConflictingOwnership -StorageAccount $StorageAccount) {
+        throw "Storage account '$($StorageAccount.Name)' has conflicting Spotto ownership tags and cannot be adopted automatically."
+    }
+
+    Update-AzTag `
+        -ResourceId $StorageAccount.ResourceId `
+        -Operation Merge `
+        -Tag @{
+            $BILLING_EXPORT_STORAGE_PURPOSE_TAG = $BILLING_EXPORT_STORAGE_PURPOSE_VALUE
+            $BILLING_EXPORT_STORAGE_TENANT_TAG = $script:tenantId
+            spotto = $BILLING_EXPORT_STORAGE_ALIAS_VALUE
+        } `
+        -ErrorAction Stop | Out-Null
+
+    $updatedTags = @{}
+    if ($StorageAccount.Tags -is [System.Collections.IDictionary]) {
+        foreach ($key in $StorageAccount.Tags.Keys) {
+            $updatedTags[$key] = $StorageAccount.Tags[$key]
+        }
+    }
+    $updatedTags[$BILLING_EXPORT_STORAGE_PURPOSE_TAG] = $BILLING_EXPORT_STORAGE_PURPOSE_VALUE
+    $updatedTags[$BILLING_EXPORT_STORAGE_TENANT_TAG] = $script:tenantId
+    $updatedTags["spotto"] = $BILLING_EXPORT_STORAGE_ALIAS_VALUE
+    $StorageAccount.Tags = $updatedTags
+    Write-Success "Added Spotto billing-export ownership tags to $($StorageAccount.Name)"
+}
+
+function Confirm-AndPrepareBillingStorageAccountReuse {
+    param([object]$StorageAccount)
+
+    if (Test-SpottoBillingStorageAccountOwnership -StorageAccount $StorageAccount) {
+        return $true
+    }
+
+    if (-not (Confirm-BillingStorageAccountReuse -StorageAccount $StorageAccount)) {
+        return $false
+    }
+
+    if (-not (Test-BillingStorageAccountHasConflictingOwnership -StorageAccount $StorageAccount)) {
+        try {
+            Add-SpottoBillingStorageAccountOwnershipTags -StorageAccount $StorageAccount
+        } catch {
+            Write-Warning-Custom "The storage account was approved for this run, but Spotto ownership tags could not be added. A future rerun will ask again. $_"
+        }
+    }
+
+    return $true
 }
 
 function Resolve-BillingExportStorageAccountName {
@@ -2064,26 +2224,46 @@ function Test-ShouldRetryAzureProvisioningInAnotherLocation {
     return (Get-AzureProvisioningFailureCategory -Message $Message) -eq "location-or-sku"
 }
 
-function New-BillingExportStorageAccount {
-    param([object[]]$Subscriptions)
+function Select-BillingStorageSubscription {
+    param(
+        [object[]]$Subscriptions,
+        [string]$Prompt = "Select subscription for the billing export storage account"
+    )
+
+    $eligibleSubscriptions = @($Subscriptions | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.Id) })
+    if ($eligibleSubscriptions.Count -eq 0) {
+        throw "No eligible subscription is available for billing export storage."
+    }
 
     Write-SectionLabel "Storage account subscription"
-    for ($i = 0; $i -lt $Subscriptions.Count; $i++) {
-        Write-Host ("  [{0,2}] {1} ({2})" -f ($i + 1), $Subscriptions[$i].Name, $Subscriptions[$i].Id)
+    for ($i = 0; $i -lt $eligibleSubscriptions.Count; $i++) {
+        Write-Host ("  [{0,2}] {1} ({2})" -f ($i + 1), $eligibleSubscriptions[$i].Name, $eligibleSubscriptions[$i].Id)
     }
 
-    $hostSubscription = $Subscriptions[0]
-    if ($Subscriptions.Count -gt 1) {
-        $selectedIndex = Read-IndexedSelection -Prompt "Select subscription for the billing export storage account (1-$($Subscriptions.Count))" -MaxValue $Subscriptions.Count
-        $hostSubscription = $Subscriptions[$selectedIndex]
+    if ($eligibleSubscriptions.Count -eq 1) {
+        return $eligibleSubscriptions[0]
     }
+
+    $selectedIndex = Read-IndexedSelection `
+        -Prompt "$Prompt (1-$($eligibleSubscriptions.Count))" `
+        -MaxValue $eligibleSubscriptions.Count
+    return $eligibleSubscriptions[$selectedIndex]
+}
+
+function New-BillingExportStorageAccount {
+    param(
+        [object[]]$Subscriptions,
+        [string[]]$ExcludedNames = @()
+    )
+
+    $hostSubscription = Select-BillingStorageSubscription -Subscriptions $Subscriptions
 
     Set-AzContext -SubscriptionId $hostSubscription.Id -TenantId $script:tenantId | Out-Null
     Assert-ResourceProviderRegistered -SubscriptionId $hostSubscription.Id -ProviderNamespace "Microsoft.Storage"
     Assert-ResourceProviderRegistered -SubscriptionId $hostSubscription.Id -ProviderNamespace "Microsoft.CostManagementExports" -MaxAttempts 60 -PollSeconds 5
     $availableLocations = Get-AvailableAzureLocationNames
 
-    $excludedStorageNames = @()
+    $excludedStorageNames = @($ExcludedNames)
     while ($true) {
         $storageNameResolution = Resolve-BillingExportStorageAccountName `
             -SubscriptionId $hostSubscription.Id `
@@ -2093,7 +2273,7 @@ function New-BillingExportStorageAccount {
             break
         }
 
-        if (Confirm-BillingStorageAccountReuse -StorageAccount $storageNameResolution.ExistingStorageAccount) {
+        if (Confirm-AndPrepareBillingStorageAccountReuse -StorageAccount $storageNameResolution.ExistingStorageAccount) {
             Write-Info "Using deterministic billing export storage account $($storageNameResolution.Name) from the selected subscription."
             return $storageNameResolution.ExistingStorageAccount
         }
@@ -2137,7 +2317,7 @@ function New-BillingExportStorageAccount {
         $existingStorageAccount = Find-BillingExportStorageAccountByName -SubscriptionId $hostSubscription.Id -Name $storageAccountName
 
         if ($existingStorageAccount) {
-            if (Confirm-BillingStorageAccountReuse -StorageAccount $existingStorageAccount) {
+            if (Confirm-AndPrepareBillingStorageAccountReuse -StorageAccount $existingStorageAccount) {
                 Write-Info "Using existing storage account $storageAccountName in $($existingStorageAccount.ResourceGroupName)"
                 return $existingStorageAccount
             }
@@ -2221,27 +2401,28 @@ function New-BillingExportStorageAccount {
 function Select-ExistingBillingStorageAccount {
     param([object[]]$Subscriptions)
 
+    $selectedSubscription = Select-BillingStorageSubscription `
+        -Subscriptions $Subscriptions `
+        -Prompt "Select subscription containing the existing storage account"
     $storageAccounts = @()
-    foreach ($sub in $Subscriptions) {
-        try {
-            Set-AzContext -SubscriptionId $sub.Id -TenantId $script:tenantId | Out-Null
-            $resources = @(Get-AzResource -ResourceType "Microsoft.Storage/storageAccounts" -ErrorAction Stop)
-            foreach ($resource in $resources) {
-                $storageAccounts += [pscustomobject]@{
-                    ResourceId = $resource.ResourceId
-                    SubscriptionId = $sub.Id
-                    ResourceGroupName = $resource.ResourceGroupName
-                    Name = $resource.Name
-                    SubscriptionName = $sub.Name
-                }
+    try {
+        Set-AzContext -SubscriptionId $selectedSubscription.Id -TenantId $script:tenantId | Out-Null
+        $resources = @(Get-AzResource -ResourceType "Microsoft.Storage/storageAccounts" -ErrorAction Stop)
+        foreach ($resource in $resources) {
+            $storageAccounts += [pscustomobject]@{
+                ResourceId = $resource.ResourceId
+                SubscriptionId = $selectedSubscription.Id
+                ResourceGroupName = $resource.ResourceGroupName
+                Name = $resource.Name
+                SubscriptionName = $selectedSubscription.Name
             }
-        } catch {
-            Write-Info "Unable to list storage accounts in $($sub.Name): $_"
         }
+    } catch {
+        Write-Info "Unable to list storage accounts in $($selectedSubscription.Name): $_"
     }
 
     if ($storageAccounts.Count -eq 0) {
-        Write-Info "No existing storage accounts were found in the selected subscriptions."
+        Write-Info "No existing storage accounts were found in $($selectedSubscription.Name)."
         return $null
     }
 
@@ -2275,7 +2456,7 @@ function Select-ExistingBillingStorageAccount {
         }
 
         if ($matches.Count -gt 1) {
-            Write-Error-Custom "Multiple storage accounts named '$selection' were found in the selected subscriptions. Select by number instead."
+            Write-Error-Custom "Multiple storage accounts named '$selection' were returned for the selected subscription. Select by number instead."
             continue
         }
 
@@ -2293,14 +2474,33 @@ function Select-BillingExportStorageAccount {
         $NetworkMutationApprovalCache = @{}
     }
 
+    $excludedDedicatedNames = @()
+    $preferredStorageAccount = Find-PreferredBillingExportStorageAccount `
+        -Subscriptions $Subscriptions `
+        -TenantId $script:tenantId
+    if ($preferredStorageAccount) {
+        if (Test-SpottoBillingStorageAccountOwnership -StorageAccount $preferredStorageAccount) {
+            Write-Info "Reusing Spotto's dedicated billing export storage account $($preferredStorageAccount.Name) from subscription $($preferredStorageAccount.SubscriptionId)."
+            return $preferredStorageAccount
+        }
+
+        Write-Warning-Custom "A deterministic billing export storage account from an earlier setup was found: $($preferredStorageAccount.Name)."
+        if (Confirm-AndPrepareBillingStorageAccountReuse -StorageAccount $preferredStorageAccount) {
+            Write-Info "Reusing the approved deterministic billing export storage account."
+            return $preferredStorageAccount
+        }
+
+        $excludedDedicatedNames += $preferredStorageAccount.Name
+    }
+
     Write-SectionLabel "Billing export storage"
-    Write-OptionRow -Key "1" -Label "Create a new storage account (recommended, default)" -Description "Create or reuse Spotto's deterministic dedicated export destination."
+    Write-OptionRow -Key "1" -Label "Create or reuse Spotto's dedicated storage account (recommended, default)" -Description "Use the deterministic tenant-specific export destination."
     Write-OptionRow -Key "2" -Label "Use an existing storage account" -Description "Restricted network settings require separate approval before they are broadened."
 
     while ($true) {
         $storageSelection = Read-Host "Select storage option (1/2, default 1)"
         if ([string]::IsNullOrWhiteSpace($storageSelection) -or $storageSelection.Trim() -eq "1") {
-            return New-BillingExportStorageAccount -Subscriptions $Subscriptions
+            return New-BillingExportStorageAccount -Subscriptions $Subscriptions -ExcludedNames $excludedDedicatedNames
         }
 
         if ($storageSelection.Trim() -eq "2") {
@@ -2317,11 +2517,11 @@ function Select-BillingExportStorageAccount {
         }
 
         Write-Info "Existing storage network changes were not approved. Continuing with the recommended dedicated account."
-        return New-BillingExportStorageAccount -Subscriptions $Subscriptions
+        return New-BillingExportStorageAccount -Subscriptions $Subscriptions -ExcludedNames $excludedDedicatedNames
     }
 
     Write-Info "No existing storage account was selected. Continuing with the recommended dedicated account."
-    return New-BillingExportStorageAccount -Subscriptions $Subscriptions
+    return New-BillingExportStorageAccount -Subscriptions $Subscriptions -ExcludedNames $excludedDedicatedNames
 }
 
 function Confirm-ExistingBillingStorageNetworkChanges {
@@ -3949,33 +4149,119 @@ function Get-CostExportProperties {
     return $properties
 }
 
+function Test-CostExportIsRecurringCandidate {
+    param([object]$Export)
+
+    $properties = Get-CostExportProperties -Export $Export
+    if (-not $properties) {
+        return $true
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$properties.schedule.recurrence)) {
+        return $true
+    }
+
+    return [string]$Export.Name -in @(
+        "spotto-actual-daily",
+        "spotto-amortized-daily",
+        "spotto-usage-daily"
+    )
+}
+
+function Get-RecurringCostExportAssessment {
+    param(
+        [object]$Export,
+        [string[]]$DatasetTypes,
+        [bool]$AllowUsageFallback = $false
+    )
+
+    $exportName = if ($Export -and -not [string]::IsNullOrWhiteSpace([string]$Export.Name)) { [string]$Export.Name } else { "<unnamed>" }
+    $properties = Get-CostExportProperties -Export $Export
+    $reasons = @()
+    if (-not $properties) {
+        $reasons += "Export properties are missing or could not be parsed."
+        return [pscustomobject]@{
+            Export = $Export
+            ExportName = $exportName
+            Classification = "incompatible"
+            RequestedDatasetType = ""
+            EffectiveDatasetType = ""
+            Reasons = $reasons
+        }
+    }
+
+    $destination = $properties.deliveryInfo.destination
+    $effectiveDatasetType = [string]$properties.definition.type
+    $requestedDatasetType = ""
+    $classification = "incompatible"
+
+    if ($properties.schedule.status -ne "Active") {
+        $reasons += "Schedule status must be Active; found '$($properties.schedule.status)'."
+    }
+    if ($properties.schedule.recurrence -ne "Daily") {
+        $reasons += "Schedule recurrence must be Daily; found '$($properties.schedule.recurrence)'."
+    }
+
+    $exactDatasetMatch = @($DatasetTypes | Where-Object {
+        Test-CostExportDefinitionTypeMatches `
+            -RequestedDatasetType $_ `
+            -ExportDefinitionType $effectiveDatasetType
+    } | Select-Object -First 1)
+    if ($exactDatasetMatch.Count -gt 0) {
+        $requestedDatasetType = [string]$exactDatasetMatch[0]
+        $classification = "compatible"
+    } elseif ($AllowUsageFallback -and $effectiveDatasetType -eq "Usage" -and $DatasetTypes -contains "ActualCost") {
+        $requestedDatasetType = "ActualCost"
+        $classification = "usable-fallback"
+    } else {
+        $requestedTypesLabel = @($DatasetTypes | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ", "
+        $reasons += "Definition type '$effectiveDatasetType' does not match the requested dataset(s): $requestedTypesLabel."
+    }
+
+    if ($properties.definition.timeframe -notin @("MonthToDate", "BillingMonthToDate", "TheCurrentMonth")) {
+        $reasons += "Timeframe must be month-to-date; found '$($properties.definition.timeframe)'."
+    }
+    if ($properties.format -ne "Csv") {
+        $reasons += "Format must be Csv; found '$($properties.format)'."
+    }
+    $compression = [string]$properties.compressionMode
+    if (-not [string]::IsNullOrWhiteSpace($compression) -and $compression -notin @("none", "gzip")) {
+        $reasons += "Compression must be None or Gzip; found '$compression'."
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$destination.resourceId)) {
+        $reasons += "Destination storage account resource ID is missing."
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$destination.container)) {
+        $reasons += "Destination container is missing."
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$destination.rootFolderPath)) {
+        $reasons += "Destination root folder path is missing."
+    }
+
+    if ($reasons.Count -gt 0) {
+        $classification = "incompatible"
+    }
+
+    return [pscustomobject]@{
+        Export = $Export
+        ExportName = $exportName
+        Classification = $classification
+        RequestedDatasetType = $requestedDatasetType
+        EffectiveDatasetType = $effectiveDatasetType
+        Reasons = @($reasons)
+    }
+}
+
 function Test-RecurringCostExportMeetsRequirements {
     param(
         [object]$Export,
         [string]$DatasetType
     )
 
-    $properties = Get-CostExportProperties -Export $Export
-    if (-not $properties) {
-        return $false
-    }
-
-    $destination = $properties.deliveryInfo.destination
-    $compression = $properties.compressionMode
-
-    if ($properties.schedule.status -ne "Active") { return $false }
-    if ($properties.schedule.recurrence -ne "Daily") { return $false }
-    if (-not (Test-CostExportDefinitionTypeMatches -RequestedDatasetType $DatasetType -ExportDefinitionType $properties.definition.type)) { return $false }
-    if ($properties.definition.timeframe -notin @("MonthToDate", "BillingMonthToDate", "TheCurrentMonth")) { return $false }
-    if ($properties.format -ne "Csv") { return $false }
-    if ($compression -and $compression -notin @("none", "gzip", "None", "Gzip")) { return $false }
-    if (
-        [string]::IsNullOrWhiteSpace([string]$destination.resourceId) -or
-        [string]::IsNullOrWhiteSpace([string]$destination.container) -or
-        [string]::IsNullOrWhiteSpace([string]$destination.rootFolderPath)
-    ) { return $false }
-
-    return $true
+    $assessment = Get-RecurringCostExportAssessment `
+        -Export $Export `
+        -DatasetTypes @($DatasetType)
+    return $assessment.Classification -eq "compatible"
 }
 
 function Test-CostExportDefinitionTypeMatches {
@@ -4114,8 +4400,15 @@ function Find-ExistingRecurringBillingExportsAtScope {
         $Exports = @($discoveryResult.Exports)
     }
 
+    $allowUsageFallback = (Test-SubscriptionCostExportScope -Scope $scope) -and $DatasetType -eq "ActualCost"
     $uniqueExports = @($Exports | Where-Object { $_ } | Sort-Object -Property ResourceId, Id, Name -Unique)
-    return @($uniqueExports | Where-Object { Test-RecurringCostExportMeetsRequirements -Export $_ -DatasetType $DatasetType })
+    return @($uniqueExports | Where-Object {
+        $assessment = Get-RecurringCostExportAssessment `
+            -Export $_ `
+            -DatasetTypes @($DatasetType) `
+            -AllowUsageFallback $allowUsageFallback
+        $assessment.Classification -in @("compatible", "usable-fallback")
+    })
 }
 
 function Get-RecurringCostExportDiscoveryForScope {
@@ -4132,14 +4425,29 @@ function Get-RecurringCostExportDiscoveryForScope {
         $matchesByDataset[$datasetType] = @()
     }
 
+    $assessments = @()
     if ($listResult.Succeeded) {
+        $allowUsageFallback = Test-SubscriptionCostExportScope -Scope $normalizedScope
+        $uniqueExports = @($listResult.Exports |
+            Where-Object { $_ -and (Test-CostExportIsRecurringCandidate -Export $_) } |
+            Sort-Object -Property ResourceId, Id, Name -Unique)
+        foreach ($export in $uniqueExports) {
+            $assessment = Get-RecurringCostExportAssessment `
+                -Export $export `
+                -DatasetTypes $DatasetTypes `
+                -AllowUsageFallback $allowUsageFallback
+            $assessments += $assessment
+        }
+
         foreach ($datasetType in $DatasetTypes) {
-            $matchesByDataset[$datasetType] = @(
-                Find-ExistingRecurringBillingExportsAtScope `
-                    -Scope $normalizedScope `
-                    -DatasetType $datasetType `
-                    -Exports $listResult.Exports
-            )
+            $matchesByDataset[$datasetType] = @($assessments |
+                Where-Object {
+                    $_.RequestedDatasetType -eq $datasetType -and
+                    $_.Classification -in @("compatible", "usable-fallback")
+                } |
+                Sort-Object `
+                    -Property @{ Expression = { if ($_.Classification -eq "compatible") { 0 } else { 1 } } }, ExportName |
+                ForEach-Object { $_.Export })
         }
     }
 
@@ -4147,6 +4455,7 @@ function Get-RecurringCostExportDiscoveryForScope {
         Succeeded = $listResult.Succeeded
         Scope = $normalizedScope
         MatchesByDataset = $matchesByDataset
+        Assessments = @($assessments)
         ErrorMessage = $listResult.ErrorMessage
     }
 }
@@ -4978,8 +5287,14 @@ function Ensure-RecurringAndBackfillExports {
             $existingExportProperties = Get-CostExportProperties -Export $existingExport
             $destination = Get-ExportDestinationInfo -Export $existingExport
             $effectiveDefinitionType = $existingExportProperties.definition.type
-            Write-Success "Using existing $datasetType daily export on $($Subscription.Name): $($existingExport.name)"
-            Add-BillingExportResult -SubscriptionName $Subscription.Name -SubscriptionId $Subscription.Id -DatasetType $datasetType -ExportKind "Recurring" -ExportName $existingExport.name -Status "existing" -StorageAccountId $destination.StorageAccountId -ContainerName $destination.Container -RootFolderPath $destination.RootFolderPath
+            $existingResultMessage = ""
+            if ($effectiveDefinitionType -ne $datasetType) {
+                $existingResultMessage = "Reused Azure definition type '$effectiveDefinitionType' as the constrained fallback for '$datasetType'; it remains labelled with its effective type."
+                Write-Success "Using existing $effectiveDefinitionType fallback for $datasetType on $($Subscription.Name): $($existingExport.name)"
+            } else {
+                Write-Success "Using existing $datasetType daily export on $($Subscription.Name): $($existingExport.name)"
+            }
+            Add-BillingExportResult -SubscriptionName $Subscription.Name -SubscriptionId $Subscription.Id -DatasetType $effectiveDefinitionType -ExportKind "Recurring" -ExportName $existingExport.name -Status "existing" -StorageAccountId $destination.StorageAccountId -ContainerName $destination.Container -RootFolderPath $destination.RootFolderPath -Message $existingResultMessage
             Add-AzureManualOnboardingBillingExportSource -Scope $scope -DatasetType $effectiveDefinitionType -ExportName $existingExport.name -Destination $destination
         } else {
             try {
@@ -5915,9 +6230,9 @@ if (Test-YesResponse -Value $grantGraphPermission) {
 Write-Header -Message "Step 12 of 13: Cost Management Billing Exports"
 
 Write-SectionLabel "Recommended billing export setup"
-Write-NumberedStep -Number 1 -Message "Detect existing daily exports at billing, management-group, and subscription scope."
+Write-NumberedStep -Number 1 -Message "Classify existing recurring exports at billing, management-group, and subscription scope."
 Write-NumberedStep -Number 2 -Message "Grant the Spotto service principal Storage Blob Data Reader on export containers."
-Write-NumberedStep -Number 3 -Message "Prefer tenant-root (or topmost visible child) management-group Usage, then create subscription Actual/Amortized exports and 13-month backfills for complete coverage."
+Write-NumberedStep -Number 3 -Message "Reuse approved broad exports before creating tenant-root (or topmost child) Usage, then retain subscription datasets and backfills for completeness."
 Write-Host ""
 Write-Info "Exports are written to customer-owned Azure Storage. Spotto cloud-engine reads them later."
 Write-Info "Exports reduce Cost Management API calls and Azure rate limiting."
@@ -5943,8 +6258,12 @@ if (Test-YesResponse -Value $configureBillingExports) {
     $acceptedBillingScopeExports = @()
     $acceptedManagementGroupScopes = @{}
     $detectedExistingExports = @()
+    $rejectedExistingExports = @()
     $billingExportSubscriptions = @()
     $managementGroupExportTargets = @()
+    $managementGroupDiscoveryTargets = @()
+    $managementGroupDiscoveryResults = @()
+    $managementGroupDiscoveryIncomplete = $false
     $script:acceptedBillingExportSources = @()
     $selectedBillingScopes = @(Select-BillingCostExportScopes)
 
@@ -5959,16 +6278,9 @@ if (Test-YesResponse -Value $configureBillingExports) {
         Write-Host ""
         Write-SectionLabel "Broad management-group export scope"
         Write-Warning-Custom "A management-group export can include cost data for subscriptions beyond the subscriptions selected in this wizard."
-        $managementGroupConsentTargets = @($preferredManagementGroups)
-        $consentIncludesTenantRoot = @($preferredManagementGroups |
-            Where-Object { Test-TenantRootManagementGroup -ManagementGroup $_ -TenantId $script:tenantId }).Count -gt 0
-        if ($consentIncludesTenantRoot) {
-            $nonRootConsentGroups = @($script:visibleManagementGroups |
-                Where-Object { -not (Test-TenantRootManagementGroup -ManagementGroup $_ -TenantId $script:tenantId) })
-            $managementGroupConsentTargets += @(Get-PreferredManagementGroupExportTargets `
-                -ManagementGroups $nonRootConsentGroups `
-                -TenantId $script:tenantId)
-        }
+        $managementGroupConsentTargets = @(Get-ManagementGroupExportDiscoveryTargets `
+            -ManagementGroups $script:visibleManagementGroups `
+            -TenantId $script:tenantId)
         foreach ($managementGroup in $managementGroupConsentTargets) {
             $scopeLabel = if (Test-TenantRootManagementGroup -ManagementGroup $managementGroup -TenantId $script:tenantId) { "Preferred scope" } else { "Possible scope" }
             Write-DetailRow -Label $scopeLabel -Value (Get-ManagementGroupDisplayLabel -ManagementGroup $managementGroup -TenantId $script:tenantId)
@@ -5979,72 +6291,77 @@ if (Test-YesResponse -Value $configureBillingExports) {
         if (-not (Test-YesResponse -Value $tryManagementGroupExports -DefaultYes $script:selectedAllSubscriptions)) {
             $preferredManagementGroups = @()
             Write-Info "Management-group exports were not approved. Continuing with billing-scope reuse and selected-subscription exports."
+        } else {
+            $managementGroupDiscoveryTargets = @($managementGroupConsentTargets)
         }
     }
-    $managementGroupProbeTargets = @($preferredManagementGroups)
-    $preferredTenantRoot = @($preferredManagementGroups |
-        Where-Object { Test-TenantRootManagementGroup -ManagementGroup $_ -TenantId $script:tenantId }).Count -gt 0
 
-    foreach ($managementGroup in $managementGroupProbeTargets) {
+    foreach ($managementGroup in $managementGroupDiscoveryTargets) {
         $managementGroupScope = Get-ManagementGroupScope -ManagementGroup $managementGroup
         $managementGroupLabel = Get-ManagementGroupDisplayLabel -ManagementGroup $managementGroup -TenantId $script:tenantId
         $managementGroupDiscovery = Get-RecurringCostExportDiscoveryForScope -Scope $managementGroupScope -DatasetTypes @("Usage")
         if ($managementGroupDiscovery.Succeeded) {
-            $existingManagementGroupExports = @($managementGroupDiscovery.MatchesByDataset["Usage"])
-            $writeAssessment = if ($existingManagementGroupExports.Count -eq 0) {
-                Get-AzurePermissionActionAssessmentAtScope -Scope $managementGroupScope -RequiredAction "Microsoft.CostManagement/exports/write"
-            } else {
-                $null
-            }
-            if ($writeAssessment -and $writeAssessment.Status -ne "ready") {
-                Write-Warning-Custom "The signed-in operator can read management group '$managementGroupLabel', but export-create access could not be confirmed there."
-            } else {
-                $managementGroupExportTargets += [pscustomobject]@{
-                    ManagementGroup = $managementGroup
-                    Scope = $managementGroupScope
-                    ScopeLabel = $managementGroupLabel
-                    Discovery = $managementGroupDiscovery
-                }
+            $managementGroupDiscoveryResults += [pscustomobject]@{
+                ManagementGroup = $managementGroup
+                Scope = $managementGroupScope
+                ScopeLabel = $managementGroupLabel
+                Discovery = $managementGroupDiscovery
             }
         } else {
+            $managementGroupDiscoveryIncomplete = $true
             Write-Warning-Custom "Cost Management exports are not available at management group '$managementGroupLabel'."
             Write-Info "Azure response: $($managementGroupDiscovery.ErrorMessage)"
         }
     }
 
-    if ($managementGroupExportTargets.Count -eq 0 -and $preferredTenantRoot) {
-        $nonRootManagementGroups = @($script:visibleManagementGroups |
-            Where-Object { -not (Test-TenantRootManagementGroup -ManagementGroup $_ -TenantId $script:tenantId) })
-        $fallbackManagementGroups = @(Get-PreferredManagementGroupExportTargets `
-            -ManagementGroups $nonRootManagementGroups `
-            -TenantId $script:tenantId)
-        if ($fallbackManagementGroups.Count -gt 0) {
-            Write-Info "Tenant-root export access was unavailable. Trying the topmost visible child management group(s)."
-        }
-        foreach ($managementGroup in $fallbackManagementGroups) {
-            $managementGroupScope = Get-ManagementGroupScope -ManagementGroup $managementGroup
-            $managementGroupLabel = Get-ManagementGroupDisplayLabel -ManagementGroup $managementGroup -TenantId $script:tenantId
-            $managementGroupDiscovery = Get-RecurringCostExportDiscoveryForScope -Scope $managementGroupScope -DatasetTypes @("Usage")
-            if ($managementGroupDiscovery.Succeeded) {
-                $existingManagementGroupExports = @($managementGroupDiscovery.MatchesByDataset["Usage"])
-                $writeAssessment = if ($existingManagementGroupExports.Count -eq 0) {
-                    Get-AzurePermissionActionAssessmentAtScope -Scope $managementGroupScope -RequiredAction "Microsoft.CostManagement/exports/write"
-                } else {
-                    $null
-                }
-                if ($writeAssessment -and $writeAssessment.Status -ne "ready") {
-                    Write-Warning-Custom "The signed-in operator can read management group '$managementGroupLabel', but export-create access could not be confirmed there."
-                } else {
-                    $managementGroupExportTargets += [pscustomobject]@{
-                        ManagementGroup = $managementGroup
-                        Scope = $managementGroupScope
-                        ScopeLabel = $managementGroupLabel
-                        Discovery = $managementGroupDiscovery
-                    }
-                }
+    $existingManagementGroupTargets = @(Get-ExistingManagementGroupExportTargets `
+        -DiscoveryResults $managementGroupDiscoveryResults `
+        -TenantId $script:tenantId)
+    if ($existingManagementGroupTargets.Count -gt 0) {
+        $managementGroupExportTargets = @($existingManagementGroupTargets)
+        Write-Info "Existing management-group Usage export(s) take precedence over creating an overlapping broader export."
+    } elseif ($managementGroupDiscoveryIncomplete) {
+        Write-Warning-Custom "Management-group export creation is skipped because discovery was incomplete and could hide an existing overlapping export. Subscription export setup will continue."
+    } elseif ($preferredManagementGroups.Count -gt 0) {
+        $preferredTenantRoot = @($preferredManagementGroups |
+            Where-Object { Test-TenantRootManagementGroup -ManagementGroup $_ -TenantId $script:tenantId }).Count -gt 0
+        $creationCandidates = @($preferredManagementGroups)
+
+        foreach ($managementGroup in $creationCandidates) {
+            $scope = Get-ManagementGroupScope -ManagementGroup $managementGroup
+            $discoveryTarget = $managementGroupDiscoveryResults |
+                Where-Object { $_.Scope -ieq $scope } |
+                Select-Object -First 1
+            if (-not $discoveryTarget) {
+                continue
+            }
+
+            $writeAssessment = Get-AzurePermissionActionAssessmentAtScope `
+                -Scope $scope `
+                -RequiredAction "Microsoft.CostManagement/exports/write"
+            if ($writeAssessment.Status -eq "ready") {
+                $managementGroupExportTargets += $discoveryTarget
             } else {
-                Write-Warning-Custom "Cost Management exports are not available at management group '$managementGroupLabel'."
-                Write-Info "Azure response: $($managementGroupDiscovery.ErrorMessage)"
+                Write-Warning-Custom "The signed-in operator can read management group '$($discoveryTarget.ScopeLabel)', but export-create access could not be confirmed there."
+            }
+        }
+
+        if ($managementGroupExportTargets.Count -eq 0 -and $preferredTenantRoot) {
+            $fallbackTargets = @($managementGroupDiscoveryResults | Where-Object {
+                -not (Test-TenantRootManagementGroup -ManagementGroup $_.ManagementGroup -TenantId $script:tenantId)
+            })
+            if ($fallbackTargets.Count -gt 0) {
+                Write-Info "Tenant-root export access was unavailable. Trying the approved topmost visible child management group(s)."
+            }
+            foreach ($fallbackTarget in $fallbackTargets) {
+                $writeAssessment = Get-AzurePermissionActionAssessmentAtScope `
+                    -Scope $fallbackTarget.Scope `
+                    -RequiredAction "Microsoft.CostManagement/exports/write"
+                if ($writeAssessment.Status -eq "ready") {
+                    $managementGroupExportTargets += $fallbackTarget
+                } else {
+                    Write-Warning-Custom "The signed-in operator can read management group '$($fallbackTarget.ScopeLabel)', but export-create access could not be confirmed there."
+                }
             }
         }
     }
@@ -6101,10 +6418,26 @@ if (Test-YesResponse -Value $configureBillingExports) {
                 break
             }
 
+            foreach ($assessment in @($discovery.Assessments | Where-Object Classification -eq "incompatible")) {
+                $rejectedExistingExports += [pscustomobject]@{
+                    Scope = $discoveryTarget.Scope
+                    ScopeLabel = $discoveryTarget.ScopeLabel
+                    ScopeType = $discoveryTarget.ScopeType
+                    Assessment = $assessment
+                }
+            }
+
             foreach ($datasetType in @("ActualCost", "AmortizedCost")) {
                 $matches = @($discovery.MatchesByDataset[$datasetType])
                 if ($matches.Count -gt 0) {
                     $export = $matches | Select-Object -First 1
+                    $assessment = $discovery.Assessments |
+                        Where-Object {
+                            $_.ExportName -eq $export.name -and
+                            $_.RequestedDatasetType -eq $datasetType -and
+                            $_.Classification -in @("compatible", "usable-fallback")
+                        } |
+                        Select-Object -First 1
                     $destination = Get-ExportDestinationInfo -Export $export
                     $detectedExistingExports += [pscustomobject]@{
                         Scope = $discoveryTarget.Scope
@@ -6114,6 +6447,8 @@ if (Test-YesResponse -Value $configureBillingExports) {
                         IsManagementGroupScope = $discoveryTarget.IsManagementGroupScope
                         Subscription = $discoveryTarget.Subscription
                         DatasetType = $datasetType
+                        EffectiveDatasetType = $assessment.EffectiveDatasetType
+                        Classification = $assessment.Classification
                         Export = $export
                         Destination = $destination
                     }
@@ -6121,10 +6456,35 @@ if (Test-YesResponse -Value $configureBillingExports) {
             }
         }
 
-        foreach ($managementGroupTarget in $managementGroupExportTargets) {
-            $matches = @($managementGroupTarget.Discovery.MatchesByDataset["Usage"])
+        $selectedExistingManagementGroupScopes = @{}
+        foreach ($managementGroupTarget in $existingManagementGroupTargets) {
+            $selectedExistingManagementGroupScopes[$managementGroupTarget.Scope.ToLowerInvariant()] = $true
+        }
+
+        foreach ($managementGroupTarget in $managementGroupDiscoveryResults) {
+            foreach ($assessment in @($managementGroupTarget.Discovery.Assessments | Where-Object Classification -eq "incompatible")) {
+                $rejectedExistingExports += [pscustomobject]@{
+                    Scope = $managementGroupTarget.Scope
+                    ScopeLabel = $managementGroupTarget.ScopeLabel
+                    ScopeType = "Management group"
+                    Assessment = $assessment
+                }
+            }
+
+            $matches = if ($selectedExistingManagementGroupScopes.ContainsKey($managementGroupTarget.Scope.ToLowerInvariant())) {
+                @($managementGroupTarget.Discovery.MatchesByDataset["Usage"])
+            } else {
+                @()
+            }
             if ($matches.Count -gt 0) {
                 $export = $matches | Select-Object -First 1
+                $assessment = $managementGroupTarget.Discovery.Assessments |
+                    Where-Object {
+                        $_.ExportName -eq $export.name -and
+                        $_.RequestedDatasetType -eq "Usage" -and
+                        $_.Classification -eq "compatible"
+                    } |
+                    Select-Object -First 1
                 $destination = Get-ExportDestinationInfo -Export $export
                 $detectedExistingExports += [pscustomobject]@{
                     Scope = $managementGroupTarget.Scope
@@ -6135,6 +6495,8 @@ if (Test-YesResponse -Value $configureBillingExports) {
                     ManagementGroup = $managementGroupTarget.ManagementGroup
                     Subscription = $null
                     DatasetType = "Usage"
+                    EffectiveDatasetType = $assessment.EffectiveDatasetType
+                    Classification = $assessment.Classification
                     Export = $export
                     Destination = $destination
                 }
@@ -6145,12 +6507,20 @@ if (Test-YesResponse -Value $configureBillingExports) {
     if ($script:billingExportSetupStatus -notin @("failed", "unavailable")) {
         if ($detectedExistingExports.Count -gt 0) {
             Write-Host ""
-            Write-SectionLabel "Detected compatible recurring exports"
+            Write-SectionLabel "Detected reusable recurring exports"
             foreach ($detected in $detectedExistingExports) {
                 Write-DetailRow -Label "Scope" -Value "$($detected.ScopeLabel) ($($detected.ScopeType))"
-                Write-DetailRow -Label "Dataset" -Value $detected.DatasetType
+                $datasetLabel = if ($detected.Classification -eq "usable-fallback") {
+                    "$($detected.DatasetType) request using Azure $($detected.EffectiveDatasetType) fallback"
+                } else {
+                    $detected.EffectiveDatasetType
+                }
+                Write-DetailRow -Label "Dataset" -Value $datasetLabel
                 Write-DetailRow -Label "Export" -Value $detected.Export.name
                 Write-DetailRow -Label "Container" -Value $detected.Destination.Container
+                if ($detected.Classification -eq "usable-fallback") {
+                    Write-DetailRow -Label "Compatibility" -Value "Usable fallback; retained as Usage and not presented as full modern Actual Cost coverage."
+                }
                 if ($detected.IsBillingScope) {
                     Write-DetailRow -Label "Billing scope" -Value $detected.Scope
                 }
@@ -6161,8 +6531,8 @@ if (Test-YesResponse -Value $configureBillingExports) {
             Write-Info "Billing- and management-group-scope export storage is not changed; the script only grants Spotto blob read access on the existing container."
             Write-Info "If broad-scope export storage has public network access disabled or a blocking firewall, Spotto cannot read it over the internet even with Storage Blob Data Reader."
             $useExistingExports = Get-SetupCapabilityResponse `
-                -Capability "compatible existing recurring exports" `
-                -Prompt "Use compatible existing recurring exports where found?" `
+                -Capability "reusable existing recurring exports" `
+                -Prompt "Use reusable existing recurring exports where found?" `
                 -RecommendedReadOnlyValue $true
             if (Test-YesResponse -Value $useExistingExports) {
                 foreach ($detected in $detectedExistingExports) {
@@ -6235,7 +6605,27 @@ if (Test-YesResponse -Value $configureBillingExports) {
                 }
             }
         } else {
-            Write-Info "No compatible recurring exports were found on the selected billing, management-group, or subscription scopes."
+            if ($rejectedExistingExports.Count -gt 0) {
+                Write-Info "Recurring exports were found, but none met the Spotto reuse requirements. Review the reasons below before choosing storage."
+            } else {
+                Write-Info "No recurring exports were found on the selected billing, management-group, or subscription scopes."
+            }
+        }
+
+        if ($rejectedExistingExports.Count -gt 0) {
+            Write-Host ""
+            Write-SectionLabel "Recurring exports not reused"
+            foreach ($rejected in @($rejectedExistingExports | Select-Object -First 10)) {
+                Write-DetailRow -Label "Scope" -Value "$($rejected.ScopeLabel) ($($rejected.ScopeType))"
+                Write-DetailRow -Label "Export" -Value $rejected.Assessment.ExportName
+                foreach ($reason in @($rejected.Assessment.Reasons)) {
+                    Write-DetailRow -Label "Reason" -Value $reason
+                }
+                Write-Host ""
+            }
+            if ($rejectedExistingExports.Count -gt 10) {
+                Write-Info "$($rejectedExistingExports.Count - 10) additional incompatible recurring export(s) are omitted from the console summary; the Azure scopes above can be inspected manually."
+            }
         }
 
         $storageDestination = $null
@@ -6273,7 +6663,7 @@ if (Test-YesResponse -Value $configureBillingExports) {
             $firstExistingExport = $existingRecurringExports.Values | Select-Object -First 1
             $firstDestination = Get-ExportDestinationInfo -Export $firstExistingExport
             $useExistingStorageForNewExports = Get-SetupCapabilityResponse `
-                -Capability "the first compatible existing export storage account" `
+                -Capability "the first reusable existing export storage account" `
                 -Prompt "Use the first existing export storage account for backfill and missing exports?" `
                 -RecommendedReadOnlyValue $true
 

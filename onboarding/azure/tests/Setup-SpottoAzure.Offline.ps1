@@ -32,17 +32,31 @@ if ($setupSource -notmatch '(?s)New-AzStorageAccount.+?SpottoPurpose\s*=.+?Spott
 if ($setupSource -notmatch '(?s)Get-CostManagementContributorSelfRemediationTargets\s+-Results\s+\$requiredResults.+?Invoke-CostManagementContributorSelfRemediation.+?SelfRemediation\s*=\s*\$selfRemediation') {
     throw "Prerequisite Cost Management self-remediation is not wired into its returned outcome."
 }
+if ($setupSource -notmatch '(?s)Get-ManagementGroupExportDiscoveryTargets.+?Get-ExistingManagementGroupExportTargets.+?Recurring exports not reused') {
+    throw "Classified management-group discovery or rejected-export diagnostics are not wired into the wizard."
+}
+if ($setupSource -notmatch '(?s)\$managementGroupDiscoveryIncomplete\s*=\s*\$true.+?creation is skipped because discovery was incomplete') {
+    throw "Incomplete management-group discovery does not fail closed before export creation."
+}
+if ($setupSource -notmatch '(?s)Find-PreferredBillingExportStorageAccount.+?Create or reuse Spotto''s dedicated storage account') {
+    throw "Deterministic storage pre-discovery is not wired before the general storage choices."
+}
 
 $functionNames = @(
     "Get-StableHashSuffix",
     "Get-BillingStorageAccountNameCandidates",
+    "Find-BillingExportStorageAccountByName",
     "Resolve-BillingExportStorageAccountName",
     "Test-SpottoBillingStorageAccountOwnership",
     "Confirm-BillingStorageAccountReuse",
+    "Test-BillingStorageAccountHasConflictingOwnership",
+    "Add-SpottoBillingStorageAccountOwnershipTags",
+    "Confirm-AndPrepareBillingStorageAccountReuse",
     "Test-YesResponse",
     "Read-SetupConfirmation",
     "Read-IndexedSelection",
     "New-BillingExportStorageAccount",
+    "Select-ExistingBillingStorageAccount",
     "Select-BillingExportStorageAccount",
     "Confirm-ExistingBillingStorageNetworkChanges",
     "Confirm-ExistingBillingStorageMutation",
@@ -64,9 +78,17 @@ $functionNames = @(
     "Get-ManagementGroupDisplayLabel",
     "Get-ManagementGroupParentScope",
     "Get-PreferredManagementGroupExportTargets",
+    "Get-ManagementGroupExportDiscoveryTargets",
+    "Get-ExistingManagementGroupExportTargets",
+    "Select-BillingStorageSubscription",
+    "Find-PreferredBillingExportStorageAccount",
     "Get-CostExportProperties",
     "Test-CostExportDefinitionTypeMatches",
+    "Test-CostExportIsRecurringCandidate",
+    "Get-RecurringCostExportAssessment",
     "Test-RecurringCostExportMeetsRequirements",
+    "Test-SubscriptionCostExportScope",
+    "Get-RecurringCostExportDiscoveryForScope",
     "Get-StorageAccountParts",
     "Get-ExportDestinationInfo",
     "Get-SpottoBackfillQueuedDescription",
@@ -292,6 +314,20 @@ if (@($firstRun | Sort-Object -Unique).Count -ne 20) {
     throw "Collision candidates are not unique."
 }
 
+& {
+    function Set-AzContext {}
+    function Get-AzResource { throw "simulated storage read denial" }
+    $lookupFailedClosed = $false
+    try {
+        Find-BillingExportStorageAccountByName -SubscriptionId $subscriptionId -Name $firstRun[0] | Out-Null
+    } catch {
+        $lookupFailedClosed = $_.Exception.Message -match "No replacement account will be selected"
+    }
+    if (-not $lookupFailedClosed) {
+        throw "A failed deterministic storage lookup did not stop replacement-account selection."
+    }
+}
+
 function Find-BillingExportStorageAccountByName { return $null }
 $script:availabilityCalls = @()
 function Test-StorageAccountNameAvailable {
@@ -437,7 +473,7 @@ if (-not (Test-SpottoBackfillPending -Export $pendingBackfill -PeriodName "20260
     function Invoke-CostExportRun { $script:backfillRunCount++ }
     function Add-BillingExportResult {
         param($SubscriptionName, $SubscriptionId, $DatasetType, $ExportKind, $ExportName, $Status, $StorageAccountId, $ContainerName, $RootFolderPath, $Message)
-        $script:backfillResults += [pscustomobject]@{ DatasetType = $DatasetType; Status = $Status; Message = $Message }
+        $script:backfillResults += [pscustomobject]@{ DatasetType = $DatasetType; ExportKind = $ExportKind; Status = $Status; Message = $Message }
     }
     function Add-AzureManualOnboardingBillingExportSource {}
     function Write-Success { param($Message) }
@@ -445,10 +481,11 @@ if (-not (Test-SpottoBackfillPending -Export $pendingBackfill -PeriodName "20260
     function Write-Warning-Custom { param($Message) }
     $existingRecurring = @{}
     foreach ($datasetType in @("ActualCost", "AmortizedCost")) {
+        $effectiveDefinitionType = if ($datasetType -eq "ActualCost") { "Usage" } else { $datasetType }
         $existingRecurring["sub-1|$datasetType"] = [pscustomobject]@{
             name = "existing-$datasetType"
             Properties = [pscustomobject]@{
-                definition = [pscustomobject]@{ type = $datasetType }
+                definition = [pscustomobject]@{ type = $effectiveDefinitionType }
                 deliveryInfo = [pscustomobject]@{ destination = [pscustomobject]@{ resourceId = "/storage"; container = "exports"; rootFolderPath = "spotto" } }
             }
         }
@@ -460,7 +497,8 @@ if (-not (Test-SpottoBackfillPending -Export $pendingBackfill -PeriodName "20260
         -ExistingRecurringExports $existingRecurring
 
     $ambiguousResults = @($script:backfillResults | Where-Object { $_.Status -eq "ambiguous" })
-    if ($script:backfillRunCount -ne 0 -or $ambiguousResults.Count -ne 1 -or $ambiguousResults[0].DatasetType -ne "ActualCost") {
+    $usageRecurringResults = @($script:backfillResults | Where-Object { $_.Status -eq "existing" -and $_.ExportKind -eq "Recurring" -and $_.DatasetType -eq "Usage" })
+    if ($script:backfillRunCount -ne 0 -or $ambiguousResults.Count -ne 1 -or $ambiguousResults[0].DatasetType -ne "ActualCost" -or $usageRecurringResults.Count -ne 1) {
         throw "A pending backfill marker did not prevent an ambiguous duplicate run."
     }
 }
@@ -811,6 +849,84 @@ if (-not (Test-RecurringCostExportMeetsRequirements -Export $recurringExportWith
     throw "A management-group Usage export was rejected."
 }
 
+$usageFallbackAssessment = Get-RecurringCostExportAssessment `
+    -Export $recurringExportWithoutRootPath `
+    -DatasetTypes @("ActualCost", "AmortizedCost") `
+    -AllowUsageFallback $true
+if ($usageFallbackAssessment.Classification -ne "usable-fallback" -or
+    $usageFallbackAssessment.RequestedDatasetType -ne "ActualCost" -or
+    $usageFallbackAssessment.EffectiveDatasetType -ne "Usage") {
+    throw "A subscription Usage fallback was not classified for safe rerun reuse."
+}
+
+$strictUsageAssessment = Get-RecurringCostExportAssessment `
+    -Export $recurringExportWithoutRootPath `
+    -DatasetTypes @("ActualCost", "AmortizedCost")
+if ($strictUsageAssessment.Classification -ne "incompatible" -or
+    ($strictUsageAssessment.Reasons -join " ") -notmatch "Usage") {
+    throw "Strict discovery did not explain the rejected Usage definition."
+}
+
+$recurringExportWithoutRootPath.Properties.schedule.recurrence = "Monthly"
+$monthlyAssessment = Get-RecurringCostExportAssessment `
+    -Export $recurringExportWithoutRootPath `
+    -DatasetTypes @("ActualCost", "AmortizedCost") `
+    -AllowUsageFallback $true
+if ($monthlyAssessment.Classification -ne "incompatible" -or
+    ($monthlyAssessment.Reasons -join " ") -notmatch "Daily") {
+    throw "An incompatible recurrence did not produce an actionable reason."
+}
+$recurringExportWithoutRootPath.Properties.schedule.recurrence = "Daily"
+
+& {
+    $usageExport = $recurringExportWithoutRootPath
+    $monthlyExport = [pscustomobject]@{
+        Name = "monthly-amortized"
+        Properties = [pscustomobject]@{
+            schedule = [pscustomobject]@{ status = "Active"; recurrence = "Monthly" }
+            definition = [pscustomobject]@{ type = "AmortizedCost"; timeframe = "MonthToDate" }
+            format = "Csv"
+            compressionMode = "gzip"
+            deliveryInfo = [pscustomobject]@{
+                destination = [pscustomobject]@{
+                    resourceId = "/subscriptions/sub-1/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/billingexports123"
+                    container = "cost-exports"
+                    rootFolderPath = "spotto"
+                }
+            }
+        }
+    }
+    $exactActualExport = [pscustomobject]@{
+        Name = "z-exact-actual"
+        Properties = [pscustomobject]@{
+            schedule = [pscustomobject]@{ status = "Active"; recurrence = "Daily" }
+            definition = [pscustomobject]@{ type = "ActualCost"; timeframe = "MonthToDate" }
+            format = "Csv"
+            compressionMode = "gzip"
+            deliveryInfo = [pscustomobject]@{
+                destination = [pscustomobject]@{
+                    resourceId = "/subscriptions/sub-1/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/billingexports123"
+                    container = "cost-exports"
+                    rootFolderPath = "spotto"
+                }
+            }
+        }
+    }
+    function Get-CostExportsForScopeResult {
+        return [pscustomobject]@{ Succeeded = $true; Exports = @($usageExport, $monthlyExport, $exactActualExport); ErrorMessage = "" }
+    }
+
+    $discovery = Get-RecurringCostExportDiscoveryForScope `
+        -Scope "/subscriptions/sub-1" `
+        -DatasetTypes @("ActualCost", "AmortizedCost")
+    if (@($discovery.MatchesByDataset["ActualCost"]).Count -ne 2 -or
+        $discovery.MatchesByDataset["ActualCost"][0].Name -ne "z-exact-actual" -or
+        $discovery.Assessments.Count -ne 3 -or
+        @($discovery.Assessments | Where-Object Classification -eq "incompatible").Count -ne 1) {
+        throw "Subscription discovery did not prefer exact ActualCost, retain Usage fallback, and explain the rejected export."
+    }
+}
+
 $scopeTypeCases = @(
     @{ Scope = "/subscriptions/sub-1"; Expected = "subscription" },
     @{ Scope = "/subscriptions/sub-1/resourceGroups/rg-1"; Expected = "resourceGroup" },
@@ -906,6 +1022,39 @@ if (($topmostTargets.Name -join ",") -ne "business,platform") {
     throw "Topmost visible management groups were not selected without their nested descendants."
 }
 
+$managementGroupDiscoveryTargets = @(Get-ManagementGroupExportDiscoveryTargets `
+    -ManagementGroups @($nestedA, $topLevelB, $topLevelA, $rootManagementGroup) `
+    -TenantId $tenantId)
+if (($managementGroupDiscoveryTargets.Name -join ",") -ne "$tenantId,business,platform") {
+    throw "Management-group discovery did not include root and topmost visible child scopes exactly once."
+}
+
+$rootWithoutExport = [pscustomobject]@{
+    ManagementGroup = $rootManagementGroup
+    Discovery = [pscustomobject]@{ MatchesByDataset = @{ Usage = @() } }
+}
+$childWithExport = [pscustomobject]@{
+    ManagementGroup = $topLevelA
+    Discovery = [pscustomobject]@{ MatchesByDataset = @{ Usage = @([pscustomobject]@{ Name = "spotto-usage-daily" }) } }
+}
+$existingManagementGroupTargets = @(Get-ExistingManagementGroupExportTargets `
+    -DiscoveryResults @($rootWithoutExport, $childWithExport) `
+    -TenantId $tenantId)
+if ($existingManagementGroupTargets.Count -ne 1 -or $existingManagementGroupTargets[0].ManagementGroup.Name -ne "platform") {
+    throw "An existing child management-group export was lost when tenant-root creation was available."
+}
+
+$rootWithExport = [pscustomobject]@{
+    ManagementGroup = $rootManagementGroup
+    Discovery = [pscustomobject]@{ MatchesByDataset = @{ Usage = @([pscustomobject]@{ Name = "spotto-usage-daily" }) } }
+}
+$rootExistingTargets = @(Get-ExistingManagementGroupExportTargets `
+    -DiscoveryResults @($rootWithExport, $childWithExport) `
+    -TenantId $tenantId)
+if ($rootExistingTargets.Count -ne 1 -or $rootExistingTargets[0].ManagementGroup.Name -ne $tenantId) {
+    throw "A tenant-root export did not suppress overlapping child management-group reuse."
+}
+
 & {
     $script:acceptedBillingExportSources = @()
     $script:capturedManagementGroupExport = $null
@@ -965,6 +1114,7 @@ function Write-Info { param($Message) }
         }
     }
     function Confirm-BillingStorageAccountReuse { return $true }
+    function Confirm-AndPrepareBillingStorageAccountReuse { return $true }
     $storageSubscriptions = @(
         [pscustomobject]@{ Id = "sub-1"; Name = "First" },
         [pscustomobject]@{ Id = "sub-2"; Name = "Second" }
@@ -980,6 +1130,7 @@ function Write-Info { param($Message) }
     function Read-Host { return "" }
     function New-BillingExportStorageAccount { return "new-storage" }
     function Select-ExistingBillingStorageAccount { throw "Existing picker ran for the default option." }
+    function Find-PreferredBillingExportStorageAccount { return $null }
     $selectedStorage = Select-BillingExportStorageAccount -Subscriptions @([pscustomobject]@{ Id = $subscriptionId })
     if ($selectedStorage -ne "new-storage") {
         throw "Default storage option did not create or reuse dedicated storage."
@@ -989,10 +1140,115 @@ function Write-Info { param($Message) }
     function Read-Host { return "2" }
     function New-BillingExportStorageAccount { throw "New storage ran for the existing option." }
     function Select-ExistingBillingStorageAccount { return [pscustomobject]@{ ResourceId = "/existing-storage" } }
+    function Find-PreferredBillingExportStorageAccount { return $null }
     function Confirm-ExistingBillingStorageNetworkChanges { return $true }
     $selectedStorage = Select-BillingExportStorageAccount -Subscriptions @([pscustomobject]@{ Id = $subscriptionId })
     if ($selectedStorage.ResourceId -ne "/existing-storage") {
         throw "Existing storage option routing failed in Recommended mode."
+    }
+}
+
+& {
+    $script:existingStorageResponses = @("2", "1")
+    $script:existingStorageResponseIndex = 0
+    $script:storageListSubscriptions = @()
+    function Read-Host {
+        $response = $script:existingStorageResponses[$script:existingStorageResponseIndex]
+        $script:existingStorageResponseIndex++
+        return $response
+    }
+    function Set-AzContext {
+        param($SubscriptionId, $TenantId)
+        $script:storageListSubscriptions += $SubscriptionId
+    }
+    function Get-AzResource {
+        return [pscustomobject]@{
+            ResourceId = "/subscriptions/sub-2/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/selected"
+            ResourceGroupName = "rg"
+            Name = "selected"
+        }
+    }
+    function Write-SectionLabel { param($Message) }
+    function Write-Host { param($Object, $ForegroundColor, [switch]$NoNewline) }
+    function Write-Error-Custom { param($Message) }
+
+    $selectedExistingStorage = Select-ExistingBillingStorageAccount -Subscriptions @(
+        [pscustomobject]@{ Id = "sub-1"; Name = "First" },
+        [pscustomobject]@{ Id = "sub-2"; Name = "Second" }
+    )
+    if ($selectedExistingStorage.SubscriptionId -ne "sub-2" -or
+        ($script:storageListSubscriptions -join ",") -ne "sub-2") {
+        throw "Existing storage selection enumerated accounts before or outside the selected subscription."
+    }
+}
+
+& {
+    $script:preferredStorageLookups = @()
+    function Find-BillingExportStorageAccountByName {
+        param($SubscriptionId, $Name)
+        $script:preferredStorageLookups += $SubscriptionId
+        if ($SubscriptionId -eq "sub-2") {
+            return [pscustomobject]@{ SubscriptionId = $SubscriptionId; Name = $Name; ResourceId = "/preferred" }
+        }
+        return $null
+    }
+
+    $preferredStorage = Find-PreferredBillingExportStorageAccount `
+        -Subscriptions @(
+            [pscustomobject]@{ Id = "sub-1"; Name = "First" },
+            [pscustomobject]@{ Id = "sub-2"; Name = "Second" }
+        ) `
+        -TenantId $tenantId
+    if (-not $preferredStorage -or $preferredStorage.SubscriptionId -ne "sub-2" -or
+        ($script:preferredStorageLookups -join ",") -ne "sub-1,sub-2") {
+        throw "The preferred deterministic storage account was not discovered across eligible host subscriptions."
+    }
+}
+
+& {
+    $script:adoptedStorageTags = $null
+    function Confirm-BillingStorageAccountReuse { return $true }
+    function Update-AzTag {
+        param($ResourceId, $Operation, $Tag, $ErrorAction)
+        $script:adoptedStorageTags = $Tag
+    }
+    function Write-Success { param($Message) }
+    function Write-Warning-Custom { param($Message) }
+
+    $legacyStorage = [pscustomobject]@{
+        ResourceId = "/subscriptions/sub-1/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/billingexportslegacy"
+        SubscriptionId = "sub-1"
+        Name = "billingexportslegacy"
+        Tags = @{ environment = "production" }
+    }
+    if (-not (Confirm-AndPrepareBillingStorageAccountReuse -StorageAccount $legacyStorage) -or
+        $script:adoptedStorageTags[$BILLING_EXPORT_STORAGE_TENANT_TAG] -ne $tenantId -or
+        $script:adoptedStorageTags[$BILLING_EXPORT_STORAGE_PURPOSE_TAG] -ne $BILLING_EXPORT_STORAGE_PURPOSE_VALUE) {
+        throw "An explicitly approved legacy deterministic account was not adopted with canonical ownership tags."
+    }
+}
+
+& {
+    function Find-PreferredBillingExportStorageAccount {
+        return [pscustomobject]@{
+            ResourceId = "/preferred"
+            SubscriptionId = "sub-1"
+            Name = "billingexportsowned"
+            Tags = @{
+                SpottoPurpose = $BILLING_EXPORT_STORAGE_PURPOSE_VALUE
+                SpottoTenantId = $tenantId
+            }
+        }
+    }
+    function New-BillingExportStorageAccount { throw "Owned deterministic storage must be reused before the storage menu." }
+    function Select-ExistingBillingStorageAccount { throw "Owned deterministic storage must be reused before account enumeration." }
+    function Read-Host { throw "Owned deterministic storage reuse must not prompt for a general storage option." }
+    function Write-Info { param($Message) }
+
+    $ownedStorage = Select-BillingExportStorageAccount `
+        -Subscriptions @([pscustomobject]@{ Id = "sub-1"; Name = "First" })
+    if ($ownedStorage.ResourceId -ne "/preferred") {
+        throw "A tagged deterministic account was not reused automatically."
     }
 }
 $script:useRecommendedReadOnlySetup = $false
