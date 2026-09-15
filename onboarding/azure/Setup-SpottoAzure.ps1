@@ -933,6 +933,42 @@ function Use-SubscriptionReaderFallback {
     return $true
 }
 
+function Test-ServicePrincipalPropagationError {
+    param([object]$ErrorRecord)
+
+    $message = if ($ErrorRecord -and $ErrorRecord.Exception) { "$($ErrorRecord.Exception.Message)" } else { "$ErrorRecord" }
+    return $message -match '(?i)(PrincipalNotFound|principal.+does not exist|directory object.+not found|identity.+not found)'
+}
+
+function New-AzRoleAssignmentWithPrincipalPropagationRetry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ObjectId,
+        [Parameter(Mandatory = $true)][string]$RoleDefinitionName,
+        [Parameter(Mandatory = $true)][string]$Scope,
+        [int]$MaxAttempts = 6
+    )
+
+    $retryDelaysSeconds = @(2, 4, 8, 16, 30)
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            return New-AzRoleAssignment `
+                -ObjectId $ObjectId `
+                -RoleDefinitionName $RoleDefinitionName `
+                -Scope $Scope `
+                -ErrorAction Stop
+        } catch {
+            if ($attempt -ge $MaxAttempts -or -not (Test-ServicePrincipalPropagationError -ErrorRecord $_)) {
+                throw
+            }
+
+            $delaySeconds = $retryDelaysSeconds[[Math]::Min($attempt - 1, $retryDelaysSeconds.Count - 1)]
+            Write-Info "The new service principal is still propagating. Retrying the role assignment in $delaySeconds seconds..."
+            Start-Sleep -Seconds $delaySeconds
+        }
+    }
+}
+
 function Ensure-SubscriptionRoleAssignments {
     param(
         [string]$PrincipalId,
@@ -959,7 +995,7 @@ function Ensure-SubscriptionRoleAssignments {
                 Write-Info "$RoleLabel already assigned on: $($sub.Name)"
                 $skipCount++
             } else {
-                New-AzRoleAssignment -ObjectId $PrincipalId -RoleDefinitionName $RoleDefinitionName -Scope $scope | Out-Null
+                New-AzRoleAssignmentWithPrincipalPropagationRetry -ObjectId $PrincipalId -RoleDefinitionName $RoleDefinitionName -Scope $scope | Out-Null
                 Write-Success "Assigned $RoleLabel on: $($sub.Name)"
                 $successCount++
             }
@@ -991,7 +1027,7 @@ function Ensure-TenantRootReaderAssignment {
             return "existing"
         }
 
-        New-AzRoleAssignment -ObjectId $PrincipalId -RoleDefinitionName "Reader" -Scope $rootScope | Out-Null
+        New-AzRoleAssignmentWithPrincipalPropagationRetry -ObjectId $PrincipalId -RoleDefinitionName "Reader" -Scope $rootScope | Out-Null
         Write-Success "Assigned Reader role at tenant root scope (/)"
         return "created"
     } catch {
@@ -1274,7 +1310,7 @@ function Ensure-ManagementGroupRoleAssignments {
                 Write-Info "$RoleLabel already assigned on: $managementGroupLabel"
                 $existingCount++
             } else {
-                New-AzRoleAssignment `
+                New-AzRoleAssignmentWithPrincipalPropagationRetry `
                     -ObjectId $PrincipalId `
                     -RoleDefinitionName $RoleDefinitionName `
                     -Scope $managementGroupScope `
@@ -1630,8 +1666,6 @@ function Ensure-SpottoServicePrincipal {
 
     $servicePrincipal = New-AzADServicePrincipal -ApplicationId $Application.AppId -ErrorAction Stop
     Write-Success "Created the missing service principal"
-    Write-Info "Waiting for the service principal to propagate (30 seconds)..."
-    Start-Sleep -Seconds 30
     return $servicePrincipal
 }
 
@@ -2467,6 +2501,7 @@ function Select-ExistingBillingStorageAccount {
 function Select-BillingExportStorageAccount {
     param(
         [object[]]$Subscriptions,
+        [string]$ContainerName,
         [hashtable]$NetworkMutationApprovalCache = $null
     )
 
@@ -2512,7 +2547,7 @@ function Select-BillingExportStorageAccount {
 
     $existing = Select-ExistingBillingStorageAccount -Subscriptions $Subscriptions
     if ($existing) {
-        if (Confirm-ExistingBillingStorageMutation -StorageAccountId $existing.ResourceId -ApprovalCache $NetworkMutationApprovalCache) {
+        if (Confirm-ExistingBillingStorageMutation -StorageAccountId $existing.ResourceId -ContainerName $ContainerName -ApprovalCache $NetworkMutationApprovalCache) {
             return $existing
         }
 
@@ -2524,40 +2559,91 @@ function Select-BillingExportStorageAccount {
     return New-BillingExportStorageAccount -Subscriptions $Subscriptions -ExcludedNames $excludedDedicatedNames
 }
 
-function Confirm-ExistingBillingStorageNetworkChanges {
-    param([object]$StorageAccount)
+function Get-ExistingBillingStorageMutationPlan {
+    param(
+        [object]$StorageAccount,
+        [string]$ContainerName
+    )
 
     $account = Get-StorageAccountResource -StorageAccountId $StorageAccount.ResourceId
-    $requiresPublicEndpointChange = $account.PublicNetworkAccess -ne "Enabled" -or
-        -not $account.NetworkRuleSet -or
-        $account.NetworkRuleSet.DefaultAction -ne "Allow"
-    if (-not $requiresPublicEndpointChange) {
-        return $true
+    $settingsToChange = @()
+    if ($account.AllowBlobPublicAccess -ne $false) { $settingsToChange += "disable anonymous blob access" }
+    if ($account.EnableHttpsTrafficOnly -ne $true) { $settingsToChange += "require HTTPS" }
+    if ($account.MinimumTlsVersion -ne "TLS1_2") { $settingsToChange += "require TLS 1.2" }
+    if ($account.PublicNetworkAccess -ne "Enabled") { $settingsToChange += "enable the public endpoint" }
+    if (-not $account.NetworkRuleSet -or $account.NetworkRuleSet.DefaultAction -ne "Allow") {
+        $settingsToChange += "set the default network action to Allow"
+    }
+    $storageParts = Get-StorageAccountParts -StorageAccountId $StorageAccount.ResourceId
+    $existingContainer = Get-AzRmStorageContainer `
+        -ResourceGroupName $storageParts.ResourceGroupName `
+        -StorageAccountName $storageParts.Name `
+        -Name $ContainerName `
+        -ErrorAction SilentlyContinue
+    $containerChange = if (-not $existingContainer) {
+        "create private container '$ContainerName'"
+    } elseif ("$($existingContainer.PublicAccess)" -notin @("", "None", "Off", "Private")) {
+        "change existing container '$ContainerName' to private access"
+    } else {
+        "keep existing private container '$ContainerName' unchanged"
     }
 
-    Write-Warning-Custom "This existing storage account currently restricts its public endpoint or firewall."
-    Write-Info "Spotto cloud-engine requires the public blob endpoint to be enabled and the default network action set to Allow. Blob containers remain private and anonymous access remains disabled."
-    $approval = Read-Host "Allow the script to broaden this existing account's network settings? (yes/no, default no)"
+    return [pscustomobject]@{
+        SettingsToChange = @($settingsToChange)
+        ContainerChange = $containerChange
+        CacheFingerprint = (@($settingsToChange) + @($containerChange) -join "|").ToLowerInvariant()
+    }
+}
+
+function Confirm-ExistingBillingStorageNetworkChanges {
+    param(
+        [object]$StorageAccount,
+        [string]$ContainerName,
+        [object]$MutationPlan = $null
+    )
+
+    $plan = if ($MutationPlan) {
+        $MutationPlan
+    } else {
+        Get-ExistingBillingStorageMutationPlan -StorageAccount $StorageAccount -ContainerName $ContainerName
+    }
+
+    Write-Warning-Custom "This is an existing customer storage account. Spotto will not change it without explicit approval."
+    if ($plan.SettingsToChange.Count -gt 0) {
+        Write-Info ("Planned account changes: " + ($plan.SettingsToChange -join "; ") + ".")
+    } else {
+        Write-Info "The account settings already match Spotto's requirements."
+    }
+    Write-Info "Planned container action: $($plan.ContainerChange)."
+    $approval = Read-Host "Allow these existing-account and container changes? (yes/no, default no)"
     return Test-YesResponse -Value $approval -DefaultYes $false
 }
 
 function Confirm-ExistingBillingStorageMutation {
     param(
         [string]$StorageAccountId,
+        [string]$ContainerName,
         [hashtable]$ApprovalCache
     )
 
-    if ([string]::IsNullOrWhiteSpace($StorageAccountId)) {
+    if ([string]::IsNullOrWhiteSpace($StorageAccountId) -or [string]::IsNullOrWhiteSpace($ContainerName)) {
         return $false
     }
 
-    $cacheKey = $StorageAccountId.Trim().ToLowerInvariant()
+    if (-not $ApprovalCache) {
+        $ApprovalCache = @{}
+    }
+    $storageAccount = [pscustomobject]@{ ResourceId = $StorageAccountId }
+    $mutationPlan = Get-ExistingBillingStorageMutationPlan -StorageAccount $storageAccount -ContainerName $ContainerName
+    $cacheKey = "$($StorageAccountId.Trim().ToLowerInvariant())|$($ContainerName.Trim().ToLowerInvariant())|$($mutationPlan.CacheFingerprint)"
     if ($ApprovalCache.ContainsKey($cacheKey)) {
         return [bool]$ApprovalCache[$cacheKey]
     }
 
     $approved = Confirm-ExistingBillingStorageNetworkChanges `
-        -StorageAccount ([pscustomobject]@{ ResourceId = $StorageAccountId })
+        -StorageAccount $storageAccount `
+        -ContainerName $ContainerName `
+        -MutationPlan $mutationPlan
     $ApprovalCache[$cacheKey] = $approved
     return $approved
 }
@@ -2638,7 +2724,7 @@ function Ensure-StorageBlobDataReaderAssignment {
             return "existing"
         }
 
-        New-AzRoleAssignment -ObjectId $PrincipalId -RoleDefinitionName "Storage Blob Data Reader" -Scope $Scope | Out-Null
+        New-AzRoleAssignmentWithPrincipalPropagationRetry -ObjectId $PrincipalId -RoleDefinitionName "Storage Blob Data Reader" -Scope $Scope | Out-Null
         Write-Success "Assigned Storage Blob Data Reader on export container"
         return "created"
     } catch {
@@ -3385,7 +3471,7 @@ function Invoke-CostManagementContributorSelfRemediation {
                     continue
                 }
 
-                New-AzRoleAssignment `
+                New-AzRoleAssignmentWithPrincipalPropagationRetry `
                     -ObjectId $PrincipalObjectId `
                     -RoleDefinitionName $COST_MANAGEMENT_CONTRIBUTOR_ROLE_NAME `
                     -Scope $scope `
@@ -5725,6 +5811,16 @@ if ($script:useTenantRootReader) {
     }
 }
 
+Write-SectionLabel "Microsoft Defender for Cloud provider"
+Write-Info "Checking Microsoft.Security registration on each selected subscription. Registration is best effort and does not enable paid Defender plans."
+foreach ($sub in $selectedSubscriptions) {
+    Ensure-ResourceProviderRegistered `
+        -SubscriptionId $sub.Id `
+        -ProviderNamespace "Microsoft.Security" `
+        -MaxAttempts 1 `
+        -PollSeconds 1 | Out-Null
+}
+
 # ============================================================================
 # Step 4: Create Service Principal
 # ============================================================================
@@ -5999,7 +6095,7 @@ if (Test-YesResponse -Value $grantReservationRoles) {
             Write-Info "Reservations Reader role already assigned"
             $script:reservationReaderStatus = "existing"
         } else {
-            New-AzRoleAssignment -ObjectId $sp.Id -RoleDefinitionName "Reservations Reader" -Scope $reservationScope | Out-Null
+            New-AzRoleAssignmentWithPrincipalPropagationRetry -ObjectId $sp.Id -RoleDefinitionName "Reservations Reader" -Scope $reservationScope | Out-Null
             Write-Success "Assigned Reservations Reader role at /providers/Microsoft.Capacity"
             $script:reservationReaderStatus = "created"
         }
@@ -6034,7 +6130,7 @@ if (Test-YesResponse -Value $grantReservationRoles) {
 
         if (-not $existingReservationContributor -and (Test-YesResponse -Value $grantReservationsContributor)) {
             try {
-                New-AzRoleAssignment -ObjectId $sp.Id -RoleDefinitionName "Reservations Contributor" -Scope $reservationScope | Out-Null
+                New-AzRoleAssignmentWithPrincipalPropagationRetry -ObjectId $sp.Id -RoleDefinitionName "Reservations Contributor" -Scope $reservationScope | Out-Null
                 Write-Success "Assigned Reservations Contributor role at /providers/Microsoft.Capacity"
                 $script:reservationContributorStatus = "created"
             } catch {
@@ -6084,7 +6180,7 @@ if (Test-YesResponse -Value $grantSavingsPlanReader) {
             Write-Info "Savings plan Reader role already assigned"
             $script:savingsPlanReaderStatus = "existing"
         } else {
-            New-AzRoleAssignment -ObjectId $sp.Id -RoleDefinitionName "Savings plan Reader" -Scope $savingsPlanScope | Out-Null
+            New-AzRoleAssignmentWithPrincipalPropagationRetry -ObjectId $sp.Id -RoleDefinitionName "Savings plan Reader" -Scope $savingsPlanScope | Out-Null
             Write-Success "Assigned Savings plan Reader role at /providers/Microsoft.BillingBenefits"
             $script:savingsPlanReaderStatus = "created"
         }
@@ -6556,7 +6652,7 @@ if (Test-YesResponse -Value $configureBillingExports) {
                             }
                             $containerScope = "$storageAccountId/blobServices/default/containers/$containerName"
                         } else {
-                            if (-not (Confirm-ExistingBillingStorageMutation -StorageAccountId $storageAccountId -ApprovalCache $existingStorageMutationApprovals)) {
+                            if (-not (Confirm-ExistingBillingStorageMutation -StorageAccountId $storageAccountId -ContainerName $containerName -ApprovalCache $existingStorageMutationApprovals)) {
                                 $message = "Existing storage network changes were not approved; the export was left unchanged and was not accepted for Spotto."
                                 Write-Warning-Custom $message
                                 Add-BillingExportResult -SubscriptionName $detected.ScopeLabel -SubscriptionId $detected.Scope -DatasetType $detected.DatasetType -ExportKind "Recurring" -ExportName $detected.Export.name -Status "unavailable" -StorageAccountId $storageAccountId -ContainerName $containerName -RootFolderPath $detected.Destination.RootFolderPath -Message $message
@@ -6692,10 +6788,11 @@ if (Test-YesResponse -Value $configureBillingExports) {
         if ($needsManagedExportStorage -and $script:billingExportSetupStatus -ne "unavailable" -and -not $storageDestination) {
             try {
                 $storageHostSubscriptions = if ($billingExportSubscriptions.Count -gt 0) { @($billingExportSubscriptions) } else { @($selectedSubscriptions) }
+                $billingExportContainerName = Get-DefaultedInput -Prompt "Blob container for Spotto billing exports" -DefaultValue $BILLING_EXPORT_CONTAINER_NAME
                 $storageDestination = Select-BillingExportStorageAccount `
                     -Subscriptions $storageHostSubscriptions `
+                    -ContainerName $billingExportContainerName `
                     -NetworkMutationApprovalCache $existingStorageMutationApprovals
-                $billingExportContainerName = Get-DefaultedInput -Prompt "Blob container for Spotto billing exports" -DefaultValue $BILLING_EXPORT_CONTAINER_NAME
             } catch {
                 $script:billingExportSetupStatus = "failed"
                 Write-Error-Custom "Failed to select or create billing export storage: $($_.Exception.Message)"
@@ -6706,7 +6803,7 @@ if (Test-YesResponse -Value $configureBillingExports) {
         if ($needsManagedExportStorage -and $script:billingExportSetupStatus -notin @("failed", "unavailable")) {
             try {
                 Assert-ResourceProviderRegistered -SubscriptionId $storageDestination.SubscriptionId -ProviderNamespace "Microsoft.CostManagementExports" -MaxAttempts 60 -PollSeconds 5
-                if (-not $storageDestination.IsNew -and -not (Confirm-ExistingBillingStorageMutation -StorageAccountId $storageDestination.ResourceId -ApprovalCache $existingStorageMutationApprovals)) {
+                if (-not $storageDestination.IsNew -and -not (Confirm-ExistingBillingStorageMutation -StorageAccountId $storageDestination.ResourceId -ContainerName $billingExportContainerName -ApprovalCache $existingStorageMutationApprovals)) {
                     throw "Existing storage account network changes were not approved. Select a dedicated export account or explicitly approve the required settings."
                 }
                 Ensure-BillingExportStorageSettings -StorageAccountId $storageDestination.ResourceId

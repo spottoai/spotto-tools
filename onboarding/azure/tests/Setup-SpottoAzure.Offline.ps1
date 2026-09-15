@@ -26,6 +26,9 @@ if ($setupSource.Substring($transcriptStopIndex) -notmatch '(?s)Complete-SpottoC
 if ($setupSource -notmatch '(?s)Resolve-SpottoAzureApplication.+?Ensure-SpottoServicePrincipal') {
     throw "Application ownership resolution or service-principal repair is not wired into setup."
 }
+if ($setupSource -notmatch '(?s)foreach\s*\(\$sub\s+in\s+\$selectedSubscriptions\).+?Ensure-ResourceProviderRegistered.+?-ProviderNamespace\s+"Microsoft\.Security"') {
+    throw "Microsoft.Security best-effort registration is not wired across the selected subscriptions."
+}
 if ($setupSource -notmatch '(?s)New-AzStorageAccount.+?SpottoPurpose\s*=.+?SpottoTenantId\s*=.+?spotto\s*=\s*\$BILLING_EXPORT_STORAGE_ALIAS_VALUE') {
     throw "New billing export storage is missing its Spotto ownership tags."
 }
@@ -58,6 +61,7 @@ $functionNames = @(
     "New-BillingExportStorageAccount",
     "Select-ExistingBillingStorageAccount",
     "Select-BillingExportStorageAccount",
+    "Get-ExistingBillingStorageMutationPlan",
     "Confirm-ExistingBillingStorageNetworkChanges",
     "Confirm-ExistingBillingStorageMutation",
     "Assert-ResourceProviderRegistered",
@@ -99,6 +103,8 @@ $functionNames = @(
     "Test-SpottoAzureOnboardingApplicationOwnership",
     "Resolve-SpottoAzureApplication",
     "Ensure-SpottoServicePrincipal",
+    "Test-ServicePrincipalPropagationError",
+    "New-AzRoleAssignmentWithPrincipalPropagationRetry",
     "New-SpottoClientSecret",
     "Complete-SpottoClientSecretHandoff",
     "Remove-OnboardingJsonAfterConfirmedImport",
@@ -251,6 +257,48 @@ if (Test-SpottoAzureOnboardingApplicationOwnership -Application $ownedApplicatio
     $servicePrincipal = Ensure-SpottoServicePrincipal -Application $ownedApplication
     if ($servicePrincipal.Id -ne "sp-object" -or $script:newServicePrincipalCalls -ne 1) {
         throw "A missing service principal was not repaired exactly once (id=$($servicePrincipal.Id), calls=$script:newServicePrincipalCalls)."
+    }
+}
+
+& {
+    $script:roleAssignmentAttempts = 0
+    $script:roleAssignmentSleeps = @()
+    function New-AzRoleAssignment {
+        $script:roleAssignmentAttempts++
+        if ($script:roleAssignmentAttempts -lt 3) {
+            throw "PrincipalNotFound: The principal does not exist in the directory."
+        }
+        return [pscustomobject]@{ Id = "assignment-1" }
+    }
+    function Start-Sleep { param($Seconds) $script:roleAssignmentSleeps += $Seconds }
+    function Write-Info { param($Message) }
+    New-AzRoleAssignmentWithPrincipalPropagationRetry `
+        -ObjectId "sp-object" `
+        -RoleDefinitionName "Reader" `
+        -Scope "/subscriptions/sub-1" | Out-Null
+    if ($script:roleAssignmentAttempts -ne 3 -or ($script:roleAssignmentSleeps -join ",") -ne "2,4") {
+        throw "Service-principal propagation retries were not bounded and exponential."
+    }
+}
+
+& {
+    $script:roleAssignmentAttempts = 0
+    function New-AzRoleAssignment {
+        $script:roleAssignmentAttempts++
+        throw "AuthorizationFailed: caller lacks permission."
+    }
+    function Start-Sleep { throw "Permanent role-assignment failures must not be retried." }
+    $permanentFailurePropagated = $false
+    try {
+        New-AzRoleAssignmentWithPrincipalPropagationRetry `
+            -ObjectId "sp-object" `
+            -RoleDefinitionName "Reader" `
+            -Scope "/subscriptions/sub-1" | Out-Null
+    } catch {
+        $permanentFailurePropagated = $_.Exception.Message -match "AuthorizationFailed"
+    }
+    if (-not $permanentFailurePropagated -or $script:roleAssignmentAttempts -ne 1) {
+        throw "A permanent role-assignment failure was retried or suppressed."
     }
 }
 
@@ -603,20 +651,36 @@ if (-not (Test-SpottoBackfillPending -Export $pendingBackfill -PeriodName "20260
 
 & {
     $script:networkConsentCalls = 0
+    $script:networkMutationFingerprint = "delta-a"
+    function Get-ExistingBillingStorageMutationPlan {
+        return [pscustomobject]@{
+            SettingsToChange = @("require HTTPS")
+            ContainerChange = "create private container"
+            CacheFingerprint = $script:networkMutationFingerprint
+        }
+    }
     function Confirm-ExistingBillingStorageNetworkChanges {
+        param($StorageAccount, $ContainerName, $MutationPlan)
         $script:networkConsentCalls++
         return $false
     }
     $approvalCache = @{}
     $storageId = "/subscriptions/sub-1/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/existing"
-    if (Confirm-ExistingBillingStorageMutation -StorageAccountId $storageId -ApprovalCache $approvalCache) {
+    if (Confirm-ExistingBillingStorageMutation -StorageAccountId $storageId -ContainerName "cost-a" -ApprovalCache $approvalCache) {
         throw "Existing storage mutation was approved despite a default-no rejection."
     }
-    if (Confirm-ExistingBillingStorageMutation -StorageAccountId $storageId.ToUpperInvariant() -ApprovalCache $approvalCache) {
+    if (Confirm-ExistingBillingStorageMutation -StorageAccountId $storageId.ToUpperInvariant() -ContainerName "COST-A" -ApprovalCache $approvalCache) {
         throw "Rejected existing storage mutation was not cached."
     }
-    if ($script:networkConsentCalls -ne 1) {
-        throw "Existing storage network consent was requested more than once for one account."
+    if (Confirm-ExistingBillingStorageMutation -StorageAccountId $storageId -ContainerName "cost-b" -ApprovalCache $approvalCache) {
+        throw "A different container was approved without its own consent."
+    }
+    $script:networkMutationFingerprint = "delta-b"
+    if (Confirm-ExistingBillingStorageMutation -StorageAccountId $storageId -ContainerName "cost-a" -ApprovalCache $approvalCache) {
+        throw "A changed account/container delta was approved from stale cached consent."
+    }
+    if ($script:networkConsentCalls -ne 3) {
+        throw "Existing storage consent was not cached by exact account, container, and rendered delta."
     }
 }
 
@@ -1131,7 +1195,7 @@ function Write-Info { param($Message) }
     function New-BillingExportStorageAccount { return "new-storage" }
     function Select-ExistingBillingStorageAccount { throw "Existing picker ran for the default option." }
     function Find-PreferredBillingExportStorageAccount { return $null }
-    $selectedStorage = Select-BillingExportStorageAccount -Subscriptions @([pscustomobject]@{ Id = $subscriptionId })
+    $selectedStorage = Select-BillingExportStorageAccount -Subscriptions @([pscustomobject]@{ Id = $subscriptionId }) -ContainerName "cost-exports"
     if ($selectedStorage -ne "new-storage") {
         throw "Default storage option did not create or reuse dedicated storage."
     }
@@ -1141,8 +1205,11 @@ function Write-Info { param($Message) }
     function New-BillingExportStorageAccount { throw "New storage ran for the existing option." }
     function Select-ExistingBillingStorageAccount { return [pscustomobject]@{ ResourceId = "/existing-storage" } }
     function Find-PreferredBillingExportStorageAccount { return $null }
-    function Confirm-ExistingBillingStorageNetworkChanges { return $true }
-    $selectedStorage = Select-BillingExportStorageAccount -Subscriptions @([pscustomobject]@{ Id = $subscriptionId })
+    function Get-ExistingBillingStorageMutationPlan {
+        return [pscustomobject]@{ SettingsToChange = @(); ContainerChange = "create private container"; CacheFingerprint = "test" }
+    }
+    function Confirm-ExistingBillingStorageNetworkChanges { param($StorageAccount, $ContainerName, $MutationPlan); return $true }
+    $selectedStorage = Select-BillingExportStorageAccount -Subscriptions @([pscustomobject]@{ Id = $subscriptionId }) -ContainerName "cost-exports" -NetworkMutationApprovalCache @{}
     if ($selectedStorage.ResourceId -ne "/existing-storage") {
         throw "Existing storage option routing failed in Recommended mode."
     }
@@ -1246,7 +1313,8 @@ function Write-Info { param($Message) }
     function Write-Info { param($Message) }
 
     $ownedStorage = Select-BillingExportStorageAccount `
-        -Subscriptions @([pscustomobject]@{ Id = "sub-1"; Name = "First" })
+        -Subscriptions @([pscustomobject]@{ Id = "sub-1"; Name = "First" }) `
+        -ContainerName "cost-exports"
     if ($ownedStorage.ResourceId -ne "/preferred") {
         throw "A tagged deterministic account was not reused automatically."
     }
@@ -1263,8 +1331,54 @@ $script:useRecommendedReadOnlySetup = $false
     function Write-Warning-Custom { param($Message) }
     function Write-Info { param($Message) }
     function Read-Host { return "" }
-    if (Confirm-ExistingBillingStorageNetworkChanges -StorageAccount ([pscustomobject]@{ ResourceId = "/restricted" })) {
+    function Get-StorageAccountParts { return [pscustomobject]@{ ResourceGroupName = "rg"; Name = "restricted" } }
+    function Get-AzRmStorageContainer { return $null }
+    if (Confirm-ExistingBillingStorageNetworkChanges -StorageAccount ([pscustomobject]@{ ResourceId = "/restricted" }) -ContainerName "cost-exports") {
         throw "Restricted existing storage network changes were approved by default."
+    }
+}
+
+& {
+    function Get-StorageAccountResource {
+        return [pscustomobject]@{
+            AllowBlobPublicAccess = $false
+            EnableHttpsTrafficOnly = $true
+            MinimumTlsVersion = "TLS1_2"
+            PublicNetworkAccess = "Enabled"
+            NetworkRuleSet = [pscustomobject]@{ DefaultAction = "Allow" }
+        }
+    }
+    function Write-Warning-Custom { param($Message) }
+    function Write-Info { param($Message) }
+    function Read-Host { return "" }
+    function Get-StorageAccountParts { return [pscustomobject]@{ ResourceGroupName = "rg"; Name = "already-open" } }
+    function Get-AzRmStorageContainer { return [pscustomobject]@{ PublicAccess = "None" } }
+    if (Confirm-ExistingBillingStorageNetworkChanges -StorageAccount ([pscustomobject]@{ ResourceId = "/already-open" }) -ContainerName "cost-exports") {
+        throw "An existing account was approved for security/container mutation without explicit consent."
+    }
+}
+
+& {
+    $script:existingStorageInfo = @()
+    function Get-StorageAccountResource {
+        return [pscustomobject]@{
+            AllowBlobPublicAccess = $false
+            EnableHttpsTrafficOnly = $true
+            MinimumTlsVersion = "TLS1_2"
+            PublicNetworkAccess = "Enabled"
+            NetworkRuleSet = [pscustomobject]@{ DefaultAction = "Allow" }
+        }
+    }
+    function Write-Warning-Custom { param($Message) }
+    function Write-Info { param($Message) $script:existingStorageInfo += $Message }
+    function Read-Host { return "yes" }
+    function Get-StorageAccountParts { return [pscustomobject]@{ ResourceGroupName = "rg"; Name = "approved" } }
+    function Get-AzRmStorageContainer { return [pscustomobject]@{ PublicAccess = "Blob" } }
+    if (-not (Confirm-ExistingBillingStorageNetworkChanges -StorageAccount ([pscustomobject]@{ ResourceId = "/approved" }) -ContainerName "customer-container")) {
+        throw "Explicit consent for existing-account mutation was not honored."
+    }
+    if (($script:existingStorageInfo -join "`n") -notmatch "change existing container 'customer-container' to private access") {
+        throw "Existing-storage consent did not preview the exact container mutation. Captured: $($script:existingStorageInfo -join ' | ')"
     }
 }
 
