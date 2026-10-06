@@ -9,6 +9,23 @@ if ($parseErrors.Count -gt 0) {
 }
 
 $setupSource = Get-Content -LiteralPath $setupScriptPath -Raw
+$graphPermissionAssignment = $setupAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+        $node.Left.Extent.Text -eq '$GRAPH_GOVERNANCE_PERMISSION_VALUES'
+}, $true) | Select-Object -First 1
+if (-not $graphPermissionAssignment) {
+    throw "Recommended Microsoft Graph permission list is missing."
+}
+$graphPermissionValues = @(& ([scriptblock]::Create($graphPermissionAssignment.Right.Extent.Text)))
+$expectedGraphPermissionValues = @(
+    "Application.Read.All", "RoleAssignmentSchedule.Read.Directory", "RoleEligibilitySchedule.Read.Directory",
+    "RoleManagement.Read.Directory", "GroupMember.Read.All", "User.Read.All", "AuditLog.Read.All",
+    "Policy.Read.All", "LicenseAssignment.Read.All", "Reports.Read.All", "Organization.Read.All"
+)
+if (($graphPermissionValues -join ',') -ne ($expectedGraphPermissionValues -join ',')) {
+    throw "Recommended Graph permissions must include Office license, subscription, user, reporting and sign-in reads without additional grants."
+}
 if ($setupSource -notmatch '(?s)\$configureBillingExports\s*=\s*Read-SetupConfirmation.+?-Prompt\s+"Set up the recommended Cost Management exports.+?-DefaultYes\s+\$true') {
     throw "Billing export setup is not an explicit default-yes choice in every setup mode."
 }

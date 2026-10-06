@@ -107,7 +107,8 @@ $GRAPH_GOVERNANCE_PERMISSION_VALUES = @(
     "AuditLog.Read.All",
     "Policy.Read.All",
     "LicenseAssignment.Read.All",
-    "Reports.Read.All"
+    "Reports.Read.All",
+    "Organization.Read.All"
 )
 $script:ConsolePanelWidth = 80
 
@@ -6204,7 +6205,7 @@ Write-Header -Message "Step 11 of 13: Grant Microsoft Graph Read Permissions"
 
 Write-SectionLabel "Microsoft Graph governance and Microsoft 365 permissions"
 Write-DetailRow -Label "Permissions" -Value "$($GRAPH_GOVERNANCE_PERMISSION_VALUES.Count) Microsoft Graph application permissions with admin consent."
-Write-DetailRow -Label "Purpose" -Value "Read app posture, tenant policies, license capacity/assignments, user account status, Global Admin/PIM schedules, audit/sign-in metadata, and Microsoft 365/Copilot usage reports."
+Write-DetailRow -Label "Purpose" -Value "Read app posture, tenant policies, license capacity/assignments, subscription renewal dates, user account status, Global Admin/PIM schedules, audit/sign-in metadata, and Microsoft 365/Copilot usage reports."
 Write-DetailRow -Label "Scope" -Value "Tenant-wide metadata and usage reports; these permissions do not grant mailbox/document contents or license changes."
 Write-DetailRow -Label "Requires" -Value "Tenant admin consent and Microsoft Graph authentication."
 Write-DetailRow -Label "Admin sign-in scopes" -Value "Application.ReadWrite.All and AppRoleAssignment.ReadWrite.All."
