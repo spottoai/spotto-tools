@@ -9,6 +9,10 @@ accounts for billing definitions and S3 storage.
 `Setup-SpottoAws.ps1` is a standalone script, like the Azure wizard. Download that
 one script alongside your company setup package; no companion module is needed.
 
+To manage the role with Terraform instead, use
+[terraform-aws-spotto](https://github.com/spottoai/terraform-aws-spotto). It consumes
+the same setup package and produces the same results JSON.
+
 ## Prepare the setup package
 
 1. In Spotto, open your company's **Cloud Accounts → Add AWS account** setup.
@@ -31,7 +35,7 @@ one script alongside your company setup package; no companion module is needed.
    session. If you choose CloudFormation for the initial role instead, finish that
    account by updating its owning stack; the PowerShell wizard does not adopt
    CloudFormation roles.
-4. Under **Set up access with PowerShell**, choose **Download PowerShell setup
+4. Under **Set up access with PowerShell or Terraform**, choose **Download setup
    package**. Review the trust and permission policies in `spotto-aws-setup.json`.
    The package contains the server-issued company External ID; do not invent or
    replace it. This is setup after company registration, not AWS account creation.
@@ -127,6 +131,14 @@ role, update its owning stack using the portal template instead. If Terraform, C
 StackSets or Control Tower customizations manage the role, apply the generated
 policies there instead; the next deployment would otherwise revert the wizard.
 
+A role tagged `SpottoManagedBy` with any value other than `Setup-SpottoAws`, such as
+`Terraform` from [terraform-aws-spotto](https://github.com/spottoai/terraform-aws-spotto),
+is verify-only:
+- If it matches the package, check-only reports `configuration-matches` and
+  configure mode reports `configured`, with no writes.
+- If it differs, the wizard lists the changes and refuses to make them, even with
+  `-RepairExistingRole`. Apply them with the owning tool.
+
 If the role has a permissions boundary, the wizard warns and names it. Boundaries are
 never changed, but they can deny Spotto reads even when the role policies match.
 
@@ -156,8 +168,8 @@ in the portal before generating the package.
 The wizard writes a new `SpottoAwsOnboarding-<timestamp>-<suffix>.json` file without
 overwriting existing files. `-OutputPath` selects another new path. The handoff
 contains company/account configuration and outcomes, but no credentials or External
-ID. Paste its full contents into **PowerShell results JSON**, then select **Read
-PowerShell results**. It must match the current company and unchanged configuration.
+ID. Paste its full contents into **Setup results JSON**, then select **Read setup
+results**. It must match the current company and unchanged configuration.
 The portal displays results without changing or saving the draft.
 
 Select **Create** or **Update** to let Spotto validate the configured trusted principal,

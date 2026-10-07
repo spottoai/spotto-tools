@@ -4,7 +4,9 @@ For AWS, use the [AWS PowerShell onboarding wizard](./onboarding/aws/README.md).
 Download the company setup package from the Spotto AWS configuration page, run
 the wizard with your authorized AWS profiles, then read its results in Spotto.
 It supports resource access, existing billing exports, and optional commitments
-planning across standalone accounts or manually configured organizations.
+planning across standalone accounts or manually configured organizations. To manage
+the role with Terraform, use [terraform-aws-spotto](https://github.com/spottoai/terraform-aws-spotto)
+with the same setup package.
 
 Use the Azure onboarding wizard to connect your Azure environment to Spotto. It can assess prerequisites without changing Azure by default, or create and repair the Spotto service principal and permissions through a guided PowerShell workflow. Recommended and Custom setup both offer optional billing exports.
 

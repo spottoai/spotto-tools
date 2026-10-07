@@ -139,7 +139,7 @@ function Read-SpottoAwsSetupPackage {
     Assert-SpottoSchemaVersions $package
     if ($package.kind -cne 'spotto.aws.setup' -or $package.schemaVersion -ne 1 -or
         $package.companyId -isnot [string] -or $package.companyId -notmatch '^[A-Za-z0-9_-]{1,256}$') {
-        throw 'Use a V1 AWS PowerShell setup package downloaded from Spotto.'
+        throw 'Use a V1 AWS setup package downloaded from Spotto.'
     }
     $configuration = $package.configuration
     Assert-SpottoCredentialFree $configuration
@@ -228,7 +228,7 @@ function Get-SpottoAwsRoleState {
         $steps.Add(@{ Action = 'create-role'; Text = 'Create SpottoReadOnlyRole with the Spotto trust policy and ownership tags' })
         foreach ($name in $policies.Keys) { $steps.Add(@{ Action = 'put-policy'; Name = $name; Text = "Add inline policy $name" }) }
         foreach ($policy in $bundle.managedPolicies) { $steps.Add(@{ Action = 'attach'; Name = $policy.arn; Text = "Attach AWS managed policy $($policy.arn)" }) }
-        return @{ Exists = $false; Matches = $false; Owned = $false; Steps = $steps.ToArray(); Boundary = $null }
+        return @{ Exists = $false; Matches = $false; Owned = $false; OtherManager = $null; Steps = $steps.ToArray(); Boundary = $null }
     }
     if ($existing.Role.Arn -cne $Role.roleArn) { throw 'Existing role ARN does not match the expected account and role path.' }
     if ($existing.Role.RoleId -isnot [string] -or $existing.Role.RoleId -notmatch '^\w{16,128}$') {
@@ -287,7 +287,9 @@ function Get-SpottoAwsRoleState {
         RoleId = $existing.Role.RoleId; CompanyId = $tags['SpottoCompanyId']; ManagedBy = $tags['SpottoManagedBy']
         Trust = $existing.Role.AssumeRolePolicyDocument; Plan = @($steps | ForEach-Object { $_.Text })
     }
-    return @{ Exists = $true; Matches = $matches; Owned = $owned; TrustMatches = $trustMatches; ApprovalProof = $approvalProof
+    # Another tool (for example terraform-aws-spotto) that tags its roles remains their only writer.
+    $otherManager = if ($tags.ContainsKey('SpottoManagedBy') -and $tags.SpottoManagedBy -cne 'Setup-SpottoAws') { $tags.SpottoManagedBy } else { $null }
+    return @{ Exists = $true; Matches = $matches; Owned = $owned; OtherManager = $otherManager; TrustMatches = $trustMatches; ApprovalProof = $approvalProof
         Steps = $steps.ToArray(); Boundary = $boundary }
 }
 
@@ -362,7 +364,7 @@ function Write-SpottoAwsResult {
 
 if (-not $SetupPackagePath) {
     if ($NonInteractive) { throw 'SetupPackagePath is required in non-interactive mode.' }
-    $SetupPackagePath = Read-Host 'Path to the AWS PowerShell setup package downloaded from Spotto'
+    $SetupPackagePath = Read-Host 'Path to the AWS setup package downloaded from Spotto'
 }
 $package = Read-SpottoAwsSetupPackage $SetupPackagePath
 if (-not $OutputPath) { $OutputPath = Join-Path (Get-Location) ("SpottoAwsOnboarding-" + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.json') }
@@ -413,14 +415,18 @@ foreach ($role in $package.roles) {
             Write-Warning "Account $($role.accountId): SpottoReadOnlyRole has permissions boundary $($state.Boundary). It can deny Spotto reads even when these policies are correct; review it before onboarding."
         }
         if ($accessSteps.Count) { Write-Host "Account $($role.accountId): IAM changes required:$([Environment]::NewLine)$(Format-SpottoAwsPlan $accessSteps)" }
-        if ($unowned) {
+        if ($state.OtherManager) {
+            Write-Host "Account $($role.accountId): existing role is managed by $($state.OtherManager). This wizard only verifies it; apply any changes there."
+        } elseif ($unowned) {
             Write-Host "Account $($role.accountId): existing role is not tagged as managed by Setup-SpottoAws. Changes require -RepairExistingRole, which also adds ownership tags. If Terraform, CDK, StackSets or Control Tower customizations manage this role, apply the changes there instead; their next deployment would revert this wizard."
         }
         if ($CheckOnly) {
             $status = if ($state.Matches) { 'configuration-matches' } else { 'changes-required' }
-        } elseif ($state.Matches -and ($state.Owned -or -not $RepairExistingRole)) {
+        } elseif ($state.Matches -and ($state.Owned -or $state.OtherManager -or -not $RepairExistingRole)) {
             # Nothing affecting Spotto access differs, so a matching role needs no writes or adoption.
             $status = 'configured'
+        } elseif ($state.OtherManager) {
+            throw "This role is managed by $($state.OtherManager). Apply the changes listed above there; -RepairExistingRole cannot adopt it."
         } elseif ($unowned -and -not $RepairExistingRole) {
             throw 'Existing role is not owned by this script. Review the changes above, then rerun with -RepairExistingRole to explicitly adopt it.'
         } else {
@@ -439,6 +445,6 @@ foreach ($role in $package.roles) {
 }
 Write-SpottoAwsResult $package $results $OutputPath
 Write-Host "Results saved to $OutputPath" -ForegroundColor Cyan
-Write-Host 'Paste the complete JSON into Read PowerShell results in Spotto. Then use Create/Update for live role, billing and resource validation.'
+Write-Host 'Paste the complete JSON into Setup results JSON in Spotto and select Read setup results. Then use Create/Update for live role, billing and resource validation.'
 Write-Host 'This script has not tested access from the Spotto principal. SCPs, boundaries, bucket policies and KMS policies can still block access.'
 if (@($results | Where-Object { $_.status -eq 'failed' }).Count) { exit 1 }

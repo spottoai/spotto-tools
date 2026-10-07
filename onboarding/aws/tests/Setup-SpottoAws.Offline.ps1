@@ -173,6 +173,18 @@ try {
     $state.roles[$accountId].Tags = @(@{ Key = 'SpottoCompanyId'; Value = 'another-company' }); $state.calls = @(); Write-State $state
     $null = Run-Wizard @('-RepairExistingRole') -ExpectedExit 1
     Assert-Test ((Mutations (Read-State)).Count -eq 0) 'another company role cannot be adopted'
+    # Roles owned by terraform-aws-spotto are verified but never adopted or changed by the wizard.
+    $state.roles[$accountId].Tags = @(@{ Key = 'SpottoCompanyId'; Value = 'company-example' }, @{ Key = 'SpottoManagedBy'; Value = 'Terraform' }); $state.calls = @(); Write-State $state
+    $terraformRole = Run-Wizard @('-RepairExistingRole')
+    Assert-Test ($terraformRole.Report.results[0].status -eq 'configured' -and (Mutations (Read-State)).Count -eq 0) 'matching Terraform-managed role is verified without writes'
+    Assert-Test ($terraformRole.Log.Contains('managed by Terraform')) 'Terraform ownership is reported'
+    Assert-Test ((Run-Wizard @('-CheckOnly')).Report.results[0].status -eq 'configuration-matches') 'check-only verifies a Terraform-managed role'
+    $state = Read-State
+    $state.roles[$accountId].inline.Remove('SpottoGuardrails'); $state.calls = @(); Write-State $state
+    $terraformDrift = Run-Wizard @('-RepairExistingRole') -ExpectedExit 1
+    Assert-Test ($terraformDrift.Report.results[0].status -eq 'failed' -and (Mutations (Read-State)).Count -eq 0) 'drifted Terraform-managed role cannot be adopted or changed'
+    Assert-Test ($terraformDrift.Log.Contains('Add inline policy SpottoGuardrails')) 'drift on a Terraform-managed role is listed for the owning tool'
+    $state = Read-State
     $state.roles[$accountId].Tags = @(@{ Key = 'aws:cloudformation:stack-name'; Value = 'CustomerStack' }); $state.calls = @(); Write-State $state
     $null = Run-Wizard @('-RepairExistingRole') -ExpectedExit 1
     Assert-Test ((Mutations (Read-State)).Count -eq 0) 'CloudFormation ownership cannot be bypassed'
