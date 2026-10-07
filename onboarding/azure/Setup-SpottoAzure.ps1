@@ -27,7 +27,8 @@
     - Savings plan Reader at /providers/Microsoft.BillingBenefits
     - Microsoft Graph application permissions with admin consent
       (read applications, service principals, directory roles, Global Admin/PIM state,
-       group membership, users, and audit logs for governance visibility)
+       group membership, user/license metadata, audit/sign-in activity, and
+       Microsoft 365/Copilot usage reports; these are tenant-wide read capabilities)
     - Optional Cost Management exports to customer-owned Azure Storage
       (tenant-root or topmost visible management-group Usage where supported, plus
        subscription actual/amortized exports and one-time historical backfill)
@@ -105,7 +106,9 @@ $GRAPH_GOVERNANCE_PERMISSION_VALUES = @(
     "User.Read.All",
     "AuditLog.Read.All",
     "Policy.Read.All",
-    "LicenseAssignment.Read.All"
+    "LicenseAssignment.Read.All",
+    "Reports.Read.All",
+    "Organization.Read.All"
 )
 $script:ConsolePanelWidth = 80
 
@@ -6198,11 +6201,12 @@ if (Test-YesResponse -Value $grantSavingsPlanReader) {
 # Step 11: Grant Microsoft Graph Governance Permissions
 # ============================================================================
 
-Write-Header -Message "Step 11 of 13: Grant Microsoft Graph Governance Permissions"
+Write-Header -Message "Step 11 of 13: Grant Microsoft Graph Read Permissions"
 
-Write-SectionLabel "Microsoft Graph governance permission"
+Write-SectionLabel "Microsoft Graph governance and Microsoft 365 permissions"
 Write-DetailRow -Label "Permissions" -Value "$($GRAPH_GOVERNANCE_PERMISSION_VALUES.Count) Microsoft Graph application permissions with admin consent."
-Write-DetailRow -Label "Purpose" -Value "Read app posture, tenant policies, subscribed licensing, Global Admin/PIM schedules, groups, users, and audit logs."
+Write-DetailRow -Label "Purpose" -Value "Read app posture, tenant policies, license capacity/assignments, subscription renewal dates, user account status, Global Admin/PIM schedules, audit/sign-in metadata, and Microsoft 365/Copilot usage reports."
+Write-DetailRow -Label "Scope" -Value "Tenant-wide metadata and usage reports; these permissions do not grant mailbox/document contents or license changes."
 Write-DetailRow -Label "Requires" -Value "Tenant admin consent and Microsoft Graph authentication."
 Write-DetailRow -Label "Admin sign-in scopes" -Value "Application.ReadWrite.All and AppRoleAssignment.ReadWrite.All."
 Write-Host ""
@@ -6212,8 +6216,8 @@ foreach ($permissionValue in $GRAPH_GOVERNANCE_PERMISSION_VALUES) {
 }
 Write-Host ""
 $grantGraphPermission = Get-SetupCapabilityResponse `
-    -Capability "the complete Microsoft Graph governance reader permission set" `
-    -Prompt "Do you want to connect to Microsoft Graph and grant these governance permissions?" `
+    -Capability "the complete Microsoft Graph governance and Microsoft 365 reader permission set" `
+    -Prompt "Do you want to connect to Microsoft Graph and grant these read permissions?" `
     -RecommendedReadOnlyValue $true
 
 if (Test-YesResponse -Value $grantGraphPermission) {
