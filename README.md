@@ -1,6 +1,6 @@
 # Spotto Tools
 
-For AWS, use the [AWS PowerShell onboarding wizard](./onboarding/aws/README.md).
+For AWS, use the [Bash or PowerShell onboarding scripts](./onboarding/aws/README.md).
 Download the company setup package from the Spotto AWS configuration page, run
 the wizard with your authorized AWS profiles, then read its results in Spotto.
 It supports resource access, existing billing exports, and optional commitments

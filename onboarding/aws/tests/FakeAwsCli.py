@@ -6,6 +6,9 @@ import sys
 from pathlib import Path
 
 arguments = sys.argv[1:]
+if arguments == ['--version']:
+    print('aws-cli/2.0.0 Python/3 offline-test')
+    sys.exit(0)
 service, action = arguments[:2]
 
 
@@ -18,11 +21,26 @@ account = profile.removeprefix('account-') if profile.startswith('account-') els
 account = os.environ.get('SPOTTO_TEST_WRONG_ACCOUNT') or account
 state_path = Path(os.environ['SPOTTO_TEST_STATE'])
 state = json.loads(state_path.read_text())
-state.setdefault('calls', []).append({'account': account, 'action': action, 'errorFormat': os.environ.get('AWS_CLI_ERROR_FORMAT')})
+state.setdefault('calls', []).append({'account': account, 'action': action,
+                                     'errorFormat': os.environ.get('AWS_CLI_ERROR_FORMAT'),
+                                     'retryMode': os.environ.get('AWS_RETRY_MODE'),
+                                     'maxAttempts': os.environ.get('AWS_MAX_ATTEMPTS')})
 state_path.write_text(json.dumps(state))
+
+# Optional race fixtures apply exactly when the wizard rechecks an approved role.
+replacement = os.environ.get('SPOTTO_TEST_RECHECK_STATE')
+if replacement and action == 'get-role' and sum(call['action'] == action for call in state['calls']) == 2:
+    state['roles'] = json.loads(Path(replacement).read_text())['roles']
+    state_path.write_text(json.dumps(state))
+if os.environ.get('SPOTTO_TEST_RECHECK_ACCOUNT') and action == 'get-caller-identity' and sum(call['action'] == action for call in state['calls']) == 2:
+    account = os.environ['SPOTTO_TEST_RECHECK_ACCOUNT']
 
 
 def error(code, message):
+    prefix = os.environ.get('SPOTTO_TEST_ERROR_PREFIX')
+    if prefix:
+        print(prefix, file=sys.stderr)
+    code = os.environ.get('SPOTTO_TEST_ERROR_CODE') or code
     if os.environ.get('AWS_CLI_ERROR_FORMAT') == 'json':
         print(json.dumps({'Code': code, 'Message': message}), file=sys.stderr)
     else:
@@ -34,7 +52,9 @@ if action == os.environ.get('SPOTTO_TEST_TRANSIENT_ACTION') and state.get('missi
     state['missingCount'] = state.get('missingCount', 0) + 1
     state_path.write_text(json.dumps(state))
     error('NoSuchEntity', 'IAM changes propagate')
-if action == os.environ.get('SPOTTO_TEST_FAIL_ACTION'):
+if action == os.environ.get('SPOTTO_TEST_FAIL_ACTION') and (
+    not os.environ.get('SPOTTO_TEST_FAIL_ACCOUNT') or account == os.environ['SPOTTO_TEST_FAIL_ACCOUNT']
+):
     error('AccessDenied', 'sensitive-diagnostic-sentinel')
 if service == 'sts' and action == 'get-caller-identity':
     print(json.dumps({'Account': account, 'Arn': f'arn:aws:iam::{account}:role/Administrator'}))

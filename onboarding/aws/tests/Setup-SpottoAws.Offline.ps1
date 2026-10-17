@@ -4,7 +4,7 @@ $ErrorActionPreference = 'Stop'
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('spotto-aws-tests-' + [guid]::NewGuid().ToString('N'))
 $null = New-Item -ItemType Directory -Path $testRoot
 $originalPath = $env:PATH
-$environmentNames = @('SPOTTO_TEST_STATE', 'SPOTTO_TEST_ACCOUNT', 'SPOTTO_TEST_WRONG_ACCOUNT', 'SPOTTO_TEST_FAIL_ACTION', 'SPOTTO_TEST_TRANSIENT_ACTION', 'AWS_CLI_ERROR_FORMAT')
+$environmentNames = @('SPOTTO_TEST_STATE', 'SPOTTO_TEST_ACCOUNT', 'SPOTTO_TEST_WRONG_ACCOUNT', 'SPOTTO_TEST_FAIL_ACTION', 'SPOTTO_TEST_TRANSIENT_ACTION', 'AWS_CLI_ERROR_FORMAT', 'SPOTTO_TEST_ERROR_PREFIX', 'SPOTTO_TEST_ERROR_CODE')
 $originalEnvironment = @{}
 foreach ($name in $environmentNames) { $originalEnvironment[$name] = [Environment]::GetEnvironmentVariable($name) }
 $setupScriptPath = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../Setup-SpottoAws.ps1')).Path
@@ -33,11 +33,14 @@ function Write-State { param($Value) [IO.File]::WriteAllText($env:SPOTTO_TEST_ST
 function Read-State { ConvertFrom-Json ([IO.File]::ReadAllText($env:SPOTTO_TEST_STATE)) -AsHashtable }
 function Mutations { param($State) return ,@($State.calls | Where-Object { $_.action -in @('create-role', 'update-assume-role-policy', 'tag-role', 'put-role-policy', 'attach-role-policy', 'delete-role-policy') }) }
 function Run-Wizard {
-    param([string[]]$Options = @(), [int]$ExpectedExit = 0, [string[]]$Answers)
+    param([string[]]$Options = @(), [int]$ExpectedExit = 0, [string[]]$Answers, [switch]$OmitConfirmation)
     $output = Join-Path $testRoot ([guid]::NewGuid().ToString('N') + '.json')
     $arguments = @('-NoProfile', '-File', $entrypoint, '-SetupPackagePath', $packagePath, '-OutputPath', $output)
     $interactive = $PSBoundParameters.ContainsKey('Answers')
-    if (-not $interactive) { $arguments += @('-NonInteractive', '-Confirm:$false') }
+    if (-not $interactive) {
+        $arguments += '-NonInteractive'
+        if (-not $OmitConfirmation) { $arguments += '-Confirm:$false' }
+    }
     $arguments += $Options
     $log = if ($interactive) { $Answers | & pwsh @arguments 2>&1 | Out-String } else { & pwsh @arguments 2>&1 | Out-String }
     $code = $LASTEXITCODE
@@ -80,7 +83,191 @@ try {
     $read = Read-SpottoAwsSetupPackage $packagePath
     Assert-Test ($read.roles[0].accountId -ceq $accountId) 'package preserves 12-digit string IDs'
 
+    # Only an explicit managed-policy array can distinguish current [] packages from malformed input.
+    $managedShapeFailures = @()
+    foreach ($shape in @('null', 'empty-object', 'object-entries', 'missing')) {
+        $invalid = ConvertFrom-Json (ConvertTo-Json $package -Depth 100) -AsHashtable
+        $invalidBundle = $invalid.roles[0].setup.onboardingBundle
+        switch ($shape) {
+            'null' { $invalidBundle.managedPolicies = $null }
+            'empty-object' { $invalidBundle.managedPolicies = @{} }
+            'object-entries' { $invalidBundle.managedPolicies = @{ SecurityAudit = @{ name = 'SecurityAudit'; arn = 'arn:aws:iam::aws:policy/SecurityAudit' } } }
+            'missing' { $invalidBundle.Remove('managedPolicies') }
+        }
+        [IO.File]::WriteAllText($packagePath, (ConvertTo-Json $invalid -Depth 100))
+        $rejected = $false
+        try { $null = Read-SpottoAwsSetupPackage $packagePath } catch { $rejected = $true }
+        if (-not $rejected) { $managedShapeFailures += $shape }
+    }
+    Assert-Test ($managedShapeFailures.Count -eq 0) "malformed managed-policy shapes rejected: $($managedShapeFailures -join ', ')"
+    $currentPackage = ConvertFrom-Json (ConvertTo-Json $package -Depth 100) -AsHashtable
+    $currentPackage.roles[0].setup.onboardingBundle.managedPolicies = @()
+    [IO.File]::WriteAllText($packagePath, (ConvertTo-Json $currentPackage -Depth 100))
+    $currentRead = Read-SpottoAwsSetupPackage $packagePath
+    Assert-Test ($currentRead.roles[0].setup.onboardingBundle.managedPolicies.Count -eq 0) 'current explicit empty managed-policy arrays remain valid'
+    [IO.File]::WriteAllText($packagePath, (ConvertTo-Json $package -Depth 100))
+    $legacyRead = Read-SpottoAwsSetupPackage $packagePath
+    Assert-Test ($legacyRead.roles[0].setup.onboardingBundle.managedPolicies.Count -eq 2) 'legacy managed-policy arrays remain valid'
+
+    # Guardrails have the same document contract as the optional inline policies.
+    $guardrailShapeFailures = @()
+    foreach ($shape in @('missing-policy', 'null-policy', 'empty-policy', 'missing-statements', 'empty-statements',
+        'object-statement', 'string-statements', 'number-statements', 'boolean-statements')) {
+        $invalid = ConvertFrom-Json (ConvertTo-Json $package -Depth 100) -AsHashtable
+        $invalidBundle = $invalid.roles[0].setup.onboardingBundle
+        switch ($shape) {
+            'missing-policy' { $invalidBundle.Remove('guardrailPolicy') }
+            'null-policy' { $invalidBundle.guardrailPolicy = $null }
+            'empty-policy' { $invalidBundle.guardrailPolicy = @{} }
+            'missing-statements' { $invalidBundle.guardrailPolicy = @{ Version = '2012-10-17' } }
+            'empty-statements' { $invalidBundle.guardrailPolicy = @{ Statement = @() } }
+            'object-statement' { $invalidBundle.guardrailPolicy = @{ Statement = @{ Effect = 'Deny'; Action = 's3:GetObject'; Resource = '*' } } }
+            'string-statements' { $invalidBundle.guardrailPolicy = @{ Statement = 'not-a-statement-list' } }
+            'number-statements' { $invalidBundle.guardrailPolicy = @{ Statement = 1 } }
+            'boolean-statements' { $invalidBundle.guardrailPolicy = @{ Statement = $true } }
+        }
+        [IO.File]::WriteAllText($packagePath, (ConvertTo-Json $invalid -Depth 100))
+        $rejected = $false
+        try { $null = Read-SpottoAwsSetupPackage $packagePath } catch { $rejected = $true }
+        if (-not $rejected) { $guardrailShapeFailures += $shape }
+    }
+    Assert-Test ($guardrailShapeFailures.Count -eq 0) "malformed guardrail shapes rejected: $($guardrailShapeFailures -join ', ')"
+    # Exercise the actual entrypoint too: malformed guardrails must stop before AWS.
     Write-State @{ roles = @{}; calls = @() }
+    $invalidGuardrail = Run-Wizard @('-CheckOnly') -ExpectedExit 1
+    Assert-Test ($null -eq $invalidGuardrail.Report -and @((Read-State).calls).Count -eq 0) 'invalid guardrails fail before AWS calls or handoff'
+    [IO.File]::WriteAllText($packagePath, (ConvertTo-Json $package -Depth 100))
+    $validGuardrails = Read-SpottoAwsSetupPackage $packagePath
+    Assert-Test ($validGuardrails.roles[0].setup.onboardingBundle.guardrailPolicy.Statement.Count -eq 2) 'valid nonempty guardrail statement arrays remain accepted'
+
+    # Capabilities and documents must agree: missing/extra/empty policies cannot silently change access.
+    $policyValidationFailures = @()
+    foreach ($capability in @('billing-definition', 'billing-storage', 'commitments-planning')) {
+        $field = if ($capability -eq 'commitments-planning') { 'commitmentsAccessPolicy' } else { 'billingAccessPolicy' }
+        $policyName = if ($capability -eq 'commitments-planning') { 'SpottoCommitmentsPlanning' } else { 'SpottoBillingExportRead' }
+        foreach ($variant in @('missing', 'unselected', 'null', 'empty-statements', 'object-statement', 'empty-object')) {
+            $invalid = ConvertFrom-Json (ConvertTo-Json $package -Depth 100) -AsHashtable
+            $invalidBundle = $invalid.roles[0].setup.onboardingBundle
+            if ($variant -ne 'unselected') {
+                $invalid.configuration.estates[0].accounts[0].purposes += $capability
+                $invalidBundle.rolePurposes += $capability
+                if ($capability -like 'billing-*') {
+                    $invalid.configuration.estates[0].billingSources = @(@{ enabled = $true; definitionRoleAccountId = $accountId; storageRoleAccountId = $accountId })
+                }
+            }
+            if ($variant -ne 'missing') {
+                $invalidBundle[$field + 'Name'] = $policyName
+                $invalidBundle[$field] = switch ($variant) {
+                    'null' { $null }
+                    'empty-statements' { @{ Statement = @() } }
+                    'object-statement' { @{ Statement = @{ Effect = 'Allow'; Action = 's3:GetObject'; Resource = '*' } } }
+                    'empty-object' { @{} }
+                    default { @{ Statement = @(@{ Effect = 'Allow'; Action = 's3:GetObject'; Resource = '*' }) } }
+                }
+            }
+            [IO.File]::WriteAllText($packagePath, (ConvertTo-Json $invalid -Depth 100))
+            $rejected = $false
+            try { $null = Read-SpottoAwsSetupPackage $packagePath } catch { $rejected = $true }
+            if (-not $rejected) { $policyValidationFailures += "$capability/$variant" }
+        }
+    }
+    Assert-Test ($policyValidationFailures.Count -eq 0) "invalid capability policy packages rejected: $($policyValidationFailures -join ', ')"
+    [IO.File]::WriteAllText($packagePath, (ConvertTo-Json $package -Depth 100))
+
+    # Map values are CLI profile names, never terminal control sequences.
+    $controlMapPath = Join-Path $testRoot 'control-profiles.json'
+    foreach ($control in @(0, 9, 10, 13, 27, 31, 127)) {
+        [IO.File]::WriteAllText($controlMapPath, (ConvertTo-Json @{ $accountId = ('operator' + [char]$control + 'profile') }))
+        Write-State @{ roles = @{}; calls = @() }
+        $invalidMap = Run-Wizard @('-CheckOnly', '-ProfileMapPath', $controlMapPath) -ExpectedExit 1
+        Assert-Test ($null -eq $invalidMap.Report -and $invalidMap.Log.Contains('Invalid profile map entry')) "control character $control is rejected during profile-map validation"
+        Assert-Test (@((Read-State).calls).Count -eq 0) "control character $control is rejected before AWS calls"
+    }
+    [IO.File]::WriteAllText($controlMapPath, (ConvertTo-Json @{ $accountId = '' }))
+    $emptyMap = Run-Wizard @('-CheckOnly', '-ProfileMapPath', $controlMapPath)
+    Assert-Test ($emptyMap.Report.results[0].status -eq 'changes-required') 'explicit empty profile mapping still uses the current session'
+
+    # Service diagnostics may follow credential-helper text; arbitrary parenthesized text is never an error code.
+    Write-State @{ roles = @{}; calls = @() }
+    $env:SPOTTO_TEST_ERROR_PREFIX = 'credential helper (sensitive-diagnostic-sentinel)'
+    $missing = Invoke-SpottoAwsCliAttempt @('iam', 'get-role', '--role-name', 'SpottoReadOnlyRole') '' 'us-east-1' -AllowMissing
+    Assert-Test ($null -eq $missing) 'real NoSuchEntity is recognized after unrelated diagnostic parentheses'
+    $env:SPOTTO_TEST_FAIL_ACTION = 'get-role'
+    $env:SPOTTO_TEST_ERROR_PREFIX = 'credential helper (NoSuchEntity)'
+    $errorMessage = ''
+    try { $null = Invoke-SpottoAwsCliAttempt @('iam', 'get-role', '--role-name', 'SpottoReadOnlyRole') '' 'us-east-1' -AllowMissing }
+    catch { $errorMessage = $_.Exception.Message }
+    Assert-Test ($errorMessage.Contains('failed (AccessDenied)')) 'diagnostic NoSuchEntity cannot hide a real AccessDenied as a missing role'
+    $env:SPOTTO_TEST_ERROR_PREFIX = 'credential helper (sensitive-diagnostic-sentinel)'
+    $env:SPOTTO_TEST_ERROR_CODE = 'sensitive-diagnostic-sentinel'
+    $errorMessage = ''
+    try { $null = Invoke-SpottoAwsCliAttempt @('iam', 'get-role', '--role-name', 'SpottoReadOnlyRole') '' 'us-east-1' -AllowMissing }
+    catch { $errorMessage = $_.Exception.Message }
+    Assert-Test ($errorMessage.Contains('failed (CliFailure)') -and -not $errorMessage.Contains('sensitive-diagnostic-sentinel')) 'unknown service codes and helper tokens cannot leak to the console'
+    $env:SPOTTO_TEST_ERROR_CODE = 'AccessDenied'
+    $env:SPOTTO_TEST_ERROR_PREFIX = 'credential helper (NoSuchEntity)'
+    $env:SPOTTO_TEST_FAIL_ACTION = 'put-role-policy'
+    Write-State @{ roles = @{}; calls = @() }
+    try { $null = Invoke-SpottoAwsCli @('iam', 'put-role-policy') '' 'us-east-1' -RetryMissing } catch {}
+    Assert-Test (@((Read-State).calls | Where-Object { $_.action -eq 'put-role-policy' }).Count -eq 1) 'diagnostic NoSuchEntity cannot trigger propagation retries for AccessDenied'
+    $env:SPOTTO_TEST_ERROR_PREFIX = $null
+    $env:SPOTTO_TEST_FAIL_ACTION = 'get-role'
+    foreach ($safeCode in @('NoSuchEntity', 'AccessDenied', 'AccessDeniedException', 'EntityAlreadyExists', 'MalformedPolicyDocument',
+        'InvalidClientTokenId', 'ExpiredToken', 'ExpiredTokenException', 'InvalidIdentityToken', 'ValidationError', 'LimitExceeded',
+        'ServiceFailure', 'Throttling', 'ThrottlingException', 'RequestLimitExceeded', 'UnrecognizedClientException', 'SignatureDoesNotMatch')) {
+        $env:SPOTTO_TEST_ERROR_CODE = $safeCode
+        $errorMessage = ''
+        try { $null = Invoke-SpottoAwsCliAttempt @('iam', 'get-role', '--role-name', 'SpottoReadOnlyRole') '' 'us-east-1' }
+        catch { $errorMessage = $_.Exception.Message }
+        Assert-Test ($errorMessage.Contains("failed ($safeCode)")) "known safe service error code is retained: $safeCode"
+    }
+    $env:SPOTTO_TEST_ERROR_CODE = $null
+    $env:SPOTTO_TEST_FAIL_ACTION = $null
+
+    # Foreign company bindings are refused even with alternate operators, key casing or IAM's object Statement form.
+    $trustValidationFailures = @()
+    foreach ($operator in @('StringEquals', 'StringLike', 'StringEqualsIfExists', 'ForAnyValue:StringEquals', 'ForAllValues:StringLike')) {
+        foreach ($shape in @('array', 'object')) {
+            foreach ($key in @('sts:ExternalId', 'STS:EXTERNALID')) {
+                $statement = @{ Effect = 'Allow'; Action = 'sts:AssumeRole'; Principal = @{ AWS = $bundle.trustedPrincipalArn }
+                    Condition = @{ $operator = @{ $key = @('spotto-example-company-id', 'spotto-another-company') } } }
+                $trust = @{ Version = '2012-10-17'; Statement = if ($shape -eq 'object') { $statement } else { @($statement) } }
+                Write-State @{ roles = @{ $accountId = @{ Arn = $roleArn; RoleId = 'AROA111122223333'; Tags = @(); AssumeRolePolicyDocument = $trust;
+                    inline = @{ SpottoGuardrails = $bundle.guardrailPolicy }; managed = @($bundle.managedPolicies | ForEach-Object { $_.arn }) } }; calls = @() }
+                $rejected = $false
+                try { $null = Get-SpottoAwsRoleState $package.roles[0] $package.companyId '' 'us-east-1' }
+                catch { $rejected = $_.Exception.Message.Contains('another External ID') }
+                if (-not $rejected) { $trustValidationFailures += "$operator/$shape/$key" }
+                Assert-Test ((Mutations (Read-State)).Count -eq 0) "foreign trust inspection performs no writes: $operator/$shape/$key"
+            }
+        }
+    }
+    Assert-Test ($trustValidationFailures.Count -eq 0) "all foreign External ID forms refused: $($trustValidationFailures -join ', ')"
+    $foreignRepair = Run-Wizard @('-RepairExistingRole') -ExpectedExit 1
+    Assert-Test ($foreignRepair.Report.results[0].status -eq 'failed' -and (Mutations (Read-State)).Count -eq 0) 'explicit repair cannot replace a foreign alternate-operator company binding'
+    foreach ($value in @('spotto-another-company', @('spotto-another-company'), @{ ambiguous = 'spotto-another-company' })) {
+        $state = Read-State
+        $state.roles[$accountId].AssumeRolePolicyDocument.Statement.Condition = @{ StringLike = @{ 'sts:ExternalId' = $value } }
+        Write-State $state
+        $rejected = $false
+        try { $null = Get-SpottoAwsRoleState $package.roles[0] $package.companyId '' 'us-east-1' }
+        catch { $rejected = $_.Exception.Message.Contains('another External ID') }
+        Assert-Test $rejected 'foreign scalar, single-value array and ambiguous External ID values are refused'
+    }
+    $state = Read-State
+    $state.roles[$accountId].AssumeRolePolicyDocument.Statement.Condition = @{ 'ForAnyValue:StringEquals' = @{ 'STS:EXTERNALID' = @('spotto-example-company-id', 'spotto-example-company-id') } }
+    Write-State $state
+    $sameCompany = Get-SpottoAwsRoleState $package.roles[0] $package.companyId '' 'us-east-1'
+    Assert-Test (-not $sameCompany.Matches -and @($sameCompany.Steps | Where-Object { $_.Action -eq 'update-trust' }).Count -eq 1) 'same-company External ID arrays remain eligible for reviewed trust repair'
+
+    Write-State @{ roles = @{}; calls = @() }
+    $unattendedDefault = Run-Wizard -OmitConfirmation
+    Assert-Test ($unattendedDefault.Report.results[0].status -eq 'changes-required') 'non-interactive without explicit approval defaults to read-only checks'
+    Assert-Test ((Mutations (Read-State)).Count -eq 0) 'non-interactive default cannot mutate AWS'
+    $unattendedConfirm = Run-Wizard -OmitConfirmation -Options @('-Confirm:$true')
+    Assert-Test ($unattendedConfirm.Report.results[0].status -eq 'changes-required') 'Confirm true does not authorize unattended configuration'
+    $unattendedPreview = Run-Wizard -OmitConfirmation -Options @('-WhatIf')
+    Assert-Test ($unattendedPreview.Report.results[0].status -eq 'planned' -and (Mutations (Read-State)).Count -eq 0) 'WhatIf retains preview behavior without explicit unattended approval'
     $defaultMode = Run-Wizard -Answers @('')
     Assert-Test ($defaultMode.Report.results[0].status -eq 'changes-required') 'interactive Enter defaults to read-only checks'
     Assert-Test ((Mutations (Read-State)).Count -eq 0) 'interactive default cannot mutate AWS'
@@ -108,6 +295,28 @@ try {
     Assert-Test ($rerun.Report.kind -ceq 'spotto.aws.manual-onboarding') 'handoff uses portal V1 kind'
     Assert-Test ($rerun.Report.configuration.companyId -ceq 'company-example') 'handoff retains company binding'
 
+    # Modern packages leave obsolete discovery attachments visible for customer review without changing them.
+    $withoutManaged = ConvertFrom-Json (ConvertTo-Json $package -Depth 100) -AsHashtable
+    $withoutManaged.roles[0].setup.onboardingBundle.managedPolicies = @()
+    [IO.File]::WriteAllText($packagePath, (ConvertTo-Json $withoutManaged -Depth 100))
+    $state = Read-State
+    $state.roles[$accountId].managed += 'arn:aws:iam::111122223333:policy/CustomerPolicy'
+    foreach ($mode in @('check', 'configure', 'preview')) {
+        $state.calls = @(); Write-State $state
+        $options = switch ($mode) { 'check' { @('-CheckOnly') } 'preview' { @('-WhatIf') } default { @() } }
+        $legacy = Run-Wizard -Options $options
+        $expectedStatus = if ($mode -eq 'check') { 'configuration-matches' } else { 'configured' }
+        Assert-Test ($legacy.Report.results[0].status -eq $expectedStatus) "legacy attachments do not change matching status: $mode"
+        Assert-Test ($legacy.Log.Contains('ReadOnlyAccess') -and $legacy.Log.Contains('SecurityAudit') -and $legacy.Log.Contains('WARNING:')) "obsolete discovery attachments are warned about: $mode"
+        Assert-Test ((Mutations (Read-State)).Count -eq 0 -and (Read-State).roles[$accountId].managed.Count -eq 3) "all unrelated and legacy attachments are preserved: $mode"
+    }
+    # An attachment still requested by the package never produces an obsolete-attachment warning.
+    $withoutManaged.roles[0].setup.onboardingBundle.managedPolicies = @(@{ name = 'SecurityAudit'; arn = 'arn:aws:iam::aws:policy/SecurityAudit' })
+    [IO.File]::WriteAllText($packagePath, (ConvertTo-Json $withoutManaged -Depth 100))
+    $oneLegacy = Run-Wizard @('-CheckOnly')
+    Assert-Test ($oneLegacy.Log.Contains('ReadOnlyAccess') -and -not $oneLegacy.Log.Contains('SecurityAudit') -and -not $oneLegacy.Log.Contains('CustomerPolicy')) 'warning names only obsolete documented discovery attachments'
+    [IO.File]::WriteAllText($packagePath, (ConvertTo-Json $package -Depth 100))
+
     # Simulate changes while the caller is deciding whether to approve a role update.
     $approvalRole = (Read-State).roles[$accountId]
     foreach ($change in @('foreign-owner', 'replaced', 'appeared', 'disappeared', 'policy-drift', 'session')) {
@@ -134,6 +343,22 @@ try {
         Assert-Test $rejected "changed approval binding is rejected: $change"
         Assert-Test ((Mutations (Read-State)).Count -eq 0) "changed approval cannot issue IAM mutations: $change"
     }
+    Write-State @{ roles = @{ $accountId = $approvalRole }; calls = @() }
+
+    # An approved adoption must stop if CloudFormation takes ownership meanwhile,
+    # even when the pending policy/tag steps have identical descriptions.
+    $stackRaceRole = ConvertFrom-Json (ConvertTo-Json $approvalRole -Depth 100) -AsHashtable
+    $stackRaceRole.Tags = @()
+    $stackRaceRole.inline.Remove('SpottoGuardrails')
+    Write-State @{ roles = @{ $accountId = $stackRaceRole }; calls = @() }
+    $approval = Get-SpottoAwsRoleState $package.roles[0] $package.companyId '' 'us-east-1'
+    $changed = Read-State
+    $changed.roles[$accountId].Tags = @(@{ Key = 'aws:cloudformation:stack-id'; Value = 'NewOwnerStack' })
+    $changed.calls = @(); Write-State $changed
+    $rejected = $false
+    try { Set-SpottoAwsRole $package.roles[0] $package.companyId $approval '' 'us-east-1' } catch { $rejected = $true }
+    Assert-Test $rejected 'CloudFormation ownership acquired after approval must be rejected'
+    Assert-Test ((Mutations (Read-State)).Count -eq 0) 'new stack ownership prevents all approved adoption writes'
     Write-State @{ roles = @{ $accountId = $approvalRole }; calls = @() }
 
     $state = Read-State
@@ -188,6 +413,24 @@ try {
     $state.roles[$accountId].Tags = @(@{ Key = 'aws:cloudformation:stack-name'; Value = 'CustomerStack' }); $state.calls = @(); Write-State $state
     $null = Run-Wizard @('-RepairExistingRole') -ExpectedExit 1
     Assert-Test ((Mutations (Read-State)).Count -eq 0) 'CloudFormation ownership cannot be bypassed'
+
+    # Stack tags establish verify-only ownership even if a script marker is also present.
+    foreach ($manager in @('', 'Terraform', 'CloudFormation', 'Setup-SpottoAws')) {
+        $state = Read-State
+        $state.roles[$accountId].inline['SpottoGuardrails'] = $bundle.guardrailPolicy
+        $state.roles[$accountId].Tags = @(@{ Key = 'spottocompanyid'; Value = 'company-example' }, @{ Key = 'spottomanagedby'; Value = $manager })
+        if ($manager -eq 'Setup-SpottoAws' -or $manager -eq 'CloudFormation') {
+            $state.roles[$accountId].Tags += @{ Key = 'aws:cloudformation:stack-id'; Value = 'CustomerStack' }
+        }
+        $state.calls = @(); Write-State $state
+        $verified = Run-Wizard @('-RepairExistingRole')
+        Assert-Test ($verified.Report.results[0].status -eq 'configured' -and (Mutations (Read-State)).Count -eq 0) "matching external-manager role is verify-only: '$manager'"
+        Assert-Test ((Run-Wizard @('-CheckOnly')).Report.results[0].status -eq 'configuration-matches') "external-manager role supports read-only verification: '$manager'"
+        $state = Read-State
+        $state.roles[$accountId].inline.Remove('SpottoGuardrails'); $state.calls = @(); Write-State $state
+        $blocked = Run-Wizard @('-RepairExistingRole') -ExpectedExit 1
+        Assert-Test ($blocked.Report.results[0].status -eq 'failed' -and (Mutations (Read-State)).Count -eq 0) "external-manager role cannot be repaired: '$manager'"
+    }
 
     Write-State @{ roles = @{}; calls = @() }
     $env:SPOTTO_TEST_WRONG_ACCOUNT = '000011112222'

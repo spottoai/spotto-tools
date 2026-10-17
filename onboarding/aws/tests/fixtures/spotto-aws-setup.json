@@ -1,0 +1,458 @@
+{
+  "kind": "spotto.aws.setup",
+  "schemaVersion": 1,
+  "companyId": "company-example",
+  "configuration": {
+    "schemaVersion": 1,
+    "provider": "AWS",
+    "companyId": "company-example",
+    "updatedAt": "2026-10-06T00:00:00.000Z",
+    "estates": [
+      {
+        "schemaVersion": 1,
+        "companyId": "company-example",
+        "estateId": "estate-example",
+        "name": "Example organization",
+        "kind": "organization",
+        "enabled": true,
+        "organization": {
+          "schemaVersion": 1,
+          "companyId": "company-example",
+          "estateId": "estate-example",
+          "organizationId": "o-example12345",
+          "managementAccountId": "111122223333",
+          "accountSource": "manual",
+          "roleDeploymentMode": "customer-managed",
+          "excludedAccounts": []
+        },
+        "accounts": [
+          {
+            "schemaVersion": 1,
+            "companyId": "company-example",
+            "estateId": "estate-example",
+            "accountId": "111122223333",
+            "roleArn": "arn:aws:iam::111122223333:role/SpottoReadOnlyRole",
+            "name": "Management",
+            "purposes": [
+              "resource-discovery",
+              "commitments-planning",
+              "billing-definition"
+            ],
+            "enabled": true
+          },
+          {
+            "schemaVersion": 1,
+            "companyId": "company-example",
+            "estateId": "estate-example",
+            "accountId": "000011112222",
+            "roleArn": "arn:aws:iam::000011112222:role/SpottoReadOnlyRole",
+            "name": "Billing storage",
+            "purposes": [
+              "resource-discovery",
+              "billing-storage"
+            ],
+            "enabled": true
+          },
+          {
+            "schemaVersion": 1,
+            "companyId": "company-example",
+            "estateId": "estate-example",
+            "accountId": "444455556666",
+            "roleArn": "arn:aws:iam::444455556666:role/SpottoReadOnlyRole",
+            "name": "Workload",
+            "purposes": [
+              "resource-discovery"
+            ],
+            "enabled": true
+          },
+          {
+            "schemaVersion": 1,
+            "companyId": "company-example",
+            "estateId": "estate-example",
+            "accountId": "777788889999",
+            "roleArn": "arn:aws:iam::777788889999:role/SpottoReadOnlyRole",
+            "name": "Retired",
+            "purposes": [
+              "resource-discovery"
+            ],
+            "enabled": false
+          }
+        ],
+        "billingSources": [
+          {
+            "schemaVersion": 1,
+            "companyId": "company-example",
+            "estateId": "estate-example",
+            "billingSourceId": "billing-example",
+            "name": "Example CUR 2.0",
+            "definitionRoleAccountId": "111122223333",
+            "payerAccountId": "111122223333",
+            "storageRoleAccountId": "000011112222",
+            "export": {
+              "type": "DATA_EXPORTS",
+              "exportArn": "arn:aws:bcm-data-exports:us-east-1:111122223333:export/example-cur2-0123",
+              "exportName": "example-cur2",
+              "destination": {
+                "bucketName": "example-cost-exports",
+                "basePrefix": "cur2",
+                "region": "us-east-1",
+                "bucketOwnerAccountId": "000011112222",
+                "kmsKeyArn": "arn:aws:kms:us-east-1:000011112222:key/11111111-2222-3333-4444-555555555555"
+              }
+            },
+            "coverage": {
+              "type": "estate"
+            },
+            "enabled": true
+          }
+        ]
+      }
+    ]
+  },
+  "roles": [
+    {
+      "accountId": "111122223333",
+      "roleArn": "arn:aws:iam::111122223333:role/SpottoReadOnlyRole",
+      "setup": {
+        "provider": "AWS",
+        "externalId": "spotto-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+        "createdAt": "2026-10-06T00:00:00.000Z",
+        "onboardingBundle": {
+          "schemaVersion": 1,
+          "roleName": "SpottoReadOnlyRole",
+          "rolePurposes": [
+            "resource-discovery",
+            "commitments-planning",
+            "billing-definition"
+          ],
+          "trustedPrincipalArn": "arn:aws:iam::999900001111:role/SpottoEngine",
+          "trustedPrincipalAccountId": "999900001111",
+          "trustPolicy": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "AllowSpottoCloudEngineAccess",
+                "Effect": "Allow",
+                "Principal": {
+                  "AWS": "arn:aws:iam::999900001111:role/SpottoEngine"
+                },
+                "Action": "sts:AssumeRole",
+                "Condition": {
+                  "StringEquals": {
+                    "sts:ExternalId": "spotto-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+                  }
+                }
+              }
+            ]
+          },
+          "managedPolicies": [
+            {
+              "name": "SecurityAudit",
+              "arn": "arn:aws:iam::aws:policy/SecurityAudit",
+              "accessScope": "broad-read-only-preview",
+              "warning": "This AWS-managed policy grants broad read-only preview access. Review it against your security requirements before attachment."
+            },
+            {
+              "name": "ReadOnlyAccess",
+              "arn": "arn:aws:iam::aws:policy/ReadOnlyAccess",
+              "accessScope": "broad-read-only-preview",
+              "warning": "This AWS-managed policy grants broad read-only preview access. Review it against your security requirements before attachment."
+            }
+          ],
+          "guardrailPolicyName": "SpottoGuardrails",
+          "guardrailPolicy": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "ReadAwsAccountInformation",
+                "Effect": "Allow",
+                "Action": "account:GetAccountInformation",
+                "Resource": "*"
+              },
+              {
+                "Sid": "DenyCredentialValueReads",
+                "Effect": "Deny",
+                "Action": [
+                  "ssm:GetParameter",
+                  "ssm:GetParameters",
+                  "ssm:GetParameterHistory",
+                  "ssm:GetParametersByPath",
+                  "secretsmanager:GetSecretValue",
+                  "secretsmanager:BatchGetSecretValue"
+                ],
+                "Resource": "*"
+              },
+              {
+                "Sid": "DenyS3ObjectReadsWithoutBillingStoragePurpose",
+                "Effect": "Deny",
+                "Action": "s3:GetObject*",
+                "Resource": "*"
+              }
+            ]
+          },
+          "billingAccessPolicyName": "SpottoBillingExportRead",
+          "billingAccessPolicy": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "DiscoverDataExports",
+                "Effect": "Allow",
+                "Action": "bcm-data-exports:ListExports",
+                "Resource": "*"
+              },
+              {
+                "Sid": "ReadDataExport01610628c9",
+                "Effect": "Allow",
+                "Action": "bcm-data-exports:GetExport",
+                "Resource": "arn:aws:bcm-data-exports:us-east-1:111122223333:export/example-cur2-0123"
+              }
+            ]
+          },
+          "commitmentsAccessPolicyName": "SpottoCommitmentsPlanning",
+          "commitmentsAccessPolicy": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "VerifyOrganizationIdentity",
+                "Effect": "Allow",
+                "Action": "organizations:DescribeOrganization",
+                "Resource": "*"
+              },
+              {
+                "Sid": "ReadCommitmentInventory",
+                "Effect": "Allow",
+                "Action": [
+                  "savingsplans:DescribeSavingsPlans",
+                  "ec2:DescribeReservedInstances"
+                ],
+                "Resource": "*"
+              },
+              {
+                "Sid": "ReadCommitmentAnalyticsAndRecommendations",
+                "Effect": "Allow",
+                "Action": [
+                  "ce:GetSavingsPlansCoverage",
+                  "ce:GetSavingsPlansUtilization",
+                  "ce:GetReservationCoverage",
+                  "ce:GetReservationUtilization",
+                  "ce:StartSavingsPlansPurchaseRecommendationGeneration",
+                  "ce:ListSavingsPlansPurchaseRecommendationGeneration",
+                  "ce:GetSavingsPlansPurchaseRecommendation",
+                  "ce:GetReservationPurchaseRecommendation"
+                ],
+                "Resource": "*"
+              }
+            ]
+          },
+          "instructionsMarkdown": "# Spotto AWS purpose-scoped role\n\nRole purposes: resource-discovery, commitments-planning, billing-definition\nRole name: SpottoReadOnlyRole\nExternal ID: spotto-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0\n\n## Trust policy\n```json\n{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \"Sid\": \"AllowSpottoCloudEngineAccess\",\n      \"Effect\": \"Allow\",\n      \"Principal\": {\n        \"AWS\": \"arn:aws:iam::999900001111:role/SpottoEngine\"\n      },\n      \"Action\": \"sts:AssumeRole\",\n      \"Condition\": {\n        \"StringEquals\": {\n          \"sts:ExternalId\": \"spotto-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0\"\n        }\n      }\n    }\n  ]\n}\n```\n\n## AWS-managed discovery policies\n- Attach `arn:aws:iam::aws:policy/SecurityAudit` (SecurityAudit). This AWS-managed policy grants broad read-only preview access. Review it against your security requirements before attachment.\n- Attach `arn:aws:iam::aws:policy/ReadOnlyAccess` (ReadOnlyAccess). This AWS-managed policy grants broad read-only preview access. Review it against your security requirements before attachment.\n\n## Security posture and findings\nThe discovery policies include the read operations used for Security Hub CSPM, GuardDuty and Inspector. Service control policies, permission boundaries or explicit denies can still cause access denied.\nFor a security percentage, enable Security Hub CSPM with a security standard and AWS Config recording in the Regions included in your Spotto account scope. GuardDuty and Inspector findings are collected independently when those services are enabled.\nSpotto reads security evidence; it does not enable security services or change findings. A disabled service or denied read is shown as unavailable, not as a zero or a healthy score.\nSecurity setup and exact read permissions: https://docs.spotto.ai/portal/cloud-account-aws/security\n\n## Required guardrail policy: SpottoGuardrails\n```json\n{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \"Sid\": \"ReadAwsAccountInformation\",\n      \"Effect\": \"Allow\",\n      \"Action\": \"account:GetAccountInformation\",\n      \"Resource\": \"*\"\n    },\n    {\n      \"Sid\": \"DenyCredentialValueReads\",\n      \"Effect\": \"Deny\",\n      \"Action\": [\n        \"ssm:GetParameter\",\n        \"ssm:GetParameters\",\n        \"ssm:GetParameterHistory\",\n        \"ssm:GetParametersByPath\",\n        \"secretsmanager:GetSecretValue\",\n        \"secretsmanager:BatchGetSecretValue\"\n      ],\n      \"Resource\": \"*\"\n    },\n    {\n      \"Sid\": \"DenyS3ObjectReadsWithoutBillingStoragePurpose\",\n      \"Effect\": \"Deny\",\n      \"Action\": \"s3:GetObject*\",\n      \"Resource\": \"*\"\n    }\n  ]\n}\n```\n\n## Required union billing policy: SpottoBillingExportRead\n```json\n{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \"Sid\": \"DiscoverDataExports\",\n      \"Effect\": \"Allow\",\n      \"Action\": \"bcm-data-exports:ListExports\",\n      \"Resource\": \"*\"\n    },\n    {\n      \"Sid\": \"ReadDataExport01610628c9\",\n      \"Effect\": \"Allow\",\n      \"Action\": \"bcm-data-exports:GetExport\",\n      \"Resource\": \"arn:aws:bcm-data-exports:us-east-1:111122223333:export/example-cur2-0123\"\n    }\n  ]\n}\n```\n\n## Required commitments policy: SpottoCommitmentsPlanning\n```json\n{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \"Sid\": \"VerifyOrganizationIdentity\",\n      \"Effect\": \"Allow\",\n      \"Action\": \"organizations:DescribeOrganization\",\n      \"Resource\": \"*\"\n    },\n    {\n      \"Sid\": \"ReadCommitmentInventory\",\n      \"Effect\": \"Allow\",\n      \"Action\": [\n        \"savingsplans:DescribeSavingsPlans\",\n        \"ec2:DescribeReservedInstances\"\n      ],\n      \"Resource\": \"*\"\n    },\n    {\n      \"Sid\": \"ReadCommitmentAnalyticsAndRecommendations\",\n      \"Effect\": \"Allow\",\n      \"Action\": [\n        \"ce:GetSavingsPlansCoverage\",\n        \"ce:GetSavingsPlansUtilization\",\n        \"ce:GetReservationCoverage\",\n        \"ce:GetReservationUtilization\",\n        \"ce:StartSavingsPlansPurchaseRecommendationGeneration\",\n        \"ce:ListSavingsPlansPurchaseRecommendationGeneration\",\n        \"ce:GetSavingsPlansPurchaseRecommendation\",\n        \"ce:GetReservationPurchaseRecommendation\"\n      ],\n      \"Resource\": \"*\"\n    }\n  ]\n}\n```"
+        }
+      }
+    },
+    {
+      "accountId": "000011112222",
+      "roleArn": "arn:aws:iam::000011112222:role/SpottoReadOnlyRole",
+      "setup": {
+        "provider": "AWS",
+        "externalId": "spotto-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+        "createdAt": "2026-10-06T00:00:00.000Z",
+        "onboardingBundle": {
+          "schemaVersion": 1,
+          "roleName": "SpottoReadOnlyRole",
+          "rolePurposes": [
+            "resource-discovery",
+            "billing-storage"
+          ],
+          "trustedPrincipalArn": "arn:aws:iam::999900001111:role/SpottoEngine",
+          "trustedPrincipalAccountId": "999900001111",
+          "trustPolicy": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "AllowSpottoCloudEngineAccess",
+                "Effect": "Allow",
+                "Principal": {
+                  "AWS": "arn:aws:iam::999900001111:role/SpottoEngine"
+                },
+                "Action": "sts:AssumeRole",
+                "Condition": {
+                  "StringEquals": {
+                    "sts:ExternalId": "spotto-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+                  }
+                }
+              }
+            ]
+          },
+          "managedPolicies": [
+            {
+              "name": "SecurityAudit",
+              "arn": "arn:aws:iam::aws:policy/SecurityAudit",
+              "accessScope": "broad-read-only-preview",
+              "warning": "This AWS-managed policy grants broad read-only preview access. Review it against your security requirements before attachment."
+            },
+            {
+              "name": "ReadOnlyAccess",
+              "arn": "arn:aws:iam::aws:policy/ReadOnlyAccess",
+              "accessScope": "broad-read-only-preview",
+              "warning": "This AWS-managed policy grants broad read-only preview access. Review it against your security requirements before attachment."
+            }
+          ],
+          "guardrailPolicyName": "SpottoGuardrails",
+          "guardrailPolicy": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "ReadAwsAccountInformation",
+                "Effect": "Allow",
+                "Action": "account:GetAccountInformation",
+                "Resource": "*"
+              },
+              {
+                "Sid": "DenyCredentialValueReads",
+                "Effect": "Deny",
+                "Action": [
+                  "ssm:GetParameter",
+                  "ssm:GetParameters",
+                  "ssm:GetParameterHistory",
+                  "ssm:GetParametersByPath",
+                  "secretsmanager:GetSecretValue",
+                  "secretsmanager:BatchGetSecretValue"
+                ],
+                "Resource": "*"
+              },
+              {
+                "Sid": "DenyS3ObjectReadsOutsideBillingScopes",
+                "Effect": "Deny",
+                "Action": "s3:GetObject*",
+                "NotResource": "arn:aws:s3:::example-cost-exports/cur2/example-cur2/*"
+              }
+            ]
+          },
+          "billingAccessPolicyName": "SpottoBillingExportRead",
+          "billingAccessPolicy": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "ReadBucketLocation0130e1c52a",
+                "Effect": "Allow",
+                "Action": "s3:GetBucketLocation",
+                "Resource": "arn:aws:s3:::example-cost-exports"
+              },
+              {
+                "Sid": "ListDeliveryRoot01ac4ae0dc",
+                "Effect": "Allow",
+                "Action": "s3:ListBucket",
+                "Resource": "arn:aws:s3:::example-cost-exports",
+                "Condition": {
+                  "StringLike": {
+                    "s3:prefix": [
+                      "cur2/example-cur2",
+                      "cur2/example-cur2/*"
+                    ]
+                  }
+                }
+              },
+              {
+                "Sid": "ReadDeliveryObjects01ac4ae0dc",
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::example-cost-exports/cur2/example-cur2/*"
+              },
+              {
+                "Sid": "DecryptBillingObjects",
+                "Effect": "Allow",
+                "Action": [
+                  "kms:Decrypt",
+                  "kms:DescribeKey"
+                ],
+                "Resource": "arn:aws:kms:us-east-1:000011112222:key/11111111-2222-3333-4444-555555555555"
+              }
+            ]
+          },
+          "instructionsMarkdown": "# Spotto AWS purpose-scoped role\n\nRole purposes: resource-discovery, billing-storage\nRole name: SpottoReadOnlyRole\nExternal ID: spotto-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0\n\n## Trust policy\n```json\n{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \"Sid\": \"AllowSpottoCloudEngineAccess\",\n      \"Effect\": \"Allow\",\n      \"Principal\": {\n        \"AWS\": \"arn:aws:iam::999900001111:role/SpottoEngine\"\n      },\n      \"Action\": \"sts:AssumeRole\",\n      \"Condition\": {\n        \"StringEquals\": {\n          \"sts:ExternalId\": \"spotto-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0\"\n        }\n      }\n    }\n  ]\n}\n```\n\n## AWS-managed discovery policies\n- Attach `arn:aws:iam::aws:policy/SecurityAudit` (SecurityAudit). This AWS-managed policy grants broad read-only preview access. Review it against your security requirements before attachment.\n- Attach `arn:aws:iam::aws:policy/ReadOnlyAccess` (ReadOnlyAccess). This AWS-managed policy grants broad read-only preview access. Review it against your security requirements before attachment.\n\n## Security posture and findings\nThe discovery policies include the read operations used for Security Hub CSPM, GuardDuty and Inspector. Service control policies, permission boundaries or explicit denies can still cause access denied.\nFor a security percentage, enable Security Hub CSPM with a security standard and AWS Config recording in the Regions included in your Spotto account scope. GuardDuty and Inspector findings are collected independently when those services are enabled.\nSpotto reads security evidence; it does not enable security services or change findings. A disabled service or denied read is shown as unavailable, not as a zero or a healthy score.\nSecurity setup and exact read permissions: https://docs.spotto.ai/portal/cloud-account-aws/security\n\n## Required guardrail policy: SpottoGuardrails\n```json\n{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \"Sid\": \"ReadAwsAccountInformation\",\n      \"Effect\": \"Allow\",\n      \"Action\": \"account:GetAccountInformation\",\n      \"Resource\": \"*\"\n    },\n    {\n      \"Sid\": \"DenyCredentialValueReads\",\n      \"Effect\": \"Deny\",\n      \"Action\": [\n        \"ssm:GetParameter\",\n        \"ssm:GetParameters\",\n        \"ssm:GetParameterHistory\",\n        \"ssm:GetParametersByPath\",\n        \"secretsmanager:GetSecretValue\",\n        \"secretsmanager:BatchGetSecretValue\"\n      ],\n      \"Resource\": \"*\"\n    },\n    {\n      \"Sid\": \"DenyS3ObjectReadsOutsideBillingScopes\",\n      \"Effect\": \"Deny\",\n      \"Action\": \"s3:GetObject*\",\n      \"NotResource\": \"arn:aws:s3:::example-cost-exports/cur2/example-cur2/*\"\n    }\n  ]\n}\n```\n\n## Required union billing policy: SpottoBillingExportRead\n```json\n{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \"Sid\": \"ReadBucketLocation0130e1c52a\",\n      \"Effect\": \"Allow\",\n      \"Action\": \"s3:GetBucketLocation\",\n      \"Resource\": \"arn:aws:s3:::example-cost-exports\"\n    },\n    {\n      \"Sid\": \"ListDeliveryRoot01ac4ae0dc\",\n      \"Effect\": \"Allow\",\n      \"Action\": \"s3:ListBucket\",\n      \"Resource\": \"arn:aws:s3:::example-cost-exports\",\n      \"Condition\": {\n        \"StringLike\": {\n          \"s3:prefix\": [\n            \"cur2/example-cur2\",\n            \"cur2/example-cur2/*\"\n          ]\n        }\n      }\n    },\n    {\n      \"Sid\": \"ReadDeliveryObjects01ac4ae0dc\",\n      \"Effect\": \"Allow\",\n      \"Action\": \"s3:GetObject\",\n      \"Resource\": \"arn:aws:s3:::example-cost-exports/cur2/example-cur2/*\"\n    },\n    {\n      \"Sid\": \"DecryptBillingObjects\",\n      \"Effect\": \"Allow\",\n      \"Action\": [\n        \"kms:Decrypt\",\n        \"kms:DescribeKey\"\n      ],\n      \"Resource\": \"arn:aws:kms:us-east-1:000011112222:key/11111111-2222-3333-4444-555555555555\"\n    }\n  ]\n}\n```\n\n> KMS-encrypted exports also require the customer-managed KMS key policy to allow this role to use kms:Decrypt and kms:DescribeKey."
+        }
+      }
+    },
+    {
+      "accountId": "444455556666",
+      "roleArn": "arn:aws:iam::444455556666:role/SpottoReadOnlyRole",
+      "setup": {
+        "provider": "AWS",
+        "externalId": "spotto-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+        "createdAt": "2026-10-06T00:00:00.000Z",
+        "onboardingBundle": {
+          "schemaVersion": 1,
+          "roleName": "SpottoReadOnlyRole",
+          "rolePurposes": [
+            "resource-discovery"
+          ],
+          "trustedPrincipalArn": "arn:aws:iam::999900001111:role/SpottoEngine",
+          "trustedPrincipalAccountId": "999900001111",
+          "trustPolicy": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "AllowSpottoCloudEngineAccess",
+                "Effect": "Allow",
+                "Principal": {
+                  "AWS": "arn:aws:iam::999900001111:role/SpottoEngine"
+                },
+                "Action": "sts:AssumeRole",
+                "Condition": {
+                  "StringEquals": {
+                    "sts:ExternalId": "spotto-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+                  }
+                }
+              }
+            ]
+          },
+          "managedPolicies": [
+            {
+              "name": "SecurityAudit",
+              "arn": "arn:aws:iam::aws:policy/SecurityAudit",
+              "accessScope": "broad-read-only-preview",
+              "warning": "This AWS-managed policy grants broad read-only preview access. Review it against your security requirements before attachment."
+            },
+            {
+              "name": "ReadOnlyAccess",
+              "arn": "arn:aws:iam::aws:policy/ReadOnlyAccess",
+              "accessScope": "broad-read-only-preview",
+              "warning": "This AWS-managed policy grants broad read-only preview access. Review it against your security requirements before attachment."
+            }
+          ],
+          "guardrailPolicyName": "SpottoGuardrails",
+          "guardrailPolicy": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "ReadAwsAccountInformation",
+                "Effect": "Allow",
+                "Action": "account:GetAccountInformation",
+                "Resource": "*"
+              },
+              {
+                "Sid": "DenyCredentialValueReads",
+                "Effect": "Deny",
+                "Action": [
+                  "ssm:GetParameter",
+                  "ssm:GetParameters",
+                  "ssm:GetParameterHistory",
+                  "ssm:GetParametersByPath",
+                  "secretsmanager:GetSecretValue",
+                  "secretsmanager:BatchGetSecretValue"
+                ],
+                "Resource": "*"
+              },
+              {
+                "Sid": "DenyS3ObjectReadsWithoutBillingStoragePurpose",
+                "Effect": "Deny",
+                "Action": "s3:GetObject*",
+                "Resource": "*"
+              }
+            ]
+          },
+          "instructionsMarkdown": "# Spotto AWS purpose-scoped role\n\nRole purposes: resource-discovery\nRole name: SpottoReadOnlyRole\nExternal ID: spotto-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0\n\n## Trust policy\n```json\n{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \"Sid\": \"AllowSpottoCloudEngineAccess\",\n      \"Effect\": \"Allow\",\n      \"Principal\": {\n        \"AWS\": \"arn:aws:iam::999900001111:role/SpottoEngine\"\n      },\n      \"Action\": \"sts:AssumeRole\",\n      \"Condition\": {\n        \"StringEquals\": {\n          \"sts:ExternalId\": \"spotto-0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0\"\n        }\n      }\n    }\n  ]\n}\n```\n\n## AWS-managed discovery policies\n- Attach `arn:aws:iam::aws:policy/SecurityAudit` (SecurityAudit). This AWS-managed policy grants broad read-only preview access. Review it against your security requirements before attachment.\n- Attach `arn:aws:iam::aws:policy/ReadOnlyAccess` (ReadOnlyAccess). This AWS-managed policy grants broad read-only preview access. Review it against your security requirements before attachment.\n\n## Security posture and findings\nThe discovery policies include the read operations used for Security Hub CSPM, GuardDuty and Inspector. Service control policies, permission boundaries or explicit denies can still cause access denied.\nFor a security percentage, enable Security Hub CSPM with a security standard and AWS Config recording in the Regions included in your Spotto account scope. GuardDuty and Inspector findings are collected independently when those services are enabled.\nSpotto reads security evidence; it does not enable security services or change findings. A disabled service or denied read is shown as unavailable, not as a zero or a healthy score.\nSecurity setup and exact read permissions: https://docs.spotto.ai/portal/cloud-account-aws/security\n\n## Required guardrail policy: SpottoGuardrails\n```json\n{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \"Sid\": \"ReadAwsAccountInformation\",\n      \"Effect\": \"Allow\",\n      \"Action\": \"account:GetAccountInformation\",\n      \"Resource\": \"*\"\n    },\n    {\n      \"Sid\": \"DenyCredentialValueReads\",\n      \"Effect\": \"Deny\",\n      \"Action\": [\n        \"ssm:GetParameter\",\n        \"ssm:GetParameters\",\n        \"ssm:GetParameterHistory\",\n        \"ssm:GetParametersByPath\",\n        \"secretsmanager:GetSecretValue\",\n        \"secretsmanager:BatchGetSecretValue\"\n      ],\n      \"Resource\": \"*\"\n    },\n    {\n      \"Sid\": \"DenyS3ObjectReadsWithoutBillingStoragePurpose\",\n      \"Effect\": \"Deny\",\n      \"Action\": \"s3:GetObject*\",\n      \"Resource\": \"*\"\n    }\n  ]\n}\n```"
+        }
+      }
+    }
+  ]
+}

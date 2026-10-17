@@ -62,8 +62,13 @@ function Invoke-SpottoAwsCliAttempt {
         $output = $stdout.GetAwaiter().GetResult()
         $errorOutput = $stderr.GetAwaiter().GetResult()
         if ($process.ExitCode -ne 0) {
-            if ($AllowMissing -and $errorOutput -match '\(NoSuchEntity\)') { return $null }
-            $code = if ($errorOutput -match '\(([A-Za-z0-9_.-]{1,80})\)') { $Matches[1] } else { 'CliFailure' }
+            $code = if ($errorOutput -cmatch '(?m)^An error occurred \(([A-Za-z0-9_.-]{1,80})\)') { $Matches[1] } else { 'CliFailure' }
+            $safeCodes = @('NoSuchEntity', 'AccessDenied', 'AccessDeniedException', 'EntityAlreadyExists', 'MalformedPolicyDocument',
+                'InvalidClientTokenId', 'ExpiredToken', 'ExpiredTokenException', 'InvalidIdentityToken', 'ValidationError',
+                'LimitExceeded', 'ServiceFailure', 'Throttling', 'ThrottlingException', 'RequestLimitExceeded',
+                'UnrecognizedClientException', 'SignatureDoesNotMatch')
+            if ($code -cnotin $safeCodes) { $code = 'CliFailure' }
+            if ($AllowMissing -and $code -ceq 'NoSuchEntity') { return $null }
             # Never echo raw CLI responses: an operator's credential process can include secrets.
             throw "AWS $($Arguments[0]) $($Arguments[1]) failed ($code). Check operator permissions, session expiry, SCPs and permissions boundaries."
         }
@@ -196,14 +201,33 @@ function Read-SpottoAwsSetupPackage {
             $statements[0].Condition.StringEquals['sts:ExternalId'] -cne $externalId) {
             throw 'The trust policy must require the exact Spotto principal and company External ID.'
         }
-        if ($bundle.guardrailPolicyName -cne 'SpottoGuardrails' -or -not $bundle.guardrailPolicy.Statement) { throw 'Spotto guardrails are required.' }
+        $guardrails = $bundle['guardrailPolicy']
+        if ($bundle['guardrailPolicyName'] -cne 'SpottoGuardrails' -or
+            $guardrails -isnot [System.Collections.IDictionary] -or -not $guardrails.Contains('Statement') -or
+            $guardrails.Statement -isnot [array] -or $guardrails.Statement.Count -eq 0) {
+            throw 'Spotto guardrails require the documented name and a nonempty Statement array.'
+        }
+        if (-not $bundle.ContainsKey('managedPolicies') -or $bundle.managedPolicies -isnot [array]) { throw 'Managed policies must be an array.' }
         foreach ($policy in $bundle.managedPolicies) {
             if ($policy.arn -cnotin @('arn:aws:iam::aws:policy/SecurityAudit', 'arn:aws:iam::aws:policy/ReadOnlyAccess')) {
                 throw 'Unexpected managed policy in setup package.'
             }
         }
-        if ($bundle.ContainsKey('billingAccessPolicy') -and $bundle.billingAccessPolicyName -cne 'SpottoBillingExportRead') { throw 'Invalid billing policy name.' }
-        if ($bundle.ContainsKey('commitmentsAccessPolicy') -and $bundle.commitmentsAccessPolicyName -cne 'SpottoCommitmentsPlanning') { throw 'Invalid commitments policy name.' }
+        foreach ($optional in @(
+            @{ Field = 'billingAccessPolicy'; Name = 'SpottoBillingExportRead'; Selected = @($bundle.rolePurposes | Where-Object { $_ -cin @('billing-definition', 'billing-storage') }).Count -gt 0 },
+            @{ Field = 'commitmentsAccessPolicy'; Name = 'SpottoCommitmentsPlanning'; Selected = 'commitments-planning' -cin $bundle.rolePurposes }
+        )) {
+            $present = $bundle.ContainsKey($optional.Field)
+            if ($present -ne $optional.Selected) { throw 'Selected role purposes must match the generated optional inline policies.' }
+            if ($present) {
+                $document = $bundle[$optional.Field]
+                if ($bundle[$optional.Field + 'Name'] -cne $optional.Name -or
+                    $document -isnot [System.Collections.IDictionary] -or -not $document.Contains('Statement') -or
+                    $document.Statement -isnot [array] -or $document.Statement.Count -eq 0) {
+                    throw 'Optional inline policies require their documented name and a nonempty Statement array.'
+                }
+            }
+        }
     }
     return $package
 }
@@ -214,6 +238,23 @@ function Get-SpottoInlinePolicies {
     if ($Bundle.ContainsKey('billingAccessPolicy')) { $policies['SpottoBillingExportRead'] = $Bundle.billingAccessPolicy }
     if ($Bundle.ContainsKey('commitmentsAccessPolicy')) { $policies['SpottoCommitmentsPlanning'] = $Bundle.commitmentsAccessPolicy }
     return $policies
+}
+
+function Assert-SpottoTrustExternalId {
+    param($Value, [string]$ExternalId)
+    if ($Value -is [System.Collections.IDictionary]) {
+        foreach ($key in $Value.Keys) {
+            if ($key -ieq 'sts:ExternalId') {
+                foreach ($candidate in @($Value[$key])) {
+                    if ($candidate -isnot [string] -or $candidate -cne $ExternalId) {
+                        throw 'Existing role trust uses another External ID. Review its company binding before changing access.'
+                    }
+                }
+            } else { Assert-SpottoTrustExternalId $Value[$key] $ExternalId }
+        }
+    } elseif ($Value -is [array]) {
+        foreach ($item in $Value) { Assert-SpottoTrustExternalId $item $ExternalId }
+    }
 }
 
 function Get-SpottoAwsRoleState {
@@ -228,7 +269,7 @@ function Get-SpottoAwsRoleState {
         $steps.Add(@{ Action = 'create-role'; Text = 'Create SpottoReadOnlyRole with the Spotto trust policy and ownership tags' })
         foreach ($name in $policies.Keys) { $steps.Add(@{ Action = 'put-policy'; Name = $name; Text = "Add inline policy $name" }) }
         foreach ($policy in $bundle.managedPolicies) { $steps.Add(@{ Action = 'attach'; Name = $policy.arn; Text = "Attach AWS managed policy $($policy.arn)" }) }
-        return @{ Exists = $false; Matches = $false; Owned = $false; OtherManager = $null; Steps = $steps.ToArray(); Boundary = $null }
+        return @{ Exists = $false; Matches = $false; Owned = $false; OtherManager = $null; Steps = $steps.ToArray(); Boundary = $null; LegacyAttachments = @() }
     }
     if ($existing.Role.Arn -cne $Role.roleArn) { throw 'Existing role ARN does not match the expected account and role path.' }
     if ($existing.Role.RoleId -isnot [string] -or $existing.Role.RoleId -notmatch '^\w{16,128}$') {
@@ -236,21 +277,15 @@ function Get-SpottoAwsRoleState {
     }
     $tags = @{}
     if ($existing.Role.ContainsKey('Tags')) { foreach ($tag in $existing.Role.Tags) { $tags[$tag.Key] = $tag.Value } }
-    if (@($tags.Keys | Where-Object { $_ -like 'aws:cloudformation:*' }).Count) {
-        throw 'This role is managed by CloudFormation. Update its owning stack with the portal template.'
-    }
+    $cloudFormation = @($tags.Keys | Where-Object { $_ -like 'aws:cloudformation:*' }).Count -gt 0
     if ($tags.ContainsKey('SpottoCompanyId') -and $tags.SpottoCompanyId -cne $CompanyId) { throw 'This role belongs to another Spotto company.' }
-    $owned = $tags.ContainsKey('SpottoCompanyId') -and $tags.SpottoCompanyId -ceq $CompanyId -and
+    $owned = -not $cloudFormation -and $tags.ContainsKey('SpottoCompanyId') -and $tags.SpottoCompanyId -ceq $CompanyId -and
         $tags.ContainsKey('SpottoManagedBy') -and $tags.SpottoManagedBy -ceq 'Setup-SpottoAws'
     $boundary = if ($existing.Role.ContainsKey('PermissionsBoundary') -and $existing.Role.PermissionsBoundary -is [System.Collections.IDictionary]) {
         $existing.Role.PermissionsBoundary['PermissionsBoundaryArn']
     } else { $null }
-    foreach ($statement in $existing.Role.AssumeRolePolicyDocument.Statement) {
-        if ($statement.ContainsKey('Condition') -and $statement.Condition.ContainsKey('StringEquals') -and
-            $statement.Condition.StringEquals.ContainsKey('sts:ExternalId') -and
-            $statement.Condition.StringEquals['sts:ExternalId'] -cne $Role.setup.externalId) {
-            throw 'Existing role trust uses another External ID. Review its company binding before changing access.'
-        }
+    foreach ($statement in @($existing.Role.AssumeRolePolicyDocument.Statement)) {
+        if ($statement.ContainsKey('Condition')) { Assert-SpottoTrustExternalId $statement.Condition $Role.setup.externalId }
     }
     $trustMatches = (ConvertTo-SpottoCanonicalJson $existing.Role.AssumeRolePolicyDocument) -ceq (ConvertTo-SpottoCanonicalJson $bundle.trustPolicy)
     # Only the three documented Spotto inline policy names are managed by this wizard.
@@ -276,6 +311,10 @@ function Get-SpottoAwsRoleState {
     }
     if (-not $owned) { $steps.Add(@{ Action = 'tag'; Text = 'Add SpottoCompanyId and SpottoManagedBy ownership tags' }) }
     $attached = Invoke-SpottoAwsCli @('iam', 'list-attached-role-policies', '--role-name', 'SpottoReadOnlyRole') $Profile $Region
+    $desiredAttachments = @($bundle.managedPolicies | ForEach-Object { $_.arn })
+    $legacyAttachments = @($attached.AttachedPolicies | ForEach-Object { $_.PolicyArn } | Where-Object {
+        $_ -cin @('arn:aws:iam::aws:policy/ReadOnlyAccess', 'arn:aws:iam::aws:policy/SecurityAudit') -and $_ -cnotin $desiredAttachments
+    })
     foreach ($policy in $bundle.managedPolicies) {
         if ($policy.arn -cnotin @($attached.AttachedPolicies | ForEach-Object { $_.PolicyArn })) {
             $steps.Add(@{ Action = 'attach'; Name = $policy.arn; Text = "Attach AWS managed policy $($policy.arn)" })
@@ -285,12 +324,13 @@ function Get-SpottoAwsRoleState {
     $matches = @($steps | Where-Object { $_.Action -ne 'tag' }).Count -eq 0
     $approvalProof = ConvertTo-SpottoCanonicalJson @{
         RoleId = $existing.Role.RoleId; CompanyId = $tags['SpottoCompanyId']; ManagedBy = $tags['SpottoManagedBy']
-        Trust = $existing.Role.AssumeRolePolicyDocument; Plan = @($steps | ForEach-Object { $_.Text })
+        CloudFormation = $cloudFormation; Trust = $existing.Role.AssumeRolePolicyDocument; Plan = @($steps | ForEach-Object { $_.Text })
     }
     # Another tool (for example terraform-aws-spotto) that tags its roles remains their only writer.
-    $otherManager = if ($tags.ContainsKey('SpottoManagedBy') -and $tags.SpottoManagedBy -cne 'Setup-SpottoAws') { $tags.SpottoManagedBy } else { $null }
+    $otherManager = if ($cloudFormation) { 'CloudFormation' }
+        elseif ($tags.ContainsKey('SpottoManagedBy') -and $tags.SpottoManagedBy -cne 'Setup-SpottoAws') { $tags.SpottoManagedBy } else { $null }
     return @{ Exists = $true; Matches = $matches; Owned = $owned; OtherManager = $otherManager; TrustMatches = $trustMatches; ApprovalProof = $approvalProof
-        Steps = $steps.ToArray(); Boundary = $boundary }
+        Steps = $steps.ToArray(); Boundary = $boundary; LegacyAttachments = $legacyAttachments }
 }
 
 function Format-SpottoAwsPlan {
@@ -305,6 +345,9 @@ function Set-SpottoAwsRole {
     $identity = Invoke-SpottoAwsCli @('sts', 'get-caller-identity') $Profile $Region
     if ($identity.Account -cne $Role.accountId) { throw 'AWS session changed after inspection. Review the target profile and rerun.' }
     $freshState = Get-SpottoAwsRoleState $Role $CompanyId $Profile $Region
+    if ($null -ne $freshState.OtherManager) {
+        throw 'The role is managed by another tool. Apply changes with its owning tool; approved adoption cannot override ownership.'
+    }
     if ($State.Exists -ne $freshState.Exists -or
         ($State.Exists -and $State.ApprovalProof -cne $freshState.ApprovalProof)) {
         throw 'The IAM role changed after inspection. Review its ownership, trust and policies, then rerun before applying changes.'
@@ -377,14 +420,20 @@ if ($ProfileMapPath) {
     $profiles = ConvertFrom-Json ([IO.File]::ReadAllText((Resolve-Path -LiteralPath $ProfileMapPath).Path)) -AsHashtable
     if ($profiles -isnot [hashtable]) { throw 'Profile map must be a JSON object mapping account IDs to profile names.' }
     foreach ($key in $profiles.Keys) {
-        if ($key -notmatch '^\d{12}$' -or $profiles[$key] -isnot [string] -or $profiles[$key].Length -gt 256) { throw 'Invalid profile map entry.' }
+        if ($key -notmatch '^\d{12}$' -or $profiles[$key] -isnot [string] -or $profiles[$key].Length -gt 256 -or
+            $profiles[$key] -match '[\x00-\x1f\x7f]') { throw 'Invalid profile map entry.' }
     }
 }
 Write-Host "Spotto AWS setup — company $($package.companyId), $($package.roles.Count) account(s)" -ForegroundColor Cyan
-Write-Host 'Review the setup package policies before continuing. Discovery uses AWS SecurityAudit and ReadOnlyAccess.'
+Write-Host 'Review the setup package policies before continuing. Discovery permissions and guardrails come from its generated policies.'
 Write-Host 'Spotto guardrails block secret values and S3 object reads outside configured billing exports.'
 if (@($package.roles | Where-Object { $_.setup.onboardingBundle.ContainsKey('commitmentsAccessPolicy') }).Count) {
     Write-Host 'Selected commitments planning includes starting a Savings Plans recommendation calculation; it does not purchase commitments.'
+}
+# Unattended configuration requires an explicit suppression of ShouldProcess confirmation.
+if ($NonInteractive -and -not $WhatIfPreference -and
+    (-not $PSBoundParameters.ContainsKey('Confirm') -or [bool]$PSBoundParameters['Confirm'])) {
+    $CheckOnly = $true
 }
 if (-not $NonInteractive -and -not $CheckOnly -and -not $WhatIfPreference) {
     $choice = Read-Host 'Mode: 1 = check prerequisites/configuration, 2 = configure access (default 1)'
@@ -414,19 +463,24 @@ foreach ($role in $package.roles) {
         if ($state.Boundary) {
             Write-Warning "Account $($role.accountId): SpottoReadOnlyRole has permissions boundary $($state.Boundary). It can deny Spotto reads even when these policies are correct; review it before onboarding."
         }
+        if ($state.LegacyAttachments.Count) {
+            Write-Warning "Account $($role.accountId): $($state.LegacyAttachments -join ', ') remain attached although absent from the setup package. They can grant broader access than the generated policies. Validate replacement access in Spotto before removing them with the owning tool; this script has not detached them."
+        }
         if ($accessSteps.Count) { Write-Host "Account $($role.accountId): IAM changes required:$([Environment]::NewLine)$(Format-SpottoAwsPlan $accessSteps)" }
-        if ($state.OtherManager) {
-            Write-Host "Account $($role.accountId): existing role is managed by $($state.OtherManager). This wizard only verifies it; apply any changes there."
+        $hasOtherManager = $null -ne $state.OtherManager
+        $managerLabel = if ($hasOtherManager -and $state.OtherManager -ceq '') { 'another tool (empty SpottoManagedBy tag)' } else { $state.OtherManager }
+        if ($hasOtherManager) {
+            Write-Host "Account $($role.accountId): existing role is managed by $managerLabel. This wizard only verifies it; apply any changes there."
         } elseif ($unowned) {
             Write-Host "Account $($role.accountId): existing role is not tagged as managed by Setup-SpottoAws. Changes require -RepairExistingRole, which also adds ownership tags. If Terraform, CDK, StackSets or Control Tower customizations manage this role, apply the changes there instead; their next deployment would revert this wizard."
         }
         if ($CheckOnly) {
             $status = if ($state.Matches) { 'configuration-matches' } else { 'changes-required' }
-        } elseif ($state.Matches -and ($state.Owned -or $state.OtherManager -or -not $RepairExistingRole)) {
+        } elseif ($state.Matches -and ($state.Owned -or $hasOtherManager -or -not $RepairExistingRole)) {
             # Nothing affecting Spotto access differs, so a matching role needs no writes or adoption.
             $status = 'configured'
-        } elseif ($state.OtherManager) {
-            throw "This role is managed by $($state.OtherManager). Apply the changes listed above there; -RepairExistingRole cannot adopt it."
+        } elseif ($hasOtherManager) {
+            throw "This role is managed by $managerLabel. Apply the changes listed above there; -RepairExistingRole cannot adopt it."
         } elseif ($unowned -and -not $RepairExistingRole) {
             throw 'Existing role is not owned by this script. Review the changes above, then rerun with -RepairExistingRole to explicitly adopt it.'
         } else {
@@ -445,6 +499,6 @@ foreach ($role in $package.roles) {
 }
 Write-SpottoAwsResult $package $results $OutputPath
 Write-Host "Results saved to $OutputPath" -ForegroundColor Cyan
-Write-Host 'Paste the complete JSON into Setup results JSON in Spotto and select Read setup results. Then use Create/Update for live role, billing and resource validation.'
+Write-Host 'Paste the complete JSON into Setup Results JSON in Spotto and select Read Setup Results. Then use Create/Update for live role, billing and resource validation.'
 Write-Host 'This script has not tested access from the Spotto principal. SCPs, boundaries, bucket policies and KMS policies can still block access.'
 if (@($results | Where-Object { $_.status -eq 'failed' }).Count) { exit 1 }
