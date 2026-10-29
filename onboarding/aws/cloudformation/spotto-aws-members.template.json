@@ -1,0 +1,113 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Deploys the read-only IAM role to member accounts with a service-managed StackSet.",
+  "Metadata": {
+    "GeneratedBy": "api/scripts/aws/generate-connect-templates.ts",
+    "TemplateVersion": "2026-10-30.1",
+    "DiscoveryPolicyVersion": "2026-10-24.1"
+  },
+  "Parameters": {
+    "ExternalId": {
+      "Type": "String",
+      "AllowedPattern": "^spotto-[0-9a-f-]{36}$",
+      "ConstraintDescription": "Use the External ID shown in the portal.",
+      "Description": "External ID shown in the portal. The role can only be assumed with this value."
+    },
+    "TrustedPrincipalArn": {
+      "Type": "String",
+      "AllowedPattern": "^arn:aws:iam::(\\d{12}):(user|role)\\/[A-Za-z0-9+=,.@_/-]{1,512}$",
+      "ConstraintDescription": "Use the trusted principal ARN shown in the portal.",
+      "Description": "IAM user or role ARN, shown in the portal, that is allowed to assume the role."
+    },
+    "OrganizationalUnitIds": {
+      "Type": "CommaDelimitedList",
+      "Description": "Organization root (r-...) or organizational unit (ou-...) IDs whose accounts get the role."
+    },
+    "RoleName": {
+      "Type": "String",
+      "AllowedPattern": "^[A-Za-z0-9+=,.@_-]{1,64}$",
+      "Description": "Name of the read-only IAM role."
+    },
+    "RepairToken": {
+      "Type": "String",
+      "Default": "",
+      "AllowedPattern": "^[0-9]{0,14}$",
+      "ConstraintDescription": "Use up to 14 digits, for example the current time in epoch seconds.",
+      "Description": "Leave empty. Change it (for example to the current epoch seconds) to re-apply the role trust and policies."
+    }
+  },
+  "Resources": {
+    "MemberRoleStackSet": {
+      "Type": "AWS::CloudFormation::StackSet",
+      "Properties": {
+        "StackSetName": {
+          "Ref": "AWS::StackName"
+        },
+        "Description": "Read-only IAM role for cost, inventory and security analysis in member accounts.",
+        "PermissionModel": "SERVICE_MANAGED",
+        "AutoDeployment": {
+          "Enabled": true,
+          "RetainStacksOnAccountRemoval": false
+        },
+        "Capabilities": [
+          "CAPABILITY_NAMED_IAM"
+        ],
+        "CallAs": "SELF",
+        "TemplateURL": "https://spotto-aws-onboarding.s3.amazonaws.com/cloudformation/v2026-10-30.1/spotto-aws-member-role.template.json",
+        "OperationPreferences": {
+          "FailureTolerancePercentage": 100,
+          "MaxConcurrentPercentage": 100,
+          "RegionConcurrencyType": "PARALLEL"
+        },
+        "Parameters": [
+          {
+            "ParameterKey": "ExternalId",
+            "ParameterValue": {
+              "Ref": "ExternalId"
+            }
+          },
+          {
+            "ParameterKey": "TrustedPrincipalArn",
+            "ParameterValue": {
+              "Ref": "TrustedPrincipalArn"
+            }
+          },
+          {
+            "ParameterKey": "RoleName",
+            "ParameterValue": {
+              "Ref": "RoleName"
+            }
+          },
+          {
+            "ParameterKey": "RepairToken",
+            "ParameterValue": {
+              "Ref": "RepairToken"
+            }
+          }
+        ],
+        "StackInstancesGroup": [
+          {
+            "DeploymentTargets": {
+              "OrganizationalUnitIds": {
+                "Ref": "OrganizationalUnitIds"
+              }
+            },
+            "Regions": [
+              {
+                "Ref": "AWS::Region"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "Outputs": {
+    "StackSetId": {
+      "Description": "ID of the member role StackSet.",
+      "Value": {
+        "Ref": "MemberRoleStackSet"
+      }
+    }
+  }
+}

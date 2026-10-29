@@ -1,0 +1,309 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Read-only IAM role for cost, inventory and security analysis in a member account.",
+  "Metadata": {
+    "GeneratedBy": "api/scripts/aws/generate-connect-templates.ts",
+    "TemplateVersion": "2026-10-30.1",
+    "DiscoveryPolicyVersion": "2026-10-24.1"
+  },
+  "Parameters": {
+    "ExternalId": {
+      "Type": "String",
+      "AllowedPattern": "^spotto-[0-9a-f-]{36}$",
+      "ConstraintDescription": "Use the External ID shown in the portal.",
+      "Description": "External ID shown in the portal. The role can only be assumed with this value."
+    },
+    "TrustedPrincipalArn": {
+      "Type": "String",
+      "AllowedPattern": "^arn:aws:iam::(\\d{12}):(user|role)\\/[A-Za-z0-9+=,.@_/-]{1,512}$",
+      "ConstraintDescription": "Use the trusted principal ARN shown in the portal.",
+      "Description": "IAM user or role ARN, shown in the portal, that is allowed to assume the role."
+    },
+    "RoleName": {
+      "Type": "String",
+      "AllowedPattern": "^[A-Za-z0-9+=,.@_-]{1,64}$",
+      "Description": "Name of the read-only IAM role."
+    },
+    "RepairToken": {
+      "Type": "String",
+      "Default": "",
+      "AllowedPattern": "^[0-9]{0,14}$",
+      "ConstraintDescription": "Use up to 14 digits, for example the current time in epoch seconds.",
+      "Description": "Leave empty. Change it (for example to the current epoch seconds) to re-apply the role trust and policies."
+    }
+  },
+  "Resources": {
+    "Role": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {
+          "Ref": "RoleName"
+        },
+        "Description": "Read-only access for cost, inventory and security analysis.",
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": {
+                "Fn::Sub": "AllowSpottoCloudEngineAccessV202610301${RepairToken}"
+              },
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": {
+                  "Ref": "TrustedPrincipalArn"
+                }
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "sts:ExternalId": {
+                    "Ref": "ExternalId"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "MaxSessionDuration": 14400,
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/job-function/ViewOnlyAccess",
+          "arn:aws:iam::aws:policy/SecurityAudit",
+          {
+            "Ref": "FrameworkAssessmentReadPolicy1"
+          }
+        ],
+        "Policies": [
+          {
+            "PolicyName": "SpottoReadOnlyAccess",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": {
+                    "Fn::Sub": "ReadSpottoMetadataV202610301${RepairToken}"
+                  },
+                  "Effect": "Allow",
+                  "Action": [
+                    "bcm-data-exports:GetExport",
+                    "bcm-data-exports:ListExports",
+                    "ce:GetAnomalies",
+                    "ce:GetAnomalyMonitors",
+                    "ce:GetAnomalySubscriptions",
+                    "ce:GetCostAndUsage",
+                    "ce:GetCostForecast",
+                    "ce:GetDimensionValues",
+                    "ce:GetReservationCoverage",
+                    "ce:GetReservationPurchaseRecommendation",
+                    "ce:GetReservationUtilization",
+                    "ce:GetSavingsPlansCoverage",
+                    "ce:GetSavingsPlansPurchaseRecommendation",
+                    "ce:GetSavingsPlansUtilization",
+                    "ce:ListSavingsPlansPurchaseRecommendationGeneration",
+                    "ce:StartSavingsPlansPurchaseRecommendationGeneration",
+                    "compute-optimizer:Get*",
+                    "identitystore:DescribeGroup",
+                    "identitystore:DescribeUser",
+                    "lambda:GetAlias",
+                    "resiliencehub:Describe*",
+                    "resiliencehub:List*",
+                    "resource-explorer-2:Search",
+                    "savingsplans:Describe*",
+                    "trustedadvisor:List*",
+                    "wellarchitected:Get*",
+                    "wellarchitected:List*"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Sid": {
+                    "Fn::Sub": "DenyDataAndSecretReadsV202610301${RepairToken}"
+                  },
+                  "Effect": "Deny",
+                  "Action": [
+                    "apigateway:GET",
+                    "bedrock:GetPrompt",
+                    "cloudfront:GetDistributionConfig",
+                    "cloudfront:ListDistributions",
+                    "cognito-idp:DescribeUserPoolClient",
+                    "directconnect:DescribeVirtualInterfaces",
+                    "ec2:DescribeVpnConnections",
+                    "glue:GetConnections",
+                    "ssm:GetDocument",
+                    "ssm:GetParameter",
+                    "ssm:GetParameters",
+                    "ssm:GetParameterHistory",
+                    "ssm:GetParametersByPath",
+                    "secretsmanager:GetSecretValue",
+                    "secretsmanager:BatchGetSecretValue",
+                    "ec2:GetPasswordData",
+                    "ec2:GetConsoleOutput",
+                    "ec2:GetConsoleScreenshot",
+                    "autoscaling:DescribeLaunchConfigurations",
+                    "rds:DownloadDBLogFilePortion",
+                    "rds:DownloadCompleteDBLogFile",
+                    "codepipeline:GetJobDetails",
+                    "codepipeline:GetThirdPartyJobDetails",
+                    "datapipeline:QueryObjects",
+                    "datapipeline:DescribeObjects",
+                    "datapipeline:EvaluateExpression",
+                    "s3vectors:GetVectors",
+                    "s3vectors:ListVectors",
+                    "s3vectors:QueryVectors",
+                    "xray:GetTraceSummaries",
+                    "xray:BatchGetTraces",
+                    "security-ir:GetCaseAttachmentDownloadUrl",
+                    "cleanrooms:GetProtectedQuery",
+                    "cleanrooms:PreviewPrivacyImpact",
+                    "qbusiness:ListDocuments",
+                    "bedrock:GetKnowledgeBaseDocuments",
+                    "bedrock-mantle:CallWithBearerToken",
+                    "redshift:ViewQueriesInConsole",
+                    "ssm:GetAutomationExecution",
+                    "account:GetPrimaryEmail",
+                    "account:GetAlternateContact",
+                    "account:GetContactInformation",
+                    "cognito-idp:ListUsers",
+                    "cognito-idp:ListUsersInGroup",
+                    "cloudformation:GetTemplate",
+                    "lambda:GetFunction",
+                    "cleanrooms:GetAnalysisTemplate",
+                    "cleanrooms:GetCollaborationAnalysisTemplate",
+                    "cleanrooms:BatchGetCollaborationAnalysisTemplate",
+                    "logs:DescribeQueries",
+                    "logs:DescribeQueryDefinitions",
+                    "quicksight:DescribeDataSet",
+                    "quicksight:DescribeAnalysis",
+                    "quicksight:DescribeDashboard",
+                    "quicksight:DescribeTemplate",
+                    "quicksight:DescribeAssetBundleExportJob",
+                    "quicksight:DescribeDashboardSnapshotJobResult",
+                    "appsync:ListResolvers",
+                    "appsync:ListResolversByFunction",
+                    "appsync:ListFunctions",
+                    "appsync:GetChannelNamespace",
+                    "appsync:ListChannelNamespaces",
+                    "cloudfront:GetFunction",
+                    "sagemaker:DescribeNotebookInstanceLifecycleConfig",
+                    "sagemaker:DescribeStudioLifecycleConfig",
+                    "sagemaker:DescribeHumanTaskUi",
+                    "sagemaker:DescribeModelCard",
+                    "ssm:ListCommands",
+                    "ssm:DescribeAutomationExecutions",
+                    "ssm:DescribeAutomationStepExecutions",
+                    "codecommit:ListFileCommitHistory",
+                    "bedrock:GetAgent",
+                    "bedrock:GetAgentVersion",
+                    "bedrock:GetAgentCollaborator",
+                    "bedrock:GetFlow",
+                    "bedrock:GetFlowVersion",
+                    "bedrock:GetExecutionFlowSnapshot",
+                    "bedrock-agentcore:GetEvaluator",
+                    "bedrock-agentcore:GetHarness",
+                    "bedrock-agentcore:GetMemory",
+                    "bedrock-agentcore:GetRegistryRecord",
+                    "bedrock-agentcore:GetConfigurationBundle",
+                    "bedrock-agentcore:GetConfigurationBundleVersion",
+                    "qapps:GetQApp",
+                    "lex:GetUtterancesView",
+                    "chime:ListChannelMessages",
+                    "chime:ListAttendees",
+                    "connect:ListRealtimeContactAnalysisSegments",
+                    "connect:ListRealtimeContactAnalysisSegmentsV2",
+                    "connect:ListContactReferences",
+                    "connect:ListDataTableValues",
+                    "connect:ListDataTablePrimaryValues",
+                    "security-ir:GetCase",
+                    "security-ir:ListCaseEdits",
+                    "security-ir:ListComments",
+                    "mobiletargeting:GetCampaigns",
+                    "mechanicalturk:ListHITs",
+                    "cognito-sync:ListRecords",
+                    "rekognition:ListDatasetEntries",
+                    "devicefarm:ListArtifacts",
+                    "devicefarm:ListTestGridSessionArtifacts",
+                    "appsync:ListApiKeys",
+                    "cognito-idp:DescribeIdentityProvider",
+                    "cloudfront:GetDistribution",
+                    "cloudfront:ListDistributionsByWebACLId",
+                    "cloudfront:ListDistributionsByRealtimeLogConfig",
+                    "cloudfront:ListDistributionsByAnycastIpListId",
+                    "cloudfront:ListDistributionsByConnectionMode"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "SpottoManagedBy",
+            "Value": "CloudFormation"
+          }
+        ]
+      }
+    },
+    "FrameworkAssessmentReadPolicy1": {
+      "Type": "AWS::IAM::ManagedPolicy",
+      "Properties": {
+        "Description": "Read-only actions used by security framework assessments.",
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": {
+                "Fn::Sub": "ReadSpottoFrameworkAssessmentMetadata1V202610301${RepairToken}"
+              },
+              "Effect": "Allow",
+              "Action": [
+                "appstream:DescribeFleets",
+                "appstream:ListTagsForResource",
+                "codeartifact:ListPackageVersions",
+                "codeartifact:ListTagsForResource",
+                "codebuild:BatchGetBuilds",
+                "codebuild:BatchGetReportGroups",
+                "codebuild:ListReportGroups",
+                "cognito-idp:GetUserPoolMfaConfig",
+                "ds:DescribeEventTopics",
+                "ds:GetSnapshotLimits",
+                "ds:ListCertificates",
+                "ds:ListLogSubscriptions",
+                "ds:ListTagsForResource",
+                "glue:GetMLTransforms",
+                "glue:SearchTables",
+                "inspector2:BatchGetFindingDetails",
+                "lightsail:GetRelationalDatabases",
+                "macie2:GetAutomatedDiscoveryConfiguration",
+                "macie2:GetMacieSession",
+                "servicecatalog:DescribePortfolio",
+                "servicecatalog:DescribePortfolioShares",
+                "ssm-incidents:GetReplicationSet",
+                "ssm-incidents:ListReplicationSets",
+                "ssm-incidents:ListResponsePlans",
+                "ssm-incidents:ListTagsForResource",
+                "storagegateway:DescribeSMBFileShares",
+                "waf-regional:GetLoggingConfiguration",
+                "waf-regional:GetRule",
+                "waf:GetLoggingConfiguration",
+                "waf:GetRule",
+                "wellarchitected:ListTagsForResource"
+              ],
+              "Resource": "*"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "RoleArn": {
+      "Description": "ARN of the read-only IAM role.",
+      "Value": {
+        "Fn::GetAtt": [
+          "Role",
+          "Arn"
+        ]
+      }
+    }
+  }
+}

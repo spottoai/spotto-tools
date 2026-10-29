@@ -1,0 +1,189 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Grants the read-only IAM role access to an existing billing data export.",
+  "Metadata": {
+    "GeneratedBy": "api/scripts/aws/generate-connect-templates.ts",
+    "TemplateVersion": "2026-10-30.1",
+    "DiscoveryPolicyVersion": "2026-10-24.1"
+  },
+  "Parameters": {
+    "RoleName": {
+      "Type": "String",
+      "AllowedPattern": "^[A-Za-z0-9+=,.@_-]{1,64}$",
+      "Description": "Name of the existing read-only IAM role."
+    },
+    "ExportName": {
+      "Type": "String",
+      "AllowedPattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$",
+      "Description": "Name of the existing data export."
+    },
+    "BucketName": {
+      "Type": "String",
+      "AllowedPattern": "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$",
+      "Description": "S3 bucket the export delivers to. It must be in this account."
+    },
+    "BasePrefix": {
+      "Type": "String",
+      "Default": "",
+      "AllowedPattern": "^(|[A-Za-z0-9!_'()=-][A-Za-z0-9!_.'()=-]*(/[A-Za-z0-9!_'()=-][A-Za-z0-9!_.'()=-]*)*)$",
+      "ConstraintDescription": "Use the S3 path prefix without leading or trailing slashes or wildcards.",
+      "Description": "S3 path prefix of the export, without leading or trailing slashes. Leave empty when the export writes to the bucket root."
+    },
+    "KmsKeyArn": {
+      "Type": "String",
+      "Default": "",
+      "AllowedPattern": "^$|^arn:aws:kms:[a-z0-9-]+:\\d{12}:key/[A-Za-z0-9-]{1,256}$",
+      "Description": "KMS key ARN when the bucket uses SSE-KMS. Leave empty for SSE-S3."
+    },
+    "RepairToken": {
+      "Type": "String",
+      "Default": "",
+      "AllowedPattern": "^[0-9]{0,14}$",
+      "ConstraintDescription": "Use up to 14 digits, for example the current time in epoch seconds.",
+      "Description": "Leave empty. Change it (for example to the current epoch seconds) to re-apply the role trust and policies."
+    }
+  },
+  "Conditions": {
+    "HasBasePrefix": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "BasePrefix"
+            },
+            ""
+          ]
+        }
+      ]
+    },
+    "HasKmsKey": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "KmsKeyArn"
+            },
+            ""
+          ]
+        }
+      ]
+    }
+  },
+  "Resources": {
+    "BillingExportRead": {
+      "Type": "AWS::IAM::RolePolicy",
+      "Properties": {
+        "RoleName": {
+          "Ref": "RoleName"
+        },
+        "PolicyName": "SpottoExistingBillingExportRead",
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": {
+                "Fn::Sub": "ReadBucketLocationV202610301${RepairToken}"
+              },
+              "Effect": "Allow",
+              "Action": "s3:GetBucketLocation",
+              "Resource": {
+                "Fn::Sub": "arn:aws:s3:::${BucketName}"
+              }
+            },
+            {
+              "Sid": {
+                "Fn::Sub": "ListDeliveryRootV202610301${RepairToken}"
+              },
+              "Effect": "Allow",
+              "Action": "s3:ListBucket",
+              "Resource": {
+                "Fn::Sub": "arn:aws:s3:::${BucketName}"
+              },
+              "Condition": {
+                "StringLike": {
+                  "s3:prefix": [
+                    {
+                      "Fn::If": [
+                        "HasBasePrefix",
+                        {
+                          "Fn::Sub": "${BasePrefix}/${ExportName}"
+                        },
+                        {
+                          "Ref": "ExportName"
+                        }
+                      ]
+                    },
+                    {
+                      "Fn::Sub": [
+                        "${DeliveryRoot}/*",
+                        {
+                          "DeliveryRoot": {
+                            "Fn::If": [
+                              "HasBasePrefix",
+                              {
+                                "Fn::Sub": "${BasePrefix}/${ExportName}"
+                              },
+                              {
+                                "Ref": "ExportName"
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "Sid": {
+                "Fn::Sub": "ReadDeliveryObjectsV202610301${RepairToken}"
+              },
+              "Effect": "Allow",
+              "Action": "s3:GetObject",
+              "Resource": {
+                "Fn::Sub": [
+                  "arn:aws:s3:::${BucketName}/${DeliveryRoot}/*",
+                  {
+                    "DeliveryRoot": {
+                      "Fn::If": [
+                        "HasBasePrefix",
+                        {
+                          "Fn::Sub": "${BasePrefix}/${ExportName}"
+                        },
+                        {
+                          "Ref": "ExportName"
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "Fn::If": [
+                "HasKmsKey",
+                {
+                  "Sid": {
+                    "Fn::Sub": "DecryptBillingObjectsV202610301${RepairToken}"
+                  },
+                  "Effect": "Allow",
+                  "Action": [
+                    "kms:Decrypt",
+                    "kms:DescribeKey"
+                  ],
+                  "Resource": {
+                    "Ref": "KmsKeyArn"
+                  }
+                },
+                {
+                  "Ref": "AWS::NoValue"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

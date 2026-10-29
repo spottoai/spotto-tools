@@ -1,12 +1,10 @@
 # Spotto Tools
 
-For AWS, use the [Bash or PowerShell onboarding scripts](./onboarding/aws/README.md).
-Download the company setup package from the Spotto AWS configuration page, run
-the wizard with your authorized AWS profiles, then read its results in Spotto.
-It supports resource access, existing billing exports, and optional commitments
-planning across standalone accounts or manually configured organizations. To manage
-the role with Terraform, use [terraform-aws-spotto](https://github.com/spottoai/terraform-aws-spotto)
-with the same setup package.
+For AWS, use **Launch Stack in AWS** in the portal, or run the
+[AWS connect script](./onboarding/aws/README.md) in AWS CloudShell. It detects the
+organization, accounts and billing exports from your session and deploys the same
+CloudFormation templates. To manage the role with Terraform, use
+[terraform-aws-spotto](https://github.com/spottoai/terraform-aws-spotto).
 
 Use the Azure onboarding wizard to connect your Azure environment to Spotto. It can assess prerequisites without changing Azure by default, or create and repair the Spotto service principal and permissions through a guided PowerShell workflow. Recommended and Custom setup both offer optional billing exports.
 
