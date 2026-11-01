@@ -26,8 +26,8 @@ Any template change must bump `TemplateVersion` (it signs in with GitHub OIDC as
 Publish all five templates before releasing the dependent API/UI/scripts/module.
 The shared S3 publisher has no runtime customer authority. Provision regional SNS
 with IaC, deploy the owning API and confirm subscriptions before customer launch.
-API and AWS engine must use distinct runtime principals per deployment; verify that
-credentials match each boundary's advertised trust. Public scripts never receive
+API and AWS engine use one runtime principal per environment (production shared,
+development separate); verify that credentials match each deployment's advertised trust. Public scripts never receive
 Spotto's source credentials. CloudFormation access/storage stacks are regional;
 only the definition-only billing stack runs in us-east-1, with billing files delivered to the selected deployment region.
 The publisher rejects backward latest promotion and uses pinned official Actions.

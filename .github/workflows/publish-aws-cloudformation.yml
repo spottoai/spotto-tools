@@ -1,0 +1,66 @@
+name: Publish AWS CloudFormation Templates
+
+# Publishes the generated connect templates to the public onboarding bucket twice:
+#   cloudformation/<file>                    latest, used by Launch Stack and the connect scripts
+#   cloudformation/v<TemplateVersion>/<file> immutable, used by updates, the StackSet and Terraform pins
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'onboarding/aws/cloudformation/**'
+      - '.github/scripts/publish-versioned-templates*.sh'
+      - '.github/workflows/publish-aws-cloudformation.yml'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: publish-aws-cloudformation
+  cancel-in-progress: false
+
+env:
+  BUCKET: spotto-aws-onboarding
+  TEMPLATES: onboarding/aws/cloudformation
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    if: ${{ github.ref == 'refs/heads/main' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Read template version
+        id: version
+        run: |
+          version="$(jq -r '.Metadata.TemplateVersion // empty' "$TEMPLATES/spotto-aws-connect.template.json")"
+          if ! [[ "$version" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\.[0-9]+$ ]]; then
+            echo "::error::spotto-aws-connect.template.json has no valid Metadata.TemplateVersion (found '$version')."
+            exit 1
+          fi
+          for file in "$TEMPLATES"/*.json; do
+            other="$(jq -r '.Metadata.TemplateVersion // empty' "$file")"
+            if [ "$other" != "$version" ]; then
+              echo "::error::$(basename "$file") has TemplateVersion '$other', expected '$version'. Regenerate the templates."
+              exit 1
+            fi
+          done
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Test the publish script
+        run: bash .github/scripts/publish-versioned-templates.test.sh
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          # Not a secret: AWS only lets main of spottoai/spotto-tools assume this role (GitHub OIDC).
+          role-to-assume: arn:aws:iam::715809501612:role/spotto-tools-template-publisher
+          aws-region: us-east-1
+
+      - name: Publish versioned templates and promote latest
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: bash .github/scripts/publish-versioned-templates.sh "$TEMPLATES" "$BUCKET" "$VERSION" --promote-latest
