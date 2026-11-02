@@ -3,21 +3,21 @@
   "Description": "Deploys the read-only IAM role to member accounts with a service-managed StackSet.",
   "Metadata": {
     "GeneratedBy": "api/scripts/aws/generate-connect-templates.ts",
-    "TemplateVersion": "2026-10-30.1",
+    "TemplateVersion": "2026-11-02.1",
     "DiscoveryPolicyVersion": "2026-10-24.1"
   },
   "Parameters": {
     "ExternalId": {
       "Type": "String",
       "AllowedPattern": "^spotto-[0-9a-f-]{36}$",
-      "ConstraintDescription": "Use the External ID shown in the portal.",
-      "Description": "External ID shown in the portal. The role can only be assumed with this value."
+      "ConstraintDescription": "Use the value from the setup link.",
+      "Description": "Pre-filled by the setup link. Only this value can assume the role. Don't change it."
     },
     "TrustedPrincipalArn": {
       "Type": "String",
       "AllowedPattern": "^arn:aws:iam::(\\d{12}):(user|role)\\/[A-Za-z0-9+=,.@_/-]{1,512}$",
-      "ConstraintDescription": "Use the trusted principal ARN shown in the portal.",
-      "Description": "IAM user or role ARN, shown in the portal, that is allowed to assume the role."
+      "ConstraintDescription": "Use the value from the setup link.",
+      "Description": "Pre-filled by the setup link: the IAM principal allowed to assume the role. Don't change it."
     },
     "OrganizationalUnitIds": {
       "Type": "CommaDelimitedList",
@@ -53,7 +53,7 @@
           "CAPABILITY_NAMED_IAM"
         ],
         "CallAs": "SELF",
-        "TemplateURL": "https://spotto-aws-onboarding.s3.amazonaws.com/cloudformation/v2026-10-30.1/spotto-aws-member-role.template.json",
+        "TemplateURL": "https://spotto-aws-onboarding.s3.amazonaws.com/cloudformation/v2026-11-02.1/spotto-aws-member-role.template.json",
         "OperationPreferences": {
           "FailureTolerancePercentage": 100,
           "MaxConcurrentPercentage": 100,

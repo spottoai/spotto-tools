@@ -3,46 +3,95 @@
   "Description": "Regional read-only access, private billing storage and isolated registration. Export definitions use a separate billing stack.",
   "Metadata": {
     "GeneratedBy": "api/scripts/aws/generate-connect-templates.ts",
-    "TemplateVersion": "2026-10-30.1",
-    "DiscoveryPolicyVersion": "2026-10-24.1"
+    "TemplateVersion": "2026-11-02.1",
+    "DiscoveryPolicyVersion": "2026-10-24.1",
+    "AWS::CloudFormation::Interface": {
+      "ParameterGroups": [
+        {
+          "Label": {
+            "default": "Pre-filled by the setup link (don't change)"
+          },
+          "Parameters": [
+            "ExternalId",
+            "TrustedPrincipalArn",
+            "RoleName",
+            "CostData",
+            "BillingExportName",
+            "Deployment",
+            "RegistrationTopicArn"
+          ]
+        },
+        {
+          "Label": {
+            "default": "Recovery only (leave as is)"
+          },
+          "Parameters": [
+            "RetainedBillingStorage",
+            "RepairToken"
+          ]
+        }
+      ],
+      "ParameterLabels": {
+        "ExternalId": {
+          "default": "External ID"
+        },
+        "TrustedPrincipalArn": {
+          "default": "Trusted principal"
+        },
+        "RoleName": {
+          "default": "Role name"
+        },
+        "CostData": {
+          "default": "Cost data"
+        },
+        "BillingExportName": {
+          "default": "Billing export name"
+        },
+        "Deployment": {
+          "default": "Region binding"
+        },
+        "RegistrationTopicArn": {
+          "default": "Registration topic"
+        },
+        "RetainedBillingStorage": {
+          "default": "Retained billing storage"
+        },
+        "RepairToken": {
+          "default": "Repair token"
+        }
+      }
+    }
   },
   "Parameters": {
     "ExternalId": {
       "Type": "String",
       "AllowedPattern": "^spotto-[0-9a-f-]{36}$",
-      "ConstraintDescription": "Use the External ID shown in the portal.",
-      "Description": "External ID shown in the portal. The role can only be assumed with this value."
+      "ConstraintDescription": "Use the value from the setup link.",
+      "Description": "Pre-filled by the setup link. Only this value can assume the role. Don't change it."
     },
     "TrustedPrincipalArn": {
       "Type": "String",
       "AllowedPattern": "^arn:aws:iam::(\\d{12}):(user|role)\\/[A-Za-z0-9+=,.@_/-]{1,512}$",
-      "ConstraintDescription": "Use the trusted principal ARN shown in the portal.",
-      "Description": "IAM user or role ARN, shown in the portal, that is allowed to assume the role."
+      "ConstraintDescription": "Use the value from the setup link.",
+      "Description": "Pre-filled by the setup link: the IAM principal allowed to assume the role. Don't change it."
     },
     "Deployment": {
       "Type": "String",
-      "AllowedValues": [
-        "dev-au",
-        "prod-au",
-        "prod-us",
-        "prod-eu"
-      ],
-      "Description": "Deployment shown in the portal. Do not change it independently of the registration topic."
+      "AllowedPattern": "^(dev-au|prod-au|prod-us|prod-eu)$",
+      "ConstraintDescription": "Use the value from the setup link.",
+      "Description": "Pre-filled by the setup link. Don't change it."
     },
     "RegistrationTopicArn": {
       "Type": "String",
-      "AllowedValues": [
-        "arn:aws:sns:ap-southeast-2:715809501612:spotto-aws-connect-dev-au",
-        "arn:aws:sns:ap-southeast-2:715809501612:spotto-aws-connect-prod-au",
-        "arn:aws:sns:us-east-1:715809501612:spotto-aws-connect-prod-us",
-        "arn:aws:sns:eu-north-1:715809501612:spotto-aws-connect-prod-eu"
-      ],
-      "Description": "Regional registration topic shown in the portal."
+      "AllowedPattern": "^arn:aws:sns:(ap-southeast-2|us-east-1|eu-north-1):715809501612:spotto-aws-connect-(dev-au|prod-au|prod-us|prod-eu)$",
+      "ConstraintDescription": "Use the value from the setup link.",
+      "Description": "Pre-filled by the setup link. Don't change it."
     },
     "BillingExportName": {
       "Type": "String",
       "AllowedPattern": "^spotto-cur2-(dev-au|prod-au|prod-us|prod-eu)$",
-      "Description": "Billing export name shown in the portal."
+      "ConstraintDescription": "Use the value from the setup link.",
+      "Description": "Pre-filled by the setup link. Don't change it."
     },
     "CostData": {
       "Type": "String",
@@ -254,7 +303,7 @@
               }
             ]
           },
-          "AssertDescription": "Use the deployment, region, registration topic and export name supplied together by the Spotto portal."
+          "AssertDescription": "Use the deployment, region, registration topic and export name supplied together by the setup link."
         }
       ]
     }
@@ -282,7 +331,7 @@
           "Statement": [
             {
               "Sid": {
-                "Fn::Sub": "AllowSpottoCloudEngineAccessV202610301${RepairToken}"
+                "Fn::Sub": "AllowSpottoCloudEngineAccessV202611021${RepairToken}"
               },
               "Effect": "Allow",
               "Principal": {
@@ -317,7 +366,7 @@
               "Statement": [
                 {
                   "Sid": {
-                    "Fn::Sub": "ReadSpottoMetadataV202610301${RepairToken}"
+                    "Fn::Sub": "ReadSpottoMetadataV202611021${RepairToken}"
                   },
                   "Effect": "Allow",
                   "Action": [
@@ -353,7 +402,7 @@
                 },
                 {
                   "Sid": {
-                    "Fn::Sub": "DenyDataAndSecretReadsV202610301${RepairToken}"
+                    "Fn::Sub": "DenyDataAndSecretReadsV202611021${RepairToken}"
                   },
                   "Effect": "Deny",
                   "Action": [
@@ -478,7 +527,7 @@
               "Statement": [
                 {
                   "Sid": {
-                    "Fn::Sub": "VerifyOrganizationIdentityV202610301${RepairToken}"
+                    "Fn::Sub": "VerifyOrganizationIdentityV202611021${RepairToken}"
                   },
                   "Effect": "Allow",
                   "Action": "organizations:DescribeOrganization",
@@ -486,7 +535,7 @@
                 },
                 {
                   "Sid": {
-                    "Fn::Sub": "ReadCommitmentInventoryV202610301${RepairToken}"
+                    "Fn::Sub": "ReadCommitmentInventoryV202611021${RepairToken}"
                   },
                   "Effect": "Allow",
                   "Action": [
@@ -497,7 +546,7 @@
                 },
                 {
                   "Sid": {
-                    "Fn::Sub": "ReadCommitmentAnalyticsAndRecommendationsV202610301${RepairToken}"
+                    "Fn::Sub": "ReadCommitmentAnalyticsAndRecommendationsV202611021${RepairToken}"
                   },
                   "Effect": "Allow",
                   "Action": [
@@ -525,7 +574,7 @@
                   "Statement": [
                     {
                       "Sid": {
-                        "Fn::Sub": "ReadBucketLocationV202610301${RepairToken}"
+                        "Fn::Sub": "ReadBucketLocationV202611021${RepairToken}"
                       },
                       "Effect": "Allow",
                       "Action": "s3:GetBucketLocation",
@@ -535,7 +584,7 @@
                     },
                     {
                       "Sid": {
-                        "Fn::Sub": "ListDeliveryRootV202610301${RepairToken}"
+                        "Fn::Sub": "ListDeliveryRootV202611021${RepairToken}"
                       },
                       "Effect": "Allow",
                       "Action": "s3:ListBucket",
@@ -557,7 +606,7 @@
                     },
                     {
                       "Sid": {
-                        "Fn::Sub": "ReadDeliveryObjectsV202610301${RepairToken}"
+                        "Fn::Sub": "ReadDeliveryObjectsV202611021${RepairToken}"
                       },
                       "Effect": "Allow",
                       "Action": "s3:GetObject",
@@ -591,7 +640,7 @@
           "Statement": [
             {
               "Sid": {
-                "Fn::Sub": "ReadSpottoFrameworkAssessmentMetadata1V202610301${RepairToken}"
+                "Fn::Sub": "ReadSpottoFrameworkAssessmentMetadata1V202611021${RepairToken}"
               },
               "Effect": "Allow",
               "Action": [
@@ -765,7 +814,7 @@
             ""
           ]
         },
-        "TemplateVersion": "2026-10-30.1",
+        "TemplateVersion": "2026-11-02.1",
         "RepairToken": {
           "Ref": "RepairToken"
         }

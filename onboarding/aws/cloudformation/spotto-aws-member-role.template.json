@@ -3,21 +3,21 @@
   "Description": "Read-only IAM role for cost, inventory and security analysis in a member account.",
   "Metadata": {
     "GeneratedBy": "api/scripts/aws/generate-connect-templates.ts",
-    "TemplateVersion": "2026-10-30.1",
+    "TemplateVersion": "2026-11-02.1",
     "DiscoveryPolicyVersion": "2026-10-24.1"
   },
   "Parameters": {
     "ExternalId": {
       "Type": "String",
       "AllowedPattern": "^spotto-[0-9a-f-]{36}$",
-      "ConstraintDescription": "Use the External ID shown in the portal.",
-      "Description": "External ID shown in the portal. The role can only be assumed with this value."
+      "ConstraintDescription": "Use the value from the setup link.",
+      "Description": "Pre-filled by the setup link. Only this value can assume the role. Don't change it."
     },
     "TrustedPrincipalArn": {
       "Type": "String",
       "AllowedPattern": "^arn:aws:iam::(\\d{12}):(user|role)\\/[A-Za-z0-9+=,.@_/-]{1,512}$",
-      "ConstraintDescription": "Use the trusted principal ARN shown in the portal.",
-      "Description": "IAM user or role ARN, shown in the portal, that is allowed to assume the role."
+      "ConstraintDescription": "Use the value from the setup link.",
+      "Description": "Pre-filled by the setup link: the IAM principal allowed to assume the role. Don't change it."
     },
     "RoleName": {
       "Type": "String",
@@ -45,7 +45,7 @@
           "Statement": [
             {
               "Sid": {
-                "Fn::Sub": "AllowSpottoCloudEngineAccessV202610301${RepairToken}"
+                "Fn::Sub": "AllowSpottoCloudEngineAccessV202611021${RepairToken}"
               },
               "Effect": "Allow",
               "Principal": {
@@ -80,7 +80,7 @@
               "Statement": [
                 {
                   "Sid": {
-                    "Fn::Sub": "ReadSpottoMetadataV202610301${RepairToken}"
+                    "Fn::Sub": "ReadSpottoMetadataV202611021${RepairToken}"
                   },
                   "Effect": "Allow",
                   "Action": [
@@ -116,7 +116,7 @@
                 },
                 {
                   "Sid": {
-                    "Fn::Sub": "DenyDataAndSecretReadsV202610301${RepairToken}"
+                    "Fn::Sub": "DenyDataAndSecretReadsV202611021${RepairToken}"
                   },
                   "Effect": "Deny",
                   "Action": [
@@ -252,7 +252,7 @@
           "Statement": [
             {
               "Sid": {
-                "Fn::Sub": "ReadSpottoFrameworkAssessmentMetadata1V202610301${RepairToken}"
+                "Fn::Sub": "ReadSpottoFrameworkAssessmentMetadata1V202611021${RepairToken}"
               },
               "Effect": "Allow",
               "Action": [
