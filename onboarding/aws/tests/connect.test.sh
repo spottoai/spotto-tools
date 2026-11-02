@@ -11,7 +11,7 @@ chmod +x "$WORK/bin/aws"
 EXT="spotto-0f8fad5b-d9cb-469f-a165-70867728950e"
 ARN="arn:aws:iam::715809501612:user/spotto-cloud-engine-prod"
 BASE="https://spotto-aws-onboarding.s3.amazonaws.com/cloudformation/"
-V="v2026-11-02.1/"
+V="v2026-11-03.1/"
 OUT="$WORK/out" LOG="$WORK/log"
 export FAKE_AWS_STATE="$WORK/state" FAKE_AWS_LOG="$LOG"
 PASS=0 FAIL=0
@@ -49,7 +49,7 @@ t_standalone_create() {
   has "up to 5 while the portal confirms" "$OUT" &&
   has "Role ARN:        arn:aws:iam::111122223333:role/SpottoReadOnlyRole" "$OUT" &&
   has "spotto-cur2-prod-us → s3://spotto-billing-111122223333-prod-us/cur2" "$OUT" &&
-  has "Template:        2026-11-02.1" "$OUT" &&
+  has "Template:        2026-11-03.1" "$OUT" &&
   has "Return to the portal — it detects the connection automatically." "$OUT"
 }
 t_rerun_no_changes() {
@@ -61,16 +61,16 @@ t_update_new_version() {
   seed_connect 2026-10-01.1 CreateExport
   seed SpottoMemberAccounts-prod-us 2026-10-01.1 "ExternalId=$EXT" "TrustedPrincipalArn=$ARN" OrganizationalUnitIds=r-ab12 RoleName=SpottoReadOnlyRole
   connect management 0 --yes &&
-  has "Found SpottoConnect-prod-us (version 2026-10-01.1); latest is 2026-11-02.1." "$OUT" &&
+  has "Found SpottoConnect-prod-us (version 2026-10-01.1); latest is 2026-11-03.1." "$OUT" &&
   has "update-stack --stack-name SpottoConnect-prod-us --template-url ${BASE}${V}spotto-aws-connect.template.json" "$LOG" &&
   has "PARAMS SpottoConnect-prod-us ExternalId=(previous);TrustedPrincipalArn=(previous);Deployment=(previous);RegistrationTopicArn=(previous);BillingExportName=(previous);CostData=(previous);RetainedBillingStorage=(previous);RoleName=(previous)" "$LOG" &&
   has "update-stack --stack-name SpottoMemberAccounts-prod-us --template-url ${BASE}${V}spotto-aws-members.template.json" "$LOG" &&
   has "OrganizationalUnitIds=(previous)" "$LOG" && lacks "list-roots" "$LOG" && lacks "create-stack" "$LOG" &&
   has "wait stack-update-complete --stack-name SpottoMemberAccounts-prod-us" "$LOG" &&
-  grep '"version": "2026-11-02.1"' "$WORK/state/SpottoConnect-prod-us.json" >/dev/null
+  grep '"version": "2026-11-03.1"' "$WORK/state/SpottoConnect-prod-us.json" >/dev/null
 }
 t_rerun_keeps_declined_members() {
-  seed_connect 2026-11-02.1 None
+  seed_connect 2026-11-03.1 None
   connect management 0 --yes && lacks "stack --stack-name SpottoMemberAccounts-prod-us" "$LOG" && has "Add --connect-members yes" "$OUT"
 }
 t_existing_export() {
@@ -110,9 +110,9 @@ t_registration_failure() {
   has "The portal didn't confirm the connection within 5 minutes" "$OUT" && has "External ID is the one shown in the portal" "$OUT"
 }
 t_role_exists() { connect role-exists 1 --yes && has "Delete it, or pass --role-name" "$OUT" && lacks "create-stack" "$LOG"; }
-t_rename_refused() { seed_connect 2026-11-02.1 None; connect standalone 1 --yes --role-name Other && has "Renaming it isn't supported" "$OUT"; }
+t_rename_refused() { seed_connect 2026-11-03.1 None; connect standalone 1 --yes --role-name Other && has "Renaming it isn't supported" "$OUT"; }
 t_repair_role_present() {
-  seed_connect 2026-11-02.1 CreateExport
+  seed_connect 2026-11-03.1 CreateExport
   FAKE_DRIFTED=SpottoConnect-prod-us run standalone 0 --repair --yes &&
   has "SpottoConnect-prod-us: drifted" "$OUT" && has "Role was modified outside CloudFormation" "$OUT" &&
   has "re-applying its trust and policies" "$OUT" &&
@@ -121,8 +121,8 @@ t_repair_role_present() {
   lacks "delete-stack" "$LOG"
 }
 t_repair_role_deleted() {
-  seed_connect 2026-11-02.1 CreateExport
-  seed SpottoMemberAccounts-prod-us 2026-11-02.1 "ExternalId=$EXT" "TrustedPrincipalArn=$ARN" OrganizationalUnitIds=r-ab12 RoleName=SpottoReadOnlyRole
+  seed_connect 2026-11-03.1 CreateExport
+  seed SpottoMemberAccounts-prod-us 2026-11-03.1 "ExternalId=$EXT" "TrustedPrincipalArn=$ARN" OrganizationalUnitIds=r-ab12 RoleName=SpottoReadOnlyRole
   rm "$WORK/state/role"
   run management 0 --repair --yes &&
   has "Recover the access stack: remove and recreate" "$OUT" &&
@@ -138,10 +138,10 @@ t_repair_old_stack_refused() {
 }
 t_repair_nothing() { run standalone 1 --repair --yes && has "Nothing to repair" "$OUT"; }
 t_check_ok() {
-  seed_connect 2026-11-02.1 CreateExport
-  seed SpottoMemberAccounts-prod-us 2026-11-02.1 "ExternalId=$EXT" "TrustedPrincipalArn=$ARN" OrganizationalUnitIds=r-ab12 RoleName=SpottoReadOnlyRole
+  seed_connect 2026-11-03.1 CreateExport
+  seed SpottoMemberAccounts-prod-us 2026-11-03.1 "ExternalId=$EXT" "TrustedPrincipalArn=$ARN" OrganizationalUnitIds=r-ab12 RoleName=SpottoReadOnlyRole
   FAKE_INSTANCES="222233334444,CURRENT,SUCCEEDED;333344445555,CURRENT,SUCCEEDED" run management 0 --check &&
-  has "SpottoConnect-prod-us: version 2026-11-02.1 (up to date)" "$OUT" && has "Drift: in sync" "$OUT" &&
+  has "SpottoConnect-prod-us: version 2026-11-03.1 (up to date)" "$OUT" && has "Drift: in sync" "$OUT" &&
   has "Member accounts: 2 OK, 0 outdated, 0 failed" "$OUT" && has "Everything is up to date and in sync." "$OUT" &&
   has "iam list-attached-role-policies --role-name SpottoReadOnlyRole" "$LOG" &&
   has "SpottoReadOnlyRole: AWS managed policies ViewOnlyAccess and SecurityAudit attached" "$OUT" &&
@@ -152,53 +152,53 @@ t_check_outdated() {
   run standalone 1 --check && has "version 2026-10-01.1 (update available)" "$OUT" && has "rerun this command without --check" "$OUT" && lacks "update-stack" "$LOG"
 }
 t_check_drift_and_members() {
-  seed_connect 2026-11-02.1 CreateExport
-  seed SpottoMemberAccounts-prod-us 2026-11-02.1 "ExternalId=$EXT" "TrustedPrincipalArn=$ARN" OrganizationalUnitIds=r-ab12 RoleName=SpottoReadOnlyRole
+  seed_connect 2026-11-03.1 CreateExport
+  seed SpottoMemberAccounts-prod-us 2026-11-03.1 "ExternalId=$EXT" "TrustedPrincipalArn=$ARN" OrganizationalUnitIds=r-ab12 RoleName=SpottoReadOnlyRole
   FAKE_DRIFTED=SpottoConnect-prod-us FAKE_INSTANCES="222233334444,CURRENT,SUCCEEDED;333344445555,OUTDATED,SUCCEEDED;444455556666,OUTDATED,FAILED" run management 1 --check &&
   has "Drift: drifted" "$OUT" && has "Role was modified outside CloudFormation" "$OUT" &&
   has "Member accounts: 1 OK, 1 outdated, 1 failed" "$OUT" && has "444455556666: FAILED" "$OUT" && has "rerun with --repair" "$OUT"
 }
 t_check_managed_missing() {
-  seed_connect 2026-11-02.1 CreateExport
+  seed_connect 2026-11-03.1 CreateExport
   FAKE_MANAGED_POLICIES="arn:aws:iam::aws:policy/job-function/ViewOnlyAccess,arn:aws:iam::aws:policy/ReadOnlyAccess" run standalone 1 --check &&
   has "SpottoReadOnlyRole is missing the AWS managed SecurityAudit policy" "$OUT" && has "rerun with --repair" "$OUT" &&
   lacks "Everything is up to date" "$OUT" && lacks "update-stack" "$LOG"
 }
 t_check_managed_none() {
-  seed SpottoConnect-prod-us 2026-11-02.1 "ExternalId=$EXT" "TrustedPrincipalArn=$ARN" CostData=None RoleName=CustomRole
+  seed SpottoConnect-prod-us 2026-11-03.1 "ExternalId=$EXT" "TrustedPrincipalArn=$ARN" CostData=None RoleName=CustomRole
   FAKE_MANAGED_POLICIES=none run standalone 1 --check &&
   has "iam list-attached-role-policies --role-name CustomRole" "$LOG" &&
   has "CustomRole is missing the AWS managed ViewOnlyAccess and SecurityAudit policies" "$OUT"
 }
 t_check_managed_denied() {
-  seed_connect 2026-11-02.1 CreateExport
+  seed_connect 2026-11-03.1 CreateExport
   FAKE_DENY=list-attached-role-policies run standalone 1 --check &&
   has "Couldn't read the managed policies attached to SpottoReadOnlyRole: An error occurred (AccessDenied)" "$OUT" &&
   has "health isn't confirmed" "$OUT"
 }
 t_check_not_connected() { run standalone 1 --check && has "Not connected" "$OUT"; }
 t_add_members_later() { # existing single-account connection, no trust flags repeated
-  seed_connect 2026-11-02.1 CreateExport
+  seed_connect 2026-11-03.1 CreateExport
   run management 0 --connect-members yes --yes &&
   has "create-stack --stack-name SpottoMemberAccounts-prod-us" "$LOG" &&
   has "PARAMS SpottoMemberAccounts-prod-us ExternalId=$EXT;TrustedPrincipalArn=$ARN;OrganizationalUnitIds=r-ab12;RoleName=SpottoReadOnlyRole" "$LOG" &&
   has "SpottoConnect-prod-us is already up to date." "$OUT"
 }
-seed_billing() { seed SpottoBillingAccess-prod-us 2026-11-02.1 RoleName=SpottoReadOnlyRole ExportName=contoso-cur2 BucketName=contoso-billing BasePrefix=reports KmsKeyArn=; }
+seed_billing() { seed SpottoBillingAccess-prod-us 2026-11-03.1 RoleName=SpottoReadOnlyRole ExportName=contoso-cur2 BucketName=contoso-billing BasePrefix=reports KmsKeyArn=; }
 t_repair_billing_token() {
-  seed_connect 2026-11-02.1 None; seed_billing
+  seed_connect 2026-11-03.1 None; seed_billing
   FAKE_BILLING_REPAIR_TOKEN=1 run standalone 0 --repair --yes &&
   grep -E "PARAMS SpottoBillingAccess-prod-us RoleName=\(previous\);ExportName=\(previous\);BucketName=\(previous\);BasePrefix=\(previous\);KmsKeyArn=\(previous\);RepairToken=[0-9]{10}$" "$LOG" >/dev/null &&
   has "update-stack --stack-name SpottoBillingAccess-prod-us" "$LOG"
 }
 t_repair_billing_no_token_param() { # today's template doesn't declare it, so it isn't sent
-  seed_connect 2026-11-02.1 None; seed_billing
+  seed_connect 2026-11-03.1 None; seed_billing
   run standalone 0 --repair --yes && has "PARAMS SpottoBillingAccess-prod-us RoleName=(previous);ExportName=(previous);BucketName=(previous);BasePrefix=(previous);KmsKeyArn=(previous)" "$LOG" &&
   ! grep "PARAMS SpottoBillingAccess-prod-us.*RepairToken" "$LOG" >/dev/null
 }
 seed_org() {
-  seed_connect 2026-11-02.1 CreateExport
-  seed SpottoMemberAccounts-prod-us 2026-11-02.1 "ExternalId=$EXT" "TrustedPrincipalArn=$ARN" OrganizationalUnitIds=r-ab12 RoleName=SpottoReadOnlyRole
+  seed_connect 2026-11-03.1 CreateExport
+  seed SpottoMemberAccounts-prod-us 2026-11-03.1 "ExternalId=$EXT" "TrustedPrincipalArn=$ARN" OrganizationalUnitIds=r-ab12 RoleName=SpottoReadOnlyRole
 }
 t_check_member_denied() {
   seed_org
@@ -218,12 +218,12 @@ t_check_drift_denied() {
   has "Couldn't read drift status: An error occurred (AccessDenied)" "$OUT" && lacks "Everything is up to date" "$OUT"
 }
 t_stack_read_denied() {
-  seed_connect 2026-11-02.1 None; seed_billing
+  seed_connect 2026-11-03.1 None; seed_billing
   FAKE_DENY=describe-stacks:SpottoBillingAccess-prod-us run standalone 1 --check && has "Couldn't read stack SpottoBillingAccess-prod-us: An error occurred (AccessDenied)" "$OUT" &&
   FAKE_DENY=describe-stacks:SpottoBillingAccess-prod-us run standalone 1 --yes && has "Couldn't read stack SpottoBillingAccess-prod-us" "$OUT" && lacks "update-stack" "$LOG"
 }
 t_repair_getrole_denied() { # only NoSuchEntity means deleted; anything else must never delete
-  seed_connect 2026-11-02.1 CreateExport
+  seed_connect 2026-11-03.1 CreateExport
   FAKE_DENY=get-role run standalone 1 --repair --yes &&
   has "Couldn't check whether role SpottoReadOnlyRole exists: An error occurred (AccessDenied)" "$OUT" &&
   lacks "delete-stack" "$LOG" && lacks "create-stack" "$LOG" && lacks "update-stack" "$LOG"
@@ -232,13 +232,13 @@ t_connect_getrole_denied() {
   FAKE_DENY=get-role connect standalone 1 --yes && has "Couldn't check whether role SpottoReadOnlyRole exists" "$OUT" && lacks "create-stack" "$LOG"
 }
 t_check_latest_unreadable() { # "get-template-summary:" denies only --template-url reads (no stack name)
-  seed_connect 2026-11-02.1 CreateExport
+  seed_connect 2026-11-03.1 CreateExport
   FAKE_DENY="get-template-summary:" run standalone 1 --check &&
   has "Couldn't read the template version for the latest templates: An error occurred (AccessDenied)" "$OUT" &&
   lacks "Everything is up to date" "$OUT" && lacks "(up to date)" "$OUT"
 }
 t_check_deployed_unreadable() {
-  seed_connect 2026-11-02.1 CreateExport
+  seed_connect 2026-11-03.1 CreateExport
   FAKE_DENY="get-template-summary:SpottoConnect-prod-us" run standalone 1 --check &&
   has "Couldn't read the template version for SpottoConnect-prod-us: An error occurred (AccessDenied)" "$OUT" &&
   has "SpottoConnect-prod-us: version unknown (version unreadable)" "$OUT" && lacks "Everything is up to date" "$OUT"
@@ -265,14 +265,14 @@ t_new_none_fails() {
   lacks "create-stack" "$LOG"
 }
 t_update_none_warns() {
-  seed_connect 2026-11-02.1 None
+  seed_connect 2026-11-03.1 None
   connect standalone 0 --yes &&
   has "Warning: this connection has no billing data, and billing is required." "$OUT" &&
   has "No cost data. Billing is required" "$OUT" &&
   has "PARAMS SpottoConnect-prod-us ExternalId=(previous);TrustedPrincipalArn=(previous);Deployment=(previous);RegistrationTopicArn=(previous);BillingExportName=(previous);CostData=(previous);RetainedBillingStorage=(previous);RoleName=(previous)" "$LOG"
 }
 t_update_none_with_billing_access() {
-  seed_connect 2026-11-02.1 None; seed_billing
+  seed_connect 2026-11-03.1 None; seed_billing
   connect standalone 0 --yes && lacks "no billing data" "$OUT"
 }
 t_existing_monthly_refused() {

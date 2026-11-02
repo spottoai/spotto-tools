@@ -3,7 +3,7 @@
   "Description": "Read-only IAM role for cost, inventory and security analysis in a member account.",
   "Metadata": {
     "GeneratedBy": "api/scripts/aws/generate-connect-templates.ts",
-    "TemplateVersion": "2026-11-02.1",
+    "TemplateVersion": "2026-11-03.1",
     "DiscoveryPolicyVersion": "2026-10-24.1"
   },
   "Parameters": {
@@ -45,7 +45,7 @@
           "Statement": [
             {
               "Sid": {
-                "Fn::Sub": "AllowSpottoCloudEngineAccessV202611021${RepairToken}"
+                "Fn::Sub": "AllowSpottoCloudEngineAccessV202611031${RepairToken}"
               },
               "Effect": "Allow",
               "Principal": {
@@ -80,11 +80,12 @@
               "Statement": [
                 {
                   "Sid": {
-                    "Fn::Sub": "ReadSpottoMetadataV202611021${RepairToken}"
+                    "Fn::Sub": "ReadSpottoMetadataV202611031${RepairToken}"
                   },
                   "Effect": "Allow",
                   "Action": [
                     "bcm-data-exports:GetExport",
+                    "bcm-data-exports:ListExecutions",
                     "bcm-data-exports:ListExports",
                     "ce:GetAnomalies",
                     "ce:GetAnomalyMonitors",
@@ -116,7 +117,7 @@
                 },
                 {
                   "Sid": {
-                    "Fn::Sub": "DenyDataAndSecretReadsV202611021${RepairToken}"
+                    "Fn::Sub": "DenyDataAndSecretReadsV202611031${RepairToken}"
                   },
                   "Effect": "Deny",
                   "Action": [
@@ -252,7 +253,7 @@
           "Statement": [
             {
               "Sid": {
-                "Fn::Sub": "ReadSpottoFrameworkAssessmentMetadata1V202611021${RepairToken}"
+                "Fn::Sub": "ReadSpottoFrameworkAssessmentMetadata1V202611031${RepairToken}"
               },
               "Effect": "Allow",
               "Action": [

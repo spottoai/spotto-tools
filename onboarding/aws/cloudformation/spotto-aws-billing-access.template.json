@@ -3,7 +3,7 @@
   "Description": "Grants the read-only IAM role access to an existing billing data export.",
   "Metadata": {
     "GeneratedBy": "api/scripts/aws/generate-connect-templates.ts",
-    "TemplateVersion": "2026-11-02.1",
+    "TemplateVersion": "2026-11-03.1",
     "DiscoveryPolicyVersion": "2026-10-24.1"
   },
   "Parameters": {
@@ -82,7 +82,7 @@
           "Statement": [
             {
               "Sid": {
-                "Fn::Sub": "ReadBucketLocationV202611021${RepairToken}"
+                "Fn::Sub": "ReadBucketLocationV202611031${RepairToken}"
               },
               "Effect": "Allow",
               "Action": "s3:GetBucketLocation",
@@ -92,7 +92,7 @@
             },
             {
               "Sid": {
-                "Fn::Sub": "ListDeliveryRootV202611021${RepairToken}"
+                "Fn::Sub": "ListDeliveryRootV202611031${RepairToken}"
               },
               "Effect": "Allow",
               "Action": "s3:ListBucket",
@@ -137,7 +137,7 @@
             },
             {
               "Sid": {
-                "Fn::Sub": "ReadDeliveryObjectsV202611021${RepairToken}"
+                "Fn::Sub": "ReadDeliveryObjectsV202611031${RepairToken}"
               },
               "Effect": "Allow",
               "Action": "s3:GetObject",
@@ -165,7 +165,7 @@
                 "HasKmsKey",
                 {
                   "Sid": {
-                    "Fn::Sub": "DecryptBillingObjectsV202611021${RepairToken}"
+                    "Fn::Sub": "DecryptBillingObjectsV202611031${RepairToken}"
                   },
                   "Effect": "Allow",
                   "Action": [

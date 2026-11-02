@@ -3,7 +3,7 @@
   "Description": "Regional read-only access, private billing storage and isolated registration. Export definitions use a separate billing stack.",
   "Metadata": {
     "GeneratedBy": "api/scripts/aws/generate-connect-templates.ts",
-    "TemplateVersion": "2026-11-02.1",
+    "TemplateVersion": "2026-11-03.1",
     "DiscoveryPolicyVersion": "2026-10-24.1",
     "AWS::CloudFormation::Interface": {
       "ParameterGroups": [
@@ -331,7 +331,7 @@
           "Statement": [
             {
               "Sid": {
-                "Fn::Sub": "AllowSpottoCloudEngineAccessV202611021${RepairToken}"
+                "Fn::Sub": "AllowSpottoCloudEngineAccessV202611031${RepairToken}"
               },
               "Effect": "Allow",
               "Principal": {
@@ -366,11 +366,12 @@
               "Statement": [
                 {
                   "Sid": {
-                    "Fn::Sub": "ReadSpottoMetadataV202611021${RepairToken}"
+                    "Fn::Sub": "ReadSpottoMetadataV202611031${RepairToken}"
                   },
                   "Effect": "Allow",
                   "Action": [
                     "bcm-data-exports:GetExport",
+                    "bcm-data-exports:ListExecutions",
                     "bcm-data-exports:ListExports",
                     "ce:GetAnomalies",
                     "ce:GetAnomalyMonitors",
@@ -402,7 +403,7 @@
                 },
                 {
                   "Sid": {
-                    "Fn::Sub": "DenyDataAndSecretReadsV202611021${RepairToken}"
+                    "Fn::Sub": "DenyDataAndSecretReadsV202611031${RepairToken}"
                   },
                   "Effect": "Deny",
                   "Action": [
@@ -527,7 +528,7 @@
               "Statement": [
                 {
                   "Sid": {
-                    "Fn::Sub": "VerifyOrganizationIdentityV202611021${RepairToken}"
+                    "Fn::Sub": "VerifyOrganizationIdentityV202611031${RepairToken}"
                   },
                   "Effect": "Allow",
                   "Action": "organizations:DescribeOrganization",
@@ -535,7 +536,7 @@
                 },
                 {
                   "Sid": {
-                    "Fn::Sub": "ReadCommitmentInventoryV202611021${RepairToken}"
+                    "Fn::Sub": "ReadCommitmentInventoryV202611031${RepairToken}"
                   },
                   "Effect": "Allow",
                   "Action": [
@@ -546,7 +547,7 @@
                 },
                 {
                   "Sid": {
-                    "Fn::Sub": "ReadCommitmentAnalyticsAndRecommendationsV202611021${RepairToken}"
+                    "Fn::Sub": "ReadCommitmentAnalyticsAndRecommendationsV202611031${RepairToken}"
                   },
                   "Effect": "Allow",
                   "Action": [
@@ -574,7 +575,7 @@
                   "Statement": [
                     {
                       "Sid": {
-                        "Fn::Sub": "ReadBucketLocationV202611021${RepairToken}"
+                        "Fn::Sub": "ReadBucketLocationV202611031${RepairToken}"
                       },
                       "Effect": "Allow",
                       "Action": "s3:GetBucketLocation",
@@ -584,7 +585,7 @@
                     },
                     {
                       "Sid": {
-                        "Fn::Sub": "ListDeliveryRootV202611021${RepairToken}"
+                        "Fn::Sub": "ListDeliveryRootV202611031${RepairToken}"
                       },
                       "Effect": "Allow",
                       "Action": "s3:ListBucket",
@@ -606,7 +607,7 @@
                     },
                     {
                       "Sid": {
-                        "Fn::Sub": "ReadDeliveryObjectsV202611021${RepairToken}"
+                        "Fn::Sub": "ReadDeliveryObjectsV202611031${RepairToken}"
                       },
                       "Effect": "Allow",
                       "Action": "s3:GetObject",
@@ -640,7 +641,7 @@
           "Statement": [
             {
               "Sid": {
-                "Fn::Sub": "ReadSpottoFrameworkAssessmentMetadata1V202611021${RepairToken}"
+                "Fn::Sub": "ReadSpottoFrameworkAssessmentMetadata1V202611031${RepairToken}"
               },
               "Effect": "Allow",
               "Action": [
@@ -814,7 +815,7 @@
             ""
           ]
         },
-        "TemplateVersion": "2026-11-02.1",
+        "TemplateVersion": "2026-11-03.1",
         "RepairToken": {
           "Ref": "RepairToken"
         }

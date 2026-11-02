@@ -3,7 +3,7 @@
   "Description": "Deploys the read-only IAM role to member accounts with a service-managed StackSet.",
   "Metadata": {
     "GeneratedBy": "api/scripts/aws/generate-connect-templates.ts",
-    "TemplateVersion": "2026-11-02.1",
+    "TemplateVersion": "2026-11-03.1",
     "DiscoveryPolicyVersion": "2026-10-24.1"
   },
   "Parameters": {
@@ -53,7 +53,7 @@
           "CAPABILITY_NAMED_IAM"
         ],
         "CallAs": "SELF",
-        "TemplateURL": "https://spotto-aws-onboarding.s3.amazonaws.com/cloudformation/v2026-11-02.1/spotto-aws-member-role.template.json",
+        "TemplateURL": "https://spotto-aws-onboarding.s3.amazonaws.com/cloudformation/v2026-11-03.1/spotto-aws-member-role.template.json",
         "OperationPreferences": {
           "FailureTolerancePercentage": 100,
           "MaxConcurrentPercentage": 100,

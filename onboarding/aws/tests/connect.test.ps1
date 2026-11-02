@@ -10,7 +10,7 @@ else { Set-Content (Join-Path $bin 'aws') "#!/usr/bin/env bash`nexec python3 `"$
 $ext = 'spotto-0f8fad5b-d9cb-469f-a165-70867728950e'
 $arn = 'arn:aws:iam::715809501612:user/spotto-cloud-engine-prod'
 $base = 'https://spotto-aws-onboarding.s3.amazonaws.com/cloudformation/'
-$v = 'v2026-11-02.1/'
+$v = 'v2026-11-03.1/'
 $state = Join-Path $work 'state'; $log = Join-Path $work 'log'
 $env:FAKE_AWS_STATE = $state; $env:FAKE_AWS_LOG = $log
 $originalPath = $env:PATH
@@ -20,7 +20,7 @@ $script:pass = 0; $script:fail = 0
 function Reset-State { Remove-Item $state -Recurse -Force -ErrorAction SilentlyContinue; $null = New-Item -ItemType Directory $state; Set-Content $log '' }
 function Add-Stack([string]$Stack, [string]$Version, [string[]]$Params) { $env:FAKE_AWS_SCENARIO = 'x'; & aws fake-seed $Stack $Version @Params; Set-Content $log '' }
 function Add-Connect([string]$Version, [string]$CostData) { Add-Stack 'SpottoConnect-prod-us' $Version @("ExternalId=$ext", "TrustedPrincipalArn=$arn", "Deployment=prod-us", "RegistrationTopicArn=arn:aws:sns:us-east-1:715809501612:spotto-aws-connect-prod-us", "BillingExportName=spotto-cur2-prod-us", "CostData=$CostData", 'RetainedBillingStorage=false', 'RoleName=SpottoReadOnlyRole'); if ($CostData -eq 'CreateExport') { Add-Stack 'SpottoBillingExport-prod-us' $Version @('Deployment=prod-us', 'BucketRegion=us-east-1') } }
-function Add-Members { Add-Stack 'SpottoMemberAccounts-prod-us' '2026-11-02.1' @("ExternalId=$ext", "TrustedPrincipalArn=$arn", 'OrganizationalUnitIds=r-ab12', 'RoleName=SpottoReadOnlyRole') }
+function Add-Members { Add-Stack 'SpottoMemberAccounts-prod-us' '2026-11-03.1' @("ExternalId=$ext", "TrustedPrincipalArn=$arn", 'OrganizationalUnitIds=r-ab12', 'RoleName=SpottoReadOnlyRole') }
 function Invoke-Script([string]$Scenario, [int]$ExpectedExit, [string[]]$Extra, [hashtable]$Env = @{}) {
     Set-Content $log ''
     $env:FAKE_AWS_SCENARIO = $Scenario
@@ -130,7 +130,7 @@ try {
     Test-Case 'rerun updates stacks to a new version' {
         Add-Connect '2026-10-01.1' 'CreateExport'; Add-Members
         $r = Invoke-Connect 'management' 0 @('-Yes')
-        Assert-Has $r.Out 'Found SpottoConnect-prod-us (version 2026-10-01.1); latest is 2026-11-02.1.'
+        Assert-Has $r.Out 'Found SpottoConnect-prod-us (version 2026-10-01.1); latest is 2026-11-03.1.'
         Assert-Has $r.Log "update-stack --stack-name SpottoConnect-prod-us --template-url $base${v}spotto-aws-connect.template.json"
         Assert-Has $r.Log 'PARAMS SpottoConnect-prod-us ExternalId=(previous);TrustedPrincipalArn=(previous);Deployment=(previous);RegistrationTopicArn=(previous);BillingExportName=(previous);CostData=(previous);RetainedBillingStorage=(previous);RoleName=(previous)'
         Assert-Has $r.Log 'OrganizationalUnitIds=(previous)'; Assert-Lacks $r.Log 'create-stack'; Assert-Lacks $r.Log 'list-roots'
@@ -164,14 +164,14 @@ try {
         $r = Invoke-Connect 'role-exists' 1 @('-Yes'); Assert-Has $r.Out 'Delete it, or pass -RoleName'; Assert-Lacks $r.Log 'create-stack'
     }
     Test-Case 'repair with the role present' {
-        Add-Connect '2026-11-02.1' 'CreateExport'
+        Add-Connect '2026-11-03.1' 'CreateExport'
         $r = Invoke-Script 'standalone' 0 @('-Repair', '-Yes') @{ FAKE_DRIFTED = 'SpottoConnect-prod-us' }
         Assert-Has $r.Out 'SpottoConnect-prod-us: drifted'; Assert-Has $r.Out 'Role was modified outside CloudFormation'
         Assert-Match $r.Log 'PARAMS SpottoConnect-prod-us ExternalId=\(previous\);TrustedPrincipalArn=\(previous\);Deployment=\(previous\);RegistrationTopicArn=\(previous\);BillingExportName=\(previous\);CostData=\(previous\);RetainedBillingStorage=\(previous\);RoleName=\(previous\);RepairToken=[0-9]{10}\r?\n'
         Assert-Lacks $r.Log 'delete-stack'
     }
     Test-Case 'repair with the role deleted' {
-        Add-Connect '2026-11-02.1' 'CreateExport'; Add-Members; Remove-Item (Join-Path $state 'role')
+        Add-Connect '2026-11-03.1' 'CreateExport'; Add-Members; Remove-Item (Join-Path $state 'role')
         $r = Invoke-Script 'management' 0 @('-Repair', '-Yes')
         Assert-Has $r.Log 'delete-stack --stack-name SpottoConnect-prod-us'
         Assert-Has $r.Log "PARAMS SpottoConnect-prod-us ExternalId=$ext;TrustedPrincipalArn=$arn;Deployment=prod-us;RegistrationTopicArn=arn:aws:sns:us-east-1:715809501612:spotto-aws-connect-prod-us;BillingExportName=spotto-cur2-prod-us;CostData=None;RetainedBillingStorage=true;RoleName=SpottoReadOnlyRole"
@@ -189,7 +189,7 @@ try {
         Assert-Lacks $r.Log 'create-stack'
     }
     Test-Case 'update of a connection without billing warns' {
-        Add-Connect '2026-11-02.1' 'None'
+        Add-Connect '2026-11-03.1' 'None'
         $r = Invoke-Connect 'standalone' 0 @('-Yes')
         Assert-Has $r.Out 'Warning: this connection has no billing data, and billing is required.'
         Assert-Has $r.Out 'No cost data. Billing is required'
@@ -233,27 +233,27 @@ try {
         Assert-Has $r.Log 'BasePrefix=reports;KmsKeyArn='; Assert-Lacks $r.Log 'kms describe-key'
     }
     Test-Case '-Check: all good exits 0' {
-        Add-Connect '2026-11-02.1' 'CreateExport'; Add-Members
+        Add-Connect '2026-11-03.1' 'CreateExport'; Add-Members
         $r = Invoke-Script 'management' 0 @('-Check') @{ FAKE_INSTANCES = '222233334444,CURRENT,SUCCEEDED;333344445555,CURRENT,SUCCEEDED' }
-        Assert-Has $r.Out 'SpottoConnect-prod-us: version 2026-11-02.1 (up to date)'; Assert-Has $r.Out 'Member accounts: 2 OK, 0 outdated, 0 failed'
+        Assert-Has $r.Out 'SpottoConnect-prod-us: version 2026-11-03.1 (up to date)'; Assert-Has $r.Out 'Member accounts: 2 OK, 0 outdated, 0 failed'
         Assert-Has $r.Out 'Everything is up to date and in sync.'; Assert-Lacks $r.Log 'update-stack'; Assert-Lacks $r.Log 'create-stack'
         Assert-Has $r.Log 'iam list-attached-role-policies --role-name SpottoReadOnlyRole'
         Assert-Has $r.Out 'SpottoReadOnlyRole: AWS managed policies ViewOnlyAccess and SecurityAudit attached'
     }
     Test-Case '-Check: missing managed policy exits 1' {
-        Add-Connect '2026-11-02.1' 'CreateExport'
+        Add-Connect '2026-11-03.1' 'CreateExport'
         $r = Invoke-Script 'standalone' 1 @('-Check') @{ FAKE_MANAGED_POLICIES = 'arn:aws:iam::aws:policy/job-function/ViewOnlyAccess,arn:aws:iam::aws:policy/ReadOnlyAccess' }
         Assert-Has $r.Out 'SpottoReadOnlyRole is missing the AWS managed SecurityAudit policy'; Assert-Has $r.Out 'rerun with -Repair'
         Assert-Lacks $r.Out 'Everything is up to date'
     }
     Test-Case '-Check: no managed policies on a custom role name' {
-        Add-Stack 'SpottoConnect-prod-us' '2026-11-02.1' @("ExternalId=$ext", "TrustedPrincipalArn=$arn", 'CostData=None', 'RoleName=CustomRole')
+        Add-Stack 'SpottoConnect-prod-us' '2026-11-03.1' @("ExternalId=$ext", "TrustedPrincipalArn=$arn", 'CostData=None', 'RoleName=CustomRole')
         $r = Invoke-Script 'standalone' 1 @('-Check') @{ FAKE_MANAGED_POLICIES = 'none' }
         Assert-Has $r.Log 'iam list-attached-role-policies --role-name CustomRole'
         Assert-Has $r.Out 'CustomRole is missing the AWS managed ViewOnlyAccess and SecurityAudit policies'
     }
     Test-Case '-Check: unreadable managed policies exit 1' {
-        Add-Connect '2026-11-02.1' 'CreateExport'
+        Add-Connect '2026-11-03.1' 'CreateExport'
         $r = Invoke-Script 'standalone' 1 @('-Check') @{ FAKE_DENY = 'list-attached-role-policies' }
         Assert-Has $r.Out "Couldn't read the managed policies attached to SpottoReadOnlyRole: An error occurred (AccessDenied)"
         Assert-Has $r.Out "health isn't confirmed"
@@ -263,49 +263,49 @@ try {
         $r = Invoke-Script 'standalone' 1 @('-Check'); Assert-Has $r.Out '(update available)'; Assert-Has $r.Out 'without -Check'
     }
     Test-Case '-Check: drift and member failures exit 1' {
-        Add-Connect '2026-11-02.1' 'CreateExport'; Add-Members
+        Add-Connect '2026-11-03.1' 'CreateExport'; Add-Members
         $r = Invoke-Script 'management' 1 @('-Check') @{ FAKE_DRIFTED = 'SpottoConnect-prod-us'; FAKE_INSTANCES = '222233334444,CURRENT,SUCCEEDED;333344445555,OUTDATED,SUCCEEDED;444455556666,OUTDATED,FAILED' }
         Assert-Has $r.Out 'Drift: drifted'; Assert-Has $r.Out 'Member accounts: 1 OK, 1 outdated, 1 failed'
         Assert-Has $r.Out '444455556666: FAILED'; Assert-Has $r.Out 'rerun with -Repair'
     }
     Test-Case '-Check: not connected exits 1' { Assert-Has (Invoke-Script 'standalone' 1 @('-Check')).Out 'Not connected' }
     Test-Case 'adding members later reuses the connect stack trust' {
-        Add-Connect '2026-11-02.1' 'CreateExport'
+        Add-Connect '2026-11-03.1' 'CreateExport'
         $r = Invoke-Script 'management' 0 @('-ConnectMembers', 'yes', '-Yes')
         Assert-Has $r.Log "PARAMS SpottoMemberAccounts-prod-us ExternalId=$ext;TrustedPrincipalArn=$arn;OrganizationalUnitIds=r-ab12;RoleName=SpottoReadOnlyRole"
     }
     Test-Case 'repair passes RepairToken to billing access when declared' {
-        Add-Connect '2026-11-02.1' 'None'
-        Add-Stack 'SpottoBillingAccess-prod-us' '2026-11-02.1' @('RoleName=SpottoReadOnlyRole', 'ExportName=contoso-cur2', 'BucketName=contoso-billing', 'BasePrefix=reports', 'KmsKeyArn=')
+        Add-Connect '2026-11-03.1' 'None'
+        Add-Stack 'SpottoBillingAccess-prod-us' '2026-11-03.1' @('RoleName=SpottoReadOnlyRole', 'ExportName=contoso-cur2', 'BucketName=contoso-billing', 'BasePrefix=reports', 'KmsKeyArn=')
         $r = Invoke-Script 'standalone' 0 @('-Repair', '-Yes') @{ FAKE_BILLING_REPAIR_TOKEN = '1' }
         Assert-Match $r.Log 'PARAMS SpottoBillingAccess-prod-us RoleName=\(previous\);ExportName=\(previous\);BucketName=\(previous\);BasePrefix=\(previous\);KmsKeyArn=\(previous\);RepairToken=[0-9]{10}\r?\n'
     }
     Test-Case '-Check: denied member status read exits 1' {
-        Add-Connect '2026-11-02.1' 'CreateExport'; Add-Members
+        Add-Connect '2026-11-03.1' 'CreateExport'; Add-Members
         $r = Invoke-Script 'management' 1 @('-Check') @{ FAKE_DENY = 'list-stack-instances' }
         Assert-Has $r.Out "Couldn't read member account status: An error occurred (AccessDenied)"
         Assert-Lacks $r.Out 'Everything is up to date'; Assert-Lacks $r.Out 'Member accounts: 0 OK'
     }
     Test-Case '-Check: pending/running instances are in progress' {
-        Add-Connect '2026-11-02.1' 'CreateExport'; Add-Members
+        Add-Connect '2026-11-03.1' 'CreateExport'; Add-Members
         $r = Invoke-Script 'management' 1 @('-Check') @{ FAKE_INSTANCES = '222233334444,CURRENT,SUCCEEDED;333344445555,OUTDATED,RUNNING;444455556666,CURRENT,PENDING' }
         Assert-Has $r.Out 'Member accounts: 1 OK, 0 outdated, 0 failed, 2 in progress'; Assert-Has $r.Out 'rerun -Check shortly'
         Assert-Lacks $r.Out 'Everything is up to date'; Assert-Lacks $r.Out '-Repair'
     }
     Test-Case '-Check: denied drift detection exits 1' {
-        Add-Connect '2026-11-02.1' 'CreateExport'
+        Add-Connect '2026-11-03.1' 'CreateExport'
         $r = Invoke-Script 'standalone' 1 @('-Check') @{ FAKE_DENY = 'detect-stack-drift' }
         Assert-Has $r.Out "Couldn't read drift status: An error occurred (AccessDenied)"
     }
     Test-Case 'denied stack read is never treated as missing' {
-        Add-Connect '2026-11-02.1' 'None'
-        Add-Stack 'SpottoBillingAccess-prod-us' '2026-11-02.1' @('RoleName=SpottoReadOnlyRole', 'ExportName=contoso-cur2', 'BucketName=contoso-billing', 'BasePrefix=reports', 'KmsKeyArn=')
+        Add-Connect '2026-11-03.1' 'None'
+        Add-Stack 'SpottoBillingAccess-prod-us' '2026-11-03.1' @('RoleName=SpottoReadOnlyRole', 'ExportName=contoso-cur2', 'BucketName=contoso-billing', 'BasePrefix=reports', 'KmsKeyArn=')
         Assert-Has (Invoke-Script 'standalone' 1 @('-Check') @{ FAKE_DENY = 'describe-stacks:SpottoBillingAccess-prod-us' }).Out "Couldn't read stack SpottoBillingAccess-prod-us: An error occurred (AccessDenied)"
         $r = Invoke-Script 'standalone' 1 @('-Yes') @{ FAKE_DENY = 'describe-stacks:SpottoBillingAccess-prod-us' }
         Assert-Has $r.Out "Couldn't read stack SpottoBillingAccess-prod-us"; Assert-Lacks $r.Log 'update-stack'
     }
     Test-Case 'repair: denied GetRole deletes nothing' {
-        Add-Connect '2026-11-02.1' 'CreateExport'
+        Add-Connect '2026-11-03.1' 'CreateExport'
         $r = Invoke-Script 'standalone' 1 @('-Repair', '-Yes') @{ FAKE_DENY = 'get-role' }
         Assert-Has $r.Out "Couldn't check whether role SpottoReadOnlyRole exists: An error occurred (AccessDenied)"
         Assert-Lacks $r.Log 'delete-stack'; Assert-Lacks $r.Log 'create-stack'; Assert-Lacks $r.Log 'update-stack'
@@ -315,13 +315,13 @@ try {
         Assert-Has $r.Out "Couldn't check whether role SpottoReadOnlyRole exists"; Assert-Lacks $r.Log 'create-stack'
     }
     Test-Case '-Check: unreadable latest version exits 1' {
-        Add-Connect '2026-11-02.1' 'CreateExport'
+        Add-Connect '2026-11-03.1' 'CreateExport'
         $r = Invoke-Script 'standalone' 1 @('-Check') @{ FAKE_DENY = 'get-template-summary:' }
         Assert-Has $r.Out "Couldn't read the template version for the latest templates: An error occurred (AccessDenied)"
         Assert-Lacks $r.Out 'Everything is up to date'; Assert-Lacks $r.Out '(up to date)'
     }
     Test-Case '-Check: unreadable deployed version exits 1' {
-        Add-Connect '2026-11-02.1' 'CreateExport'
+        Add-Connect '2026-11-03.1' 'CreateExport'
         $r = Invoke-Script 'standalone' 1 @('-Check') @{ FAKE_DENY = 'get-template-summary:SpottoConnect-prod-us' }
         Assert-Has $r.Out "Couldn't read the template version for SpottoConnect-prod-us: An error occurred (AccessDenied)"
         Assert-Has $r.Out 'SpottoConnect-prod-us: version unknown (version unreadable)'; Assert-Lacks $r.Out 'Everything is up to date'

@@ -29,7 +29,7 @@ import sys
 ACCOUNT = "111122223333"
 SCENARIO = os.environ.get("FAKE_AWS_SCENARIO", "standalone")
 STATE = os.environ["FAKE_AWS_STATE"]
-LATEST = os.environ.get("FAKE_LATEST_VERSION", "2026-11-02.1")
+LATEST = os.environ.get("FAKE_LATEST_VERSION", "2026-11-03.1")
 if LATEST == "none":  # PowerShell can't set an empty environment variable
     LATEST = ""
 TEMPLATE_PARAMS = {
